@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.5
+version: 0.9.7
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -38,6 +38,23 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.7
+- Persist thinking block signatures across turns. `<details type="reasoning">`
+  blocks now carry a `data-signature` HTML attribute carrying the opaque
+  server-issued signature, and historical reasoning blocks are reconstructed
+  as structured {type:"thinking", thinking, signature} API blocks on replay.
+  This enables Opus 4.5+/Sonnet 4.6/Mythos thinking-preservation cache hits
+  and keeps reasoning continuity intact across multi-turn conversations.
+  Unsignatured legacy blocks are silently dropped (API would strip them
+  anyway on non-tool-result turns).
+
+v0.9.6
+- Fixed tool-call history loss (GitHub issue #30): historical assistant messages with
+  <details type="tool_calls"> HTML are now parsed back into structured tool_use/tool_result
+  blocks instead of being stripped. Claude no longer loses evidence of prior tool calls
+  on follow-up turns and stops re-executing tools wastefully. Interrupted (done="false")
+  calls synthesize is_error tool_results to keep the chain valid.
+
 v0.9.5
 - Added Opus 4.7
 - Added new "xhigh" effort level (Opus 4.7 only)
@@ -485,6 +502,30 @@ PATTERN_TOOL_CALLS_DETAILS = re.compile(
     r'\n?<details type="tool_calls"[^>]*>.*?</details>\n?',
     flags=re.DOTALL,
 )
+
+# Pattern to MATCH (not strip) <details type="tool_calls"> blocks for structured
+# reconstruction into tool_use/tool_result Claude API blocks on replay.
+# Group 1 captures the attributes string (id, name, arguments, result, done, error).
+# Attribute values are html.escape()'d JSON — no raw '"' inside — so a simple
+# `(\w+)="([^"]*)"` attribute parser is safe.
+PATTERN_TOOL_CALLS_BLOCK = re.compile(
+    r'\n?<details type="tool_calls"([^>]*)>.*?</details>\n?',
+    flags=re.DOTALL,
+)
+PATTERN_TOOL_CALLS_ATTRS = re.compile(r'(\w+)="([^"]*)"')
+
+# Pattern to MATCH <details type="reasoning"> blocks for reconstruction into
+# structured Claude API ``thinking`` blocks on replay. Group 1 captures the
+# attribute string (for signature extraction), group 2 captures the body
+# (between </summary> and </details>) where each line is prefixed with "> ".
+# The signature is stored as ``data-signature="..."`` (html.escape'd) and
+# must be html.unescape'd before being sent back to the API byte-exact.
+PATTERN_REASONING_BLOCK = re.compile(
+    r'\n?<details type="reasoning"([^>]*)>\s*<summary>[^<]*</summary>\s*(.*?)\s*</details>\n?',
+    flags=re.DOTALL,
+)
+# Matches a quoted-line body: strips the leading "> " prefix per line.
+PATTERN_REASONING_QUOTED_LINE = re.compile(r'^>\s?', flags=re.MULTILINE)
 
 # Pattern to strip OpenWebUI <details type="code_interpreter"> blocks from conversation history.
 PATTERN_CODE_INTERPRETER_DETAILS = re.compile(
@@ -2266,6 +2307,26 @@ class Pipe:
             role = msg.get("role")
             raw_content = msg.get("content")
 
+            # Historical assistant turns may carry tool calls serialized as
+            # <details type="tool_calls"> HTML (OpenWebUI stores flat strings
+            # only). Parse them back into structured tool_use/tool_result
+            # blocks so Claude sees its own prior tool usage and doesn't
+            # re-execute tools on follow-up turns.
+            if (
+                role == "assistant"
+                and isinstance(raw_content, str)
+                and '<details type="tool_calls"' in raw_content
+            ):
+                parsed_msgs = self._parse_assistant_tool_calls_string(raw_content)
+                if parsed_msgs:
+                    for pmsg in parsed_msgs:
+                        if pmsg["role"] == "assistant":
+                            extracted_metadata = self._extract_metadata_marker_from_message(pmsg)
+                            if extracted_metadata:
+                                previous_marker_metadata.extend(extracted_metadata)
+                        processed_messages.append(pmsg)
+                    continue
+
             claude_message = self._convert_content_to_claude_format(raw_content, role=role)
             if not claude_message:
                 continue
@@ -2622,6 +2683,133 @@ class Pipe:
 
         return claude_tools, api_tool_names
 
+    def _parse_assistant_tool_calls_string(self, content: str) -> list[dict]:
+        """Reconstruct structured Claude messages from an OpenWebUI assistant
+        string that contains ``<details type="tool_calls">`` HTML blocks.
+
+        OpenWebUI stores the entire assistant turn (including tool calls and
+        results) as a single flat text string. To replay the conversation via
+        the Claude API we must parse that HTML back into structured
+        ``tool_use`` / ``tool_result`` blocks and emit the correct
+        assistant→user→assistant sequence.
+
+        Returns a list of ``{"role": ..., "content": [...]}`` dicts. Each
+        consecutive run of ``tool_calls`` becomes one assistant message with
+        multiple ``tool_use`` blocks followed by a single user message carrying
+        all matching ``tool_result`` blocks. Text between tool-call runs
+        terminates the current turn and starts a new assistant message.
+        """
+        segments: list[tuple[str, str]] = []
+        last_end = 0
+        for m in PATTERN_TOOL_CALLS_BLOCK.finditer(content):
+            segments.append(("text", content[last_end:m.start()]))
+            segments.append(("tool_call", m.group(1)))
+            last_end = m.end()
+        segments.append(("text", content[last_end:]))
+
+        messages: list[dict] = []
+        current_assistant: list[dict] = []
+        pending_results: list[dict] = []
+
+        def flush() -> None:
+            if current_assistant:
+                messages.append({"role": "assistant", "content": list(current_assistant)})
+                current_assistant.clear()
+            if pending_results:
+                messages.append({"role": "user", "content": list(pending_results)})
+                pending_results.clear()
+
+        for kind, data in segments:
+            if kind == "text":
+                # A text segment AFTER tool results terminates the prior turn.
+                if pending_results:
+                    flush()
+                if not data.strip():
+                    continue
+                # Reuse the existing converter for text (handles compaction
+                # extraction and code_interpreter stripping). It will also no-op
+                # on the already-extracted tool_calls HTML.
+                blocks = self._convert_content_to_claude_format(data, role="assistant")
+                current_assistant.extend(blocks)
+            else:  # tool_call
+                attrs = dict(PATTERN_TOOL_CALLS_ATTRS.findall(data))
+                tc_id = html.unescape(attrs.get("id", "") or "")
+                tc_name = html.unescape(attrs.get("name", "") or "")
+                if not tc_id or not tc_name:
+                    logger.warning(
+                        "Skipping malformed <details type='tool_calls'> "
+                        "block (missing id/name) during history reconstruction"
+                    )
+                    continue
+                tc_args_raw = html.unescape(attrs.get("arguments", "") or "")
+                tc_result_raw = html.unescape(attrs.get("result", "") or "")
+                tc_done = (attrs.get("done", "true") or "true") == "true"
+                tc_error = (attrs.get("error", "false") or "false") == "true"
+                try:
+                    tc_input = json.loads(tc_args_raw) if tc_args_raw else {}
+                    if not isinstance(tc_input, dict):
+                        tc_input = {}
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(
+                        f"Failed to parse tool_use arguments for "
+                        f"{tc_name!r}: {tc_args_raw[:120]!r}"
+                    )
+                    tc_input = {}
+                current_assistant.append({
+                    "type": "tool_use",
+                    "id": tc_id,
+                    "name": tc_name,
+                    "input": tc_input,
+                })
+                if tc_done:
+                    result_content = tc_result_raw if tc_result_raw else "(no result)"
+                    result_block: dict = {
+                        "type": "tool_result",
+                        "tool_use_id": tc_id,
+                        "content": result_content,
+                    }
+                    if tc_error:
+                        result_block["is_error"] = True
+                else:
+                    # Interrupted / aborted tool call — synthesize an error
+                    # result so the assistant/user chain stays valid.
+                    result_block = {
+                        "type": "tool_result",
+                        "tool_use_id": tc_id,
+                        "content": "tool execution was interrupted",
+                        "is_error": True,
+                    }
+                pending_results.append(result_block)
+
+        flush()
+        return messages
+
+    def _extract_compaction_and_text(self, content: str) -> list[dict]:
+        """Extract compaction blocks from a text chunk and return a list of
+        Claude-format blocks (text + compaction) in original order.
+
+        Used by the assistant-branch of ``_convert_content_to_claude_format``
+        when thinking reconstruction needs to process text chunks around
+        reconstructed thinking blocks while still honoring compaction
+        boundaries.
+        """
+        compaction_matches = list(PATTERN_COMPACTION_DETAILS.finditer(content))
+        if not compaction_matches:
+            stripped = content.strip()
+            return [{"type": "text", "text": stripped}] if stripped else []
+        blocks: list[dict] = []
+        last_end = 0
+        for match in compaction_matches:
+            before = content[last_end:match.start()].strip()
+            if before:
+                blocks.append({"type": "text", "text": before})
+            blocks.append({"type": "compaction", "content": match.group(1).strip()})
+            last_end = match.end()
+        after = content[last_end:].strip()
+        if after:
+            blocks.append({"type": "text", "text": after})
+        return blocks
+
     def _convert_content_to_claude_format(
         self, content: Union[str, List[dict], None], role: str = "user"
     ) -> List[dict]:
@@ -2651,6 +2839,52 @@ class Pipe:
             if role == "assistant":
                 content = PATTERN_TOOL_CALLS_DETAILS.sub("", content)
                 content = PATTERN_CODE_INTERPRETER_DETAILS.sub("", content)
+
+                # Reconstruct thinking blocks from <details type="reasoning">
+                # HTML. Only blocks carrying a signature are replayable — the
+                # API rejects thinking blocks without a valid signature.
+                # Unsignatured blocks (e.g. from older pipe versions that did
+                # not persist the signature) are silently dropped: the API
+                # would strip them anyway on a non-tool-result turn.
+                thinking_matches = list(PATTERN_REASONING_BLOCK.finditer(content))
+                has_thinking = any(
+                    'data-signature="' in m.group(1) for m in thinking_matches
+                )
+                if has_thinking:
+                    blocks: list[dict] = []
+                    last_end = 0
+                    for match in thinking_matches:
+                        attrs_str = match.group(1)
+                        text_before = content[last_end:match.start()]
+                        if text_before.strip():
+                            blocks.extend(
+                                self._extract_compaction_and_text(text_before)
+                            )
+                        sig_match = re.search(
+                            r'data-signature="([^"]*)"', attrs_str
+                        )
+                        if sig_match:
+                            signature = html.unescape(sig_match.group(1))
+                            body = match.group(2)
+                            thinking_text = html.unescape(
+                                PATTERN_REASONING_QUOTED_LINE.sub("", body)
+                            ).strip()
+                            blocks.append({
+                                "type": "thinking",
+                                "thinking": thinking_text,
+                                "signature": signature,
+                            })
+                        # else: drop unsignatured reasoning block
+                        last_end = match.end()
+                    after = content[last_end:]
+                    if after.strip():
+                        blocks.extend(self._extract_compaction_and_text(after))
+                    return blocks
+
+                # Strip any unsignatured reasoning HTML from the remaining
+                # content so it doesn't leak to the API as plain text.
+                if thinking_matches:
+                    content = PATTERN_REASONING_BLOCK.sub("", content)
 
                 # Extract compaction display blocks as API-native {type: "compaction"}
                 # blocks so the API recognises the boundary and drops prior content.
@@ -3364,6 +3598,7 @@ class Pipe:
             # Thinking mode state
             is_model_thinking = False
             thinking_message = ""
+            thinking_signature = ""  # Accumulates signature_delta events (required for replay)
             thinking_start_time = None  # Track when thinking started for duration calc
             thinking_stream_start_idx = -1  # Position in final_message where thinking content starts
             thinking_last_block = ""  # Tracks current formatted thinking block for content-preserving replace
@@ -3564,6 +3799,7 @@ class Pipe:
                                     is_model_thinking = True
                                     thinking_start_time = time.time()
                                     thinking_message = ""
+                                    thinking_signature = ""
                                     thinking_stream_start_idx = len(final_message)
                                 elif content_type == "redacted_thinking":
                                     is_model_thinking = True
@@ -4131,8 +4367,10 @@ class Pipe:
                                         await update_content_block(thinking_last_block, formatted)
                                         thinking_last_block = formatted
                                 elif delta_type == "signature_delta":
-                                    # No manual tracking needed
-                                    pass
+                                    # Accumulate the opaque signature for this thinking block.
+                                    # The signature is required byte-exact when replaying
+                                    # thinking blocks across turns (see Thinking encryption docs).
+                                    thinking_signature += getattr(delta, "signature", "") or ""
                                 elif delta_type == "compaction_delta":
                                     # Accumulate compaction content progressively (may arrive in multiple deltas)
                                     compaction_content += getattr(delta, "content", "")
@@ -4608,14 +4846,20 @@ class Pipe:
                                 elif is_model_thinking and content_type in ("thinking", "redacted_thinking"):
                                     if content_type == "thinking" and thinking_message:
                                         duration = time.time() - (thinking_start_time or time.time())
-                                        formatted = self._format_thinking_block(thinking_message, duration)
+                                        formatted = self._format_thinking_block(
+                                            thinking_message, duration, signature=thinking_signature
+                                        )
                                         await update_content_block(thinking_last_block, formatted)
                                         thinking_last_block = ""
-                                        logger.debug(f"Finalized thinking block ({len(thinking_message)} chars, {duration:.1f}s)")
+                                        logger.debug(
+                                            f"Finalized thinking block ({len(thinking_message)} chars, "
+                                            f"{duration:.1f}s, sig={len(thinking_signature)}c)"
+                                        )
                                     elif content_type == "redacted_thinking":
                                         logger.debug("Redacted thinking block completed (preserved by SDK)")
                                     is_model_thinking = False
                                     thinking_message = ""
+                                    thinking_signature = ""
                                     thinking_stream_start_idx = -1
                                 # Reset tracked type
                                 current_block_type = None
@@ -5208,6 +5452,7 @@ class Pipe:
                             first_text_emitted = False
                             # Reset thinking state
                             thinking_message = ""
+                            thinking_signature = ""
                             thinking_start_time = None
                             thinking_stream_start_idx = -1
                             thinking_last_block = ""
@@ -5959,12 +6204,19 @@ class Pipe:
         )
 
     def _format_thinking_block(
-        self, content: str, duration: Optional[float] = None
+        self, content: str, duration: Optional[float] = None,
+        signature: Optional[str] = None,
     ) -> str:
         """Format a thinking block with OpenWebUI native <details type='reasoning'> format.
 
         This produces the same format that OpenWebUI's built-in pipes use,
         enabling proper spinner, localized text, and collapsible behavior.
+
+        ``signature`` (when provided) is persisted as an HTML attribute so the
+        block can be reconstructed as a valid Claude API ``thinking`` block on
+        subsequent turns. The signature is an opaque server-issued token that
+        must be sent back byte-exact; without it, the API rejects replayed
+        thinking blocks with a 400 error.
         """
         # Escape content and add > prefix per line (OpenWebUI quota block style)
         escaped_lines = "\n".join(
@@ -5972,17 +6224,19 @@ class Pipe:
             for line in content.splitlines()
         )
 
+        sig_attr = f' data-signature="{html.escape(signature)}"' if signature else ""
+
         if duration is not None:
             duration_int = int(duration)
             return (
-                f'<details type="reasoning" done="true" duration="{duration_int}">\n'
+                f'<details type="reasoning" done="true" duration="{duration_int}"{sig_attr}>\n'
                 f"<summary>Thought for {duration_int} seconds</summary>\n"
                 f"{escaped_lines}\n"
                 f"</details>\n"
             )
         else:
             return (
-                f'<details type="reasoning" done="false">\n'
+                f'<details type="reasoning" done="false"{sig_attr}>\n'
                 f"<summary>Thinking…</summary>\n"
                 f"{escaped_lines}\n"
                 f"</details>\n"
