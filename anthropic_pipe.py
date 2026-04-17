@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.4
+version: 0.9.5
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -33,11 +33,16 @@ Supports:
 - Tool Search (BM25/Regex)
 - Native PDF Upload (visual PDF analysis with charts/images)
 - Agent Skills (pptx, xlsx, docx, pdf and custom skills)
-- Fast Mode (research preview) for Opus 4.6
+- Fast Mode (research preview) for Opus 4.6 / 4.7
 - Memory Tool (integrated with OpenWebUI memory system)
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.5
+- Added Opus 4.7
+- Added new "xhigh" effort level (Opus 4.7 only)
+- Effort values are now clamped per-model: xhigh -> high on non-Opus-4.7, max -> high on models that don't support it
+
 v0.9.4
 - Added Cache Statistics to Token Count Message
 
@@ -614,6 +619,10 @@ class Pipe:
     # The API now provides: max_tokens, max_input_tokens, capabilities (thinking, effort, vision, etc.)
     # These overrides only contain flags that must be derived from model identity.
     MODEL_CAPABILITY_OVERRIDES = {
+        "claude-opus-4-7": {
+            "supports_dynamic_filtering": True,
+            "supports_fast_mode": True,
+        },
         "claude-opus-4-6": {
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
@@ -659,6 +668,7 @@ class Pipe:
             "supports_adaptive_thinking": _sup(getattr(thinking_types, "adaptive", None)) if thinking_types else False,
             "supports_effort": _sup(effort),
             "supports_effort_max": _sup(getattr(effort, "max", None)) if effort else False,
+            "supports_effort_xhigh": _sup(getattr(effort, "xhigh", None)) if effort else False,
             "supports_vision": _sup(getattr(caps, "image_input", None)) if caps else True,
             "supports_programmatic_calling": _sup(getattr(caps, "code_execution", None)) if caps else False,
             "supports_compaction": _sup(getattr(ctx_mgmt, "compact_20260112", None)) if ctx_mgmt else False,
@@ -698,6 +708,7 @@ class Pipe:
             "supports_dynamic_filtering": False,
             "supports_adaptive_thinking": False,
             "supports_effort_max": False,
+            "supports_effort_xhigh": False,
             "supports_fast_mode": False,
         }
 
@@ -709,7 +720,7 @@ class Pipe:
         )
         ENABLE_FAST_MODE: bool = Field(
             default=False,
-            description="Enable Fast Mode for Opus 4.6. Up to 2.5x faster output at higher costs",
+            description="Enable Fast Mode for Opus 4.6 / 4.7. Up to 2.5x faster output at higher costs",
         )
         # Not quite finished with testing yet, disabled for now
         # ENABLE_CLAUDE_MEMORY: bool = Field(
@@ -827,9 +838,9 @@ class Pipe:
             default="summarized",
             description="Thinking display mode. 'summarized' returns summarized thinking (default). 'omitted' skips streaming thinking tokens for faster time-to-first-text.",
         )
-        EFFORT: Literal["low", "medium", "high", "max"] = Field(
+        EFFORT: Literal["low", "medium", "high", "xhigh", "max"] = Field(
             default="high",
-            description="Effort level for this user. Also Controllable with OpenWebUI's reasoning_effort parameter.",
+            description="Effort level for this user. Also controllable via OpenWebUI's reasoning_effort parameter. 'xhigh' is Opus 4.7 only; 'max' is Opus 4.7 / 4.6 / Sonnet 4.6 only. Unsupported values are clamped down automatically.",
         )
         USE_PDF_NATIVE_UPLOAD: bool = Field(
             default=True,
@@ -1817,7 +1828,7 @@ class Pipe:
         if self.valves.DATA_RESIDENCY == "us":
             payload["inference_geo"] = "us"
 
-        # Add Fast Mode if enabled and model supports it (Opus 4.6 only)
+        # Add Fast Mode if enabled and model supports it (Opus 4.6 / 4.7)
         if self.valves.ENABLE_FAST_MODE and model_info.get("supports_fast_mode", False):
             payload["speed"] = "fast"
             logger.debug("Fast Mode enabled for this request")
@@ -1828,25 +1839,21 @@ class Pipe:
         effective_effort = None
 
         if model_info["supports_effort"]:
-            # Determine effective effort level
+            # Clamp an effort value to what the current model supports.
+            #   xhigh -> high if the model doesn't advertise xhigh (Opus 4.7 only)
+            #   max   -> high if the model doesn't advertise max   (Opus 4.7/4.6, Sonnet 4.6)
+            def _clamp_effort(value: str) -> str:
+                if value == "xhigh" and not model_info.get("supports_effort_xhigh"):
+                    return "high"
+                if value == "max" and not model_info.get("supports_effort_max"):
+                    return "high"
+                return value
+
             body_effort = body.get("reasoning_effort")
-            if body_effort in ["low", "medium", "high", "max"]:
-                # "max" is Opus 4.6 only — clamp to "high" for other models
-                if body_effort == "max" and not model_info["supports_effort_max"]:
-                    effective_effort = "high"
-                else:
-                    effective_effort = body_effort
-            elif (
-                model_info["supports_effort_max"] and __user__["valves"].EFFORT == "max"
-            ):
-                effective_effort = "max"
+            if body_effort in ("low", "medium", "high", "xhigh", "max"):
+                effective_effort = _clamp_effort(body_effort)
             else:
-                # Clamp user valve "max" to "high" for non-Opus 4.6 models
-                valve_effort = __user__["valves"].EFFORT
-                if valve_effort == "max" and not model_info["supports_effort_max"]:
-                    effective_effort = "high"
-                else:
-                    effective_effort = valve_effort
+                effective_effort = _clamp_effort(__user__["valves"].EFFORT)
 
             effort_config = {"effort": effective_effort}
             logger.debug(f"Effort level set to: {effective_effort}")
