@@ -1,360 +1,279 @@
 # 🚀 Anthropic API Manifold Pipe for Open WebUI
 
-> **Claude Feature parity for Open WebUI - streaming, prompt caching, tool use, extended thinking, code execution with file support, programmatic tool calling, agent skills, and more.**
+> Near-complete Anthropic Messages API parity for OpenWebUI — model auto-discovery, native streaming, citations, web search/fetch, code execution, Files API, Agent Skills, prompt caching, context editing, compaction, and programmatic tool calling.
 
 ---
 
-## 📖 Overview
+## 📌 Current status
 
-A comprehensive Anthropic API integration for Open WebUI built on the **Anthropic Python SDK**. I tried to include as much Claude API features as possible while stay compatible with all Openwebui Features. It Enables Claude to orchestrate complex multi-tool workflows
-- *"Grab my Jira tasks and send a summary on Slack"* — work token-effician and in a single request with programmatic tool calling, parallel execution.
-- *"Check out this finance report - Extract the important information and distill it down into a nice Powerpoint Presentation"* — code_execution with Files API Up- and Download Support and pptx Skill will do the trick.
-- *"What's the meaning of life?"* — Extended Thinking can use up to 64k Tokens and web_search can do ask the internet before giving a good answer. Interleaved Thinking allows to think about the path it took even during the response.
+- **Current pipe version:** `0.9.8`
+- **Recommended OpenWebUI:** `0.9.0+`
+- **Minimum practical OpenWebUI for good UX:** `0.8.11+`
+- **Model list and capabilities are fetched dynamically** from Anthropic's Models API (`max_input_tokens`, `max_tokens`, thinking/effort support, compaction support, etc.)
+- **Current Anthropic model docs focus on:** `Claude Opus 4.7`, `Claude Sonnet 4.6`, `Claude Haiku 4.5`
+- **Anthropic deprecation note:** `Claude Sonnet 4` and `Claude Opus 4` are deprecated and retire on **2026-06-15**
 
-### 🎯 Key Highlights
-
-| Feature | Description |
-|---------|-------------|
-| 🔧 **Programmatic Tool Calling** | Claude orchestrates tools through code execution — multi-tool workflows in one go |
-| ⚡ **Parallel Execution** | Independent tools execute simultaneously |
-| 💾 **Prompt Caching** | 4-level cache for system prompts, tools, and messages; compatible with RAG & Memory |
-| 🧠 **Extended Thinking** | Classic budget, adaptive, and interleaved thinking with live streaming |
-| 💻 **Code Execution** | Sandboxed Python with persistent container state, file upload/download |
-| 🌐 **Web Search & Fetch** | Dynamic filtering, inline citations, URL content analysis |
-| 🔍 **Tool Search** | BM25/Regex deferred loading for large toolsets |
-| 🧹 **Context Editing** | Auto-clear old tool results and thinking blocks |
-| 📊 **1M Token Context** | Extended context for Opus 4.6, Sonnet 4/4.5 |
-| 🎨 **Agent Skills** | pptx, xlsx, docx, pdf & custom skills via Files API |
+This pipe targets the **Anthropic Messages API** directly through the official **Anthropic Python SDK** and keeps the OpenWebUI experience close to Anthropic-native behavior while still playing nicely with OpenWebUI models, tools, filters, files, notes, channels, and task generation.
 
 ---
 
-## ✨ Features
+## ✨ Highlights
 
-### Core
-
-| Feature | Description |
-|---------|-------------|
-| **Anthropic Python SDK** | Official SDK for streaming and message accumulation |
-| **Model Auto-Discovery** | Fetches available models from your API key |
-| **Streaming** | Fine-grained tool streaming with eager input streaming (GA) |
-| **Tool Call Loop** | Multiple tools per response cycle with configurable limit |
-| **Parallel Tool Execution** | Local tools run concurrently |
-| **Error Handling** | Retry logic for rate limits and transient errors |
-| **Task Support** | Title, tag, and follow-up generation |
-| **Notes & Channels** | Full OpenWebUI integration |
-| **Token Count** | Toggleable context window progress bar per response |
-
-### Claude API Features
-
-| Feature | Description |
-|---------|-------------|
-| **Vision** | Image analysis (JPEG, PNG, GIF, WebP) |
-| **Native PDF Upload** | Visual PDF analysis bypassing RAG extraction |
-| **Citations** | Correctly positioned streaming citations from web search |
-| **Extended Thinking** | Classic `budget_tokens` and adaptive thinking (Opus 4.6) |
-| **Interleaved Thinking** | Claude thinks between tool calls |
-| **Live Thinking Streaming** | Real-time streaming, collapsing into `<details>` blocks |
-| **Files API (standalone)** | Native file handling for code execution |
-| **Web Search** | `web_search_20260209` with dynamic filtering and location-aware results |
-| **Web Fetch** | URL content retrieval and analysis |
-| **Code Execution** | Persistent container state, unified display (code + tool calls + output) |
-| **Programmatic Tool Calling** | Tools callable from within code execution; multi-tool coordination |
-| **Tool Search** | BM25/Regex deferred loading for hundreds/thousands of tools |
-| **Context Editing** | Auto-clear tool results & thinking blocks with token-count triggers |
-| **Agent Skills** | pptx, xlsx, docx, pdf & custom skills, validated via List Skills API |
-| **Data Residency** | `inference_geo` parameter (global or US) |
-| **Fast Mode** | Up to 2.5× faster output for Opus 4.6 |
-| **1M Token Context** | Opus 4.6, Sonnet 4/4.5 (Tier 4 required) |
-| **Effort Parameter** | low / medium / high / max (GA) |
-| **Prompt Caching** | 4-level cache: tools, system prompt, messages; RAG/Memory aware |
+| Area | What you get |
+|------|---------------|
+| **Models & capabilities** | Auto-discovered Claude models, capability parsing from Anthropic's Models API, no hardcoded model tables to babysit |
+| **Streaming UX** | SDK-based streaming, grouped reasoning/tool/code blocks, rich tool result rendering via OpenWebUI's `process_tool_result()` |
+| **Reasoning controls** | Extended thinking, adaptive thinking where supported, interleaved thinking, `thinking.display="omitted"`, effort levels including `xhigh` |
+| **Web tooling** | Native `web_search` + `web_fetch`, citations, location-aware searches, optional dynamic filtering on supported models |
+| **Execution** | Anthropic code execution, persistent container reuse across turns, unified code/tool/output display, programmatic tool calling |
+| **Files** | Native PDF upload, Anthropic Files API upload/download, file persistence markers, code-exec file roundtrips |
+| **Skills** | Prebuilt and custom Agent Skills, skill validation, API-side skill support via Files API + code execution |
+| **Context efficiency** | Prompt caching, optional 1-hour cache TTL, token/cache stats, context editing, compaction, tool search |
+| **OpenWebUI integration** | Notes, channels, task generation, built-in tools, MCP tools, toggle filters, companion filter for native Anthropic buttons |
 
 ---
 
-## 🗺️ Roadmap
+## 🧠 Anthropic / Claude notes reflected in this pipe
 
-| Status | Feature | Notes |
-|--------|---------|-------|
-| 📌 | **[Compaction](https://platform.claude.com/docs/en/build-with-claude/compaction)** | Server-side context summarization for infinite conversations |
+- The Anthropic docs now treat **Opus 4.7** as the flagship generally available model for the hardest agentic and coding workloads.
+- **Opus 4.7** and **Sonnet 4.6** expose a **1M token** context window; **Haiku 4.5** uses **200k**.
+- Modern Claude models expose capabilities through the **Models API**, which this pipe reads directly.
+- `thinking.display: "omitted"` suppresses streamed `thinking_delta` events; only the thinking block shell and signature are emitted.
+- Anthropic's **Files API** remains **beta** and is especially useful together with code execution and skills.
+- Anthropic's **Skills API** relies on **code execution + files + skills beta headers**; this pipe handles that plumbing for you.
+- Anthropic's **effort** parameter is now the recommended control for adaptive-thinking models; `xhigh` is **Opus 4.7 only**.
 
 ---
 
 ## 📦 Installation
 
-### Option 1: Install from OpenWebUI Community (Recommended)
+### Option 1: Install from OpenWebUI Community
 
 | Component | Link |
 |-----------|------|
 | **Main Pipe** | [anthropic_pipe](https://openwebui.com/f/podden/anthropic_pipe) |
 | **Thinking Toggle** | [anthropic_pipe_thinking_toggle](https://openwebui.com/f/podden/anthropic_pipe_thinking_toggle) |
+| **Web Search Toggle** | [anthropic_web_search_toggle](https://openwebui.com/f/podden/anthropic_web_search_toggle) |
+| **Code Execution Toggle** | [anthropic_pipe_code_execution_toggle](https://openwebui.com/f/podden/anthropic_pipe_code_execution_toggle) |
+| **Files API Toggle** | [anthropic_pipe_files_toggle](https://openwebui.com/f/podden/anthropic_pipe_files_toggle) |
 | **Companion Filter** | [anthropic_manifold_companion](https://openwebui.com/f/podden/anthropic_manifold_companion) |
 
-### Option 2: Manual Installation
+### Option 2: Manual installation
 
-1. **Admin Settings** → **Functions** → **"+ New Function"**
-2. Paste the source code, set name/ID/description
-3. Repeat for each toggle filter
+1. Open **Admin Settings** → **Functions** → **+ New Function**
+2. Paste the source for `anthropic_pipe.py`
+3. Repeat for the toggle filters you want to use
+4. Optionally install the **Companion Filter**
+5. Set the admin valves described below
 
-### Configuration
+### Recommended OpenWebUI model configuration
 
-1. **Set API Key** in the pipe's Valves
-2. **Configure Models** (Admin Settings → Models):
-   - Activate Thinking and Companion Filter for each Claude model or globally
-   - Activate web_search and code_interpreter capabilities
-   - Optional: Add usage to see token consumption
-   - Set **Function Calling** to `Native` in Advanced Parameters
-2a.**Set Valves and UserValves** Experiment with the Settings to find values to your liking
-3. **Start chatting!**
+For each Claude model in **Admin Settings → Models**:
+
+1. Attach the toggle filters you want available for that model
+2. Set **Function Calling** to **`Native`**
+3. Optionally attach the **Companion Filter** if you want OpenWebUI's built-in `web_search` / `code_interpreter` buttons to route to Anthropic-native tools
+4. If you plan to use **Skills** or **Files API** workflows heavily, prefer models with strong tool and code-exec support (today that usually means **Opus 4.7** or **Sonnet 4.6**)
+
+---
+
+## 🔌 OpenWebUI compatibility notes
+
+Recent OpenWebUI releases matter for this pipe:
+
+- **0.8.11**
+   - grouped consecutive reasoning/tool blocks into single collapsible summaries
+   - improved tool-call streaming persistence and reasoning spinner behavior
+   - added upstream `WEB_FETCH_MAX_CONTENT_LENGTH` support
+- **0.8.12**
+   - rich embeds from tool calls remain visible outside collapsed groups
+- **0.9.0**
+   - async plugin/backend migration for Tools, Functions, Pipes, Filters, and Actions
+   - built-in and MCP tools reach pipes more reliably
+   - richer Anthropic-compatible tool result content and citation rendering
+   - active filter badges can expose valve configuration shortcuts directly in chat
+- **0.9.2**
+   - persisted skill mentions inject into system prompts reliably on stored chats
+
+If you fork this pipe or copy code into your own plugin, note that OpenWebUI `0.9.0+` moved DB/model helpers to async. The pipe is already migrated, but custom additions must also follow the async model/helper rules. See the official migration guide: https://docs.openwebui.com/features/extensibility/plugin/migration/to-0.9.0
+
 ---
 
 ## 🔧 Configuration
-### Valves (Global / Admin Settings)
+
+### Global Valves (admin-wide)
+
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Your Anthropic API key (required) |
-| `ENABLE_FAST_MODE` | `false` | Fast Mode for Opus 4.6 (up to 2.5× faster, higher cost) |
-| `ENABLE_1M_CONTEXT` | `false` | 1M token context window (Tier 4 required) |
-| `ENABLE_INTERLEAVED_THINKING` | `true` | Claude thinks between tool calls |
-| `WEB_SEARCH` | `true` | Enable web search tool |
-| `WEB_FETCH` | `true` | Enable web fetch tool (URL content retrieval) |
-| `MAX_TOOL_CALLS` | `15` | Max tool execution loops per request (1–50) |
-| `MAX_RETRIES` | `3` | Max retries for failed requests (0–50) |
-| `CACHE_CONTROL` | `cache tools array, system prompt and messages` | Prompt caching scope (see below) |
-| `ENABLE_PROGRAMMATIC_TOOL_CALLING` | `false` | Tools callable from within code execution |
-| `ENABLE_TOOL_SEARCH` | `false` | BM25/Regex tool search for large toolsets |
-| `TOOL_SEARCH_TYPE` | `bm25` | `regex` or `bm25` |
-| `TOOL_SEARCH_MAX_DESCRIPTION_LENGTH` | `100` | Tools with longer JSON defs are deferred |
-| `TOOL_SEARCH_EXCLUDE_TOOLS` | `[web_search, web_fetch, ...]` | Always-loaded tools |
-| `CONTEXT_EDITING_STRATEGY` | `none` | `none` / `clear_tool_results` / `clear_thinking` / `clear_both` |
-| `CONTEXT_EDITING_THINKING_KEEP` | `5` | Thinking blocks to keep |
-| `CONTEXT_EDITING_TOOL_TRIGGER` | `50000` | Token threshold for clearing tool results |
-| `CONTEXT_EDITING_TOOL_KEEP` | `5` | Recent tool results to preserve |
-| `CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST` | `10000` | Minimum tokens to clear |
-| `CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT` | `false` | Also clear tool input parameters |
-| `DATA_RESIDENCY` | `global` | `global` or `us` (1.1× cost for US) |
-| `WEB_SEARCH_USER_*` | — | Default location for web searches (city, region, country, timezone) |
+| `ANTHROPIC_API_KEY` | required | Anthropic API key used by the pipe unless overridden by a per-user key |
+| `ANTHROPIC_BASE_URL` | `""` | Optional custom base URL / proxy for Anthropic API requests |
+| `ENABLE_FAST_MODE` | `false` | Sends Anthropic's `speed: "fast"` research-preview speed tier on models this pipe marks as fast-mode capable |
+| `ENABLE_INTERLEAVED_THINKING` | `true` | Allows thinking blocks between tool calls where supported |
+| `WEB_SEARCH` | `true` | Enables Anthropic native web search |
+| `WEB_FETCH` | `true` | Enables Anthropic native URL fetch |
+| `MAX_TOOL_CALLS` | `15` | Maximum Claude → tool → Claude loop count per request |
+| `MAX_RETRIES` | `3` | Retries for overload, rate limits, and transient transport/provider errors |
+| `CACHE_CONTROL` | `cache tools array, system prompt and messages` | Prompt caching scope |
+| `CACHE_TTL` | `5 minutes` | Anthropic cache TTL (`1 hour` is also supported) |
+| `WEB_SEARCH_USER_CITY / REGION / COUNTRY / TIMEZONE` | `""` | Default search-location hints for Anthropic web search |
+| `ENABLE_PROGRAMMATIC_TOOL_CALLING` | `false` | Allows Claude to call OpenWebUI tools from inside code execution |
+| `ENABLE_TOOL_SEARCH` | `true` | Deferred tool loading with search for large tool sets |
+| `TOOL_SEARCH_TYPE` | `bm25` | Tool search mode: `bm25` or `regex` |
+| `TOOL_SEARCH_MAX_DESCRIPTION_LENGTH` | `100` | Tools with longer JSON definitions are deferred for lazy loading |
+| `TOOL_SEARCH_EXCLUDE_TOOLS` | `[web_search, web_fetch, code_execution_20250825, code_execution_20260120]` | Always keep these tools loaded |
+| `DATA_RESIDENCY` | `global` | Anthropic `inference_geo` routing: `global` or `us` |
+| `REQUEST_TIMEOUT` | `300` | Anthropic API timeout in seconds |
+| `TOOL_CALL_TIMEOUT` | `30` | Per-tool execution timeout in seconds |
 
-#### Cache Control Options
-| Option | Description |
-|--------|-------------|
-| `cache disabled` | No caching |
-| `cache tools array only` | Cache tool definitions |
+#### `CACHE_CONTROL` options
+
+| Value | Meaning |
+|-------|---------|
+| `cache disabled` | Disable Anthropic prompt caching |
+| `cache tools array only` | Cache tool definitions only |
 | `cache tools array and system prompt` | Cache tools + system prompt |
-| `cache tools array, system prompt and messages` | Full caching (recommended) |
+| `cache tools array, system prompt and messages` | Cache tools + system + growing message history |
 
-> 💡 **RAG & Memory**: The pipe is aware of your settings and your intention, for example if you're attaching a PDF document with full context mode with NATIVE_PDF_UPLOAD active, it removed the RAG Promt and Sources entirely. If there's additional knowledge added, it strips the PDF RAG sources from RAG and moves the caching point to the previous messages as the last message is now always changing. It also extracts Memories from the System Promt and add them to the last user message when the Memory System is active to avoid cache misses. If you're encountering problems, feel free to open an issue!
+### UserValves (per-user)
 
-### UserValves (Per-User Settings)
-| Valve | Default | Range | Description |
-|-------|---------|-------|-------------|
-| `ENABLE_THINKING` | `false` | — | Enable Extended Thinking |
-| `THINKING_BUDGET_TOKENS` | `8192` | 1024–64000 | Token budget for thinking |
-| `EFFORT` | `high` | low/medium/high/max | Effort level (also controllable via OpenWebUI's `reasoning_effort`) |
-| `USE_PDF_NATIVE_UPLOAD` | `true` | — | Visual PDF analysis instead of RAG extraction |
-| `SHOW_TOKEN_COUNT` | `false` | — | Show context window progress bar |
-| `WEB_SEARCH_MAX_USES` | `5` | 1–20 | Max web searches per turn |
-| `WEB_FETCH_MAX_USES` | `5` | 1–20 | Max web fetch requests per turn |
-| `WEB_SEARCH_USER_*` | — | — | Override global location settings |
-| `SKILLS` | `[]` | — | Skills to activate (e.g., `pptx`, `xlsx`, `docx`, `pdf`, or custom IDs) |
-| `DEBUG_MODE` | `false` | — | Logs some internal and external parameters as citation to send me for debugging ;) |
+#### Reasoning and output
 
-### Toggle Filters & Companion
-| Filter | Purpose |
-|--------|---------|
-| **Thinking Toggle** | 🧠 Enable thinking for the next message |
-| **Companion Filter** | 🔀 Intercepts OpenWebUI's built-in `web_search` / `code_interpreter` buttons and routes them to native Anthropic tools |
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `ANTHROPIC_API_KEY` | `""` | Personal key override for the admin key |
+| `ENABLE_THINKING` | `false` | Enables extended thinking |
+| `THINKING_BUDGET_TOKENS` | `8192` | Manual thinking budget for models that still use `budget_tokens` |
+| `THINKING_DISPLAY` | `summarized` | `summarized` or `omitted` |
+| `EFFORT` | `high` | `low`, `medium`, `high`, `xhigh`, `max` (clamped by model support) |
+| `SHOW_TOKEN_COUNT` | `Off` | `Off`, `On`, or `With Cache` |
+| `DEBUG_MODE` | `false` | Extra logging and status output |
+
+#### Search, files, and skills
+
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `USE_PDF_NATIVE_UPLOAD` | `true` | Use native Anthropic PDF documents instead of RAG text extraction |
+| `WEB_SEARCH_MAX_USES` | `5` | Maximum native web searches per turn |
+| `WEB_FETCH_MAX_USES` | `5` | Maximum native web fetch calls per turn |
+| `WEB_SEARCH_USER_CITY / REGION / COUNTRY / TIMEZONE` | `""` | Per-user search-location overrides |
+| `ENABLE_DYNAMIC_FILTERING` | `false` | Enables Anthropic dynamic filtering flow for web search/fetch on supported models |
+| `USE_FILES_API` | `false` | Upload chat files to Anthropic Files API for code execution / skills |
+| `SKILLS` | `[]` | Skill IDs such as `pptx`, `xlsx`, `docx`, `pdf`, or custom uploaded skill IDs |
+
+#### Compaction and context editing
+
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `ENABLE_COMPACTION` | `false` | Enables Anthropic API compaction where the model supports it |
+| `COMPACTION_TRIGGER_TOKENS` | `50000` | Token threshold that triggers compaction |
+| `COMPACTION_INSTRUCTIONS` | `""` | Optional custom compaction prompt |
+| `CONTEXT_EDITING_STRATEGY` | `none` | `none`, `clear_tool_results`, `clear_thinking`, `clear_both` |
+| `CONTEXT_EDITING_THINKING_KEEP` | `0` | Recent assistant thinking turns to preserve; `0` means keep all |
+| `CONTEXT_EDITING_TOOL_TRIGGER` | `50000` | Token threshold for clearing tool results |
+| `CONTEXT_EDITING_TOOL_KEEP` | `5` | Number of recent tool results to keep |
+| `CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST` | `10000` | Minimum tokens to clear when triggered |
+| `CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT` | `false` | Also clear tool input payloads |
+
+### Important behavior notes
+
+- On **Opus 4.7 / Opus 4.6 / Sonnet 4.6**, the pipe automatically prefers **adaptive thinking** when the model advertises it.
+- Anthropic now recommends **`effort`** as the main control for adaptive-thinking models. `xhigh` is **Opus 4.7 only**. `max` is available on **Opus 4.7 / Opus 4.6 / Sonnet 4.6**.
+- `THINKING_DISPLAY="omitted"` suppresses streamed `thinking_delta` events, matching Anthropic's streaming behavior.
+- `USE_FILES_API` **overrides** native PDF upload. If enabled, the pipe uploads files to Anthropic and injects `container_upload` blocks at the correct message positions.
+- Anthropic's **Files API** supports create-once / use-many flows, but remains **beta**.
+- Anthropic **citations** work well with prompt caching, but Anthropic docs note they are incompatible with strict structured outputs.
+- `CACHE_TTL="1 hour"` maps to Anthropic's extended cache TTL (`{"type": "ephemeral", "ttl": "1h"}`).
+- `CONTEXT_EDITING_THINKING_KEEP=0` is the safest cache-friendly default. Sliding windows (`>0`) can reduce cache efficiency on long thinking-heavy chats.
+- `ENABLE_DYNAMIC_FILTERING` improves quality for supported web-search / web-fetch models but is **substantially slower** than the normal flow.
+- There is **no dedicated Claude memory tool** documented here anymore. This README intentionally reflects the current pipe surface only.
+
+### Toggle filters & companion filter
+
+| Component | Purpose |
+|-----------|---------|
+| **Thinking Toggle** | One-shot thinking enable for the next message |
+| **Web Search Toggle** | One-shot web-search forcing for the next message |
+| **Code Execution Toggle** | One-shot code-execution enable for the next message |
+| **Files API Toggle** | One-shot Files API mode for file-heavy / skill-heavy flows |
+| **Companion Filter** | Routes OpenWebUI's built-in `web_search` / `code_interpreter` UI actions to Anthropic-native tools |
 
 ---
 
-## 📝 Changelog
+## 📝 Recent pipe changes
 
-### v0.8.1
-- Added experimental Files API Support for uploading files to the Container. Feedback welcome!
-- Added a Valve to control wheter Opus/Sonnet 4.6 should use the new dynamic web_fetching and web_searching (At least I have issues with that)
+### `v0.9.8`
+- Persist `server_tool_use` / `server_tool_result` blocks as hidden carriers so native Anthropic server tools survive multi-turn replay
+- Merge `web_search` / `web_fetch` use + result into a **single** collapsible block per call
+- Remove redundant status spam for search/fetch; details stay inline in the conversation instead
 
-### v0.8.0
-- Major streaming refactor: rebuilt on Anthropic SDK message accumulation
-- Programmatic Tool Calling — Claude orchestrates tools from within code execution
-- Web Fetch tool — Claude can fetch and analyze URL content
-- Fine-grained tool streaming with eager input streaming (GA)
-- Unified code execution display (code + tool calls + output in one block)
-- Updated web_search to `web_search_20260209` with dynamic filtering
-- Citations now correctly appear after cited text
-- Tool search status shows actual search query
-- Model capabilities updated for Sonnet 4.5/4.6 and Opus 4.6
-- Stop reason debug logging for tool loop diagnostics
+### `v0.9.7`
+- Persist thinking block signatures across turns
+- Reconstruct historical reasoning blocks back into structured Anthropic `thinking` blocks for better continuity and cache behavior
 
-### v0.7.1
-- Removed deprecated Sonnet 3.7 and Haiku 3 models
+### `v0.9.6`
+- OpenWebUI `0.9.0+` compatibility update for async DB/model APIs
+- Replay historical `<details type="tool_calls">` back into structured tool blocks so Claude stops losing prior tool-call history
 
-### v0.7.0
-- Sonnet 4.6 model support
-- Fast Mode for Opus 4.6 (`speed: "fast"`)
-- Web fetch tool (URL content retrieval)
-- Memory tool integration with OpenWebUI memory system
-- Fixed task model bug (`_run_task_model_request()` extra argument)
+### `v0.9.5`
+- Add **Claude Opus 4.7** support
+- Add `xhigh` effort
+- Clamp unsupported effort values per model automatically
 
-### v0.6.3
-- Opus 4.6 model support
-- Effort: `max` support
-- Data Residency (`inference_geo`) support
-- Messages for stop_reason (refusal, stop_sequence, context exceeded)
-- `ENABLE_INTERLEAVED_THINKING` valve
-- Homogenized thinking and tool call/result streaming to match built-in UX
+### `v0.9.4`
+- Add cache statistics to token-count output
 
-### v0.6.2
-- Reordered payload for better caching
+### `v0.9.3`
+- Move **compaction** and **context editing** from admin valves to **UserValves**
+- Upgrade `SHOW_TOKEN_COUNT` from boolean to `Off` / `On` / `With Cache`
 
-### v0.6.1
-- Full Skills support (pptx, xlsx, docx, pdf, custom) with API validation and caching
+### `v0.9.2`
+- Add compaction and client-side pre-trim before request submission
 
-### v0.6.0
-- Live thinking streaming with collapsible blocks
-- Companion Filter for routing OpenWebUI web_search/code_interpreter to Anthropic tools
-- Files API upload for code execution file access
-- Built-in OpenWebUI tools support (0.7.x)
-- Native PDF markers for multi-turn file persistence
-- Container ID persistence for code execution state
-- Fixed RAG + Native PDF Upload interaction
+### `v0.9.1`
+- Return the full final message and persist stream content through `message` delta behavior to avoid empty saved messages
+
+### `v0.9.0`
+- Fetch model capabilities directly from Anthropic's Models API
+- Add support for `thinking.display: "omitted"`
+- Fix usage handling when analytics/token capabilities differ between models
 
 <details>
-<summary><b>v0.5.x</b> (click to expand)</summary>
+<summary><b>Older 0.8.x milestones</b></summary>
 
-### v0.5.12
-- Thinking is now streamed in the UI and folded when the thought process has ended
+### `v0.8.12`
+- API tool passthrough for external function calling
+- Add `ANTHROPIC_BASE_URL`
+- Fix OpenTerminal tools and tool-result grouping
 
-### v0.5.11
-- Compatibility with built-in tools from OpenWebUI 0.7.x
+### `v0.8.11`
+- Add `CACHE_TTL`
+- Add proper stream completion event in final phase
+- Fix programmatic tool calling and OpenWebUI 0.8.11 grouping behavior
 
-### v0.5.10
-- Pre-compiled regex patterns at module level
-- Debug logging guards for expensive JSON serialization
-- Comprehensive docstring and section comments
+### `v0.8.10`
+- Rich UI tool results (`HTMLResponse`, embeds, files)
+- OpenWebUI Skills support
 
-### v0.5.9
-- Native PDF upload via `USE_PDF_NATIVE_UPLOAD` UserValve
+### `v0.8.9`
+- Request / tool timeouts
+- Optional per-user API key override
+- Remove separate 1M-context valve now that extended context is model/capability driven
 
-### v0.5.8
-- Fixed UnboundLocalError for `total_usage` variable
-- Code execution added to `TOOL_SEARCH_EXCLUDE_TOOLS`
+### `v0.8.8`
+- Interleaved thinking + tool-call fixes
+- Stream code/tool input into live collapsible blocks
+- Surface tool-call errors correctly instead of spinning forever
 
-### v0.5.7
-- Tool search exclusion valve
-- Web Search Toggle overrides `WEB_SEARCH` valve
-- Fixed Tool Search return
+### `v0.8.7`
+- Native OpenWebUI `code_interpreter` details format for code execution
+- Removed redundant code-exec status events
 
-### v0.5.6
-- Context Editing (clear_tool_results, clear_thinking)
-- Tool Search (BM25/Regex) with deferred loading
-- Status events for context clearing
-
-### v0.5.4
-- Fixed Message Caching Problems when using RAG or Memories
-
-### v0.5.3
-- Effort Levels (`low`, `medium`, `high`)
-- Opus 4.5 support
-- UserValves for per-user settings
-
-### v0.5.2
-- Fixed usage statistics accumulation for multi-step tool calls
-
-### v0.5.1
-- Fixed caching in tool execution loops
-
-### v0.5.0
-- **CRITICAL FIX**: Eliminated cross-talk between concurrent users/requests
-
-</details>
-
-<details>
-<summary><b>v0.4.x</b> (click to expand)</summary>
-
-#### v0.4.9
-- Performance optimization: Moved local imports to top level
-- Fixed fallback logic for model fetching
-
-#### v0.4.8
-- Added configurable `MAX_TOOL_CALLS` valve (default: 15)
-- Immediate tool execution status events
-- Proactive warnings when approaching tool call limit
-
-#### v0.4.7
-- Fixed potential data leakage between concurrent users
-
-#### v0.4.6
-- Tool results now display input parameters at the top
-
-#### v0.4.5
-- Added status events for local tool execution
-- Better UX for long-running tools
-
-#### v0.4.4
-- Tool calls now execute in parallel
-- Fixed server tool identification
-
-#### v0.4.3
-- Fixed compatibility with OpenWebUI "Chat with Notes"
-
-#### v0.4.2
-- Fixed NoneType error in OpenWebUI Channels
-
-#### v0.4.1
-- Added token count display valve
-- Auto-enable native function calling
-
-#### v0.4.0
-- Added Task Support (titles, tags, follow-ups)
-- Fixed server + local tool use conflict
-
-</details>
-
-<details>
-<summary><b>v0.3.x</b> (click to expand)</summary>
-
-#### v0.3.9
-- Added fine-grained cache control valve (4 levels)
-
-#### v0.3.8
-- Removed MAX_OUTPUT_TOKENS valve
-- Reworked caching with OpenWebUI Memory System
-- Added retry logic for transient errors
-
-#### v0.3.7
-- Fixed Extended Thinking compatibility with Tool Use
-
-#### v0.3.6
-- Added Claude 4.5 Haiku Model
-
-#### v0.3.5
-- Fixed last chunk not sent bug
-- Added correct citation handling for Web Search
-
-#### v0.3.4
-- Added Claude 4.5 Sonnet support
-- Added OpenWebUI token usage compatibility
-- Added duplicate tool name validation
-
-#### v0.3.3 - v0.3.1
-- Various bug fixes
-
-#### v0.3.0 (September 2025)
-- Added Vision support
-- Added Extended Thinking filter
-- Added Web Search enforcement toggle
-- Added Anthropic Code Execution Tool
-- Improved cache control with dynamic Memory/RAG detection
-- Added 1M context beta header for Sonnet 4
-
-</details>
-
-<details>
-<summary><b>v0.2.0</b> (August 2025)</summary>
-
-- Fixed caching by moving Memories to Messages
-- Cache usage statistics display
-- Fixed last chunk not showing in frontend
-- Implemented Web Search valves and error handling
-- Added Cache_Control for System_Prompt, Tools, and Messages
+### `v0.8.0`
+- Major streaming refactor to Anthropic SDK message accumulation
+- Web fetch
+- programmatic tool calling
+- unified code execution display
+- `web_search_20260209` support
 
 </details>
 
@@ -362,7 +281,7 @@ A comprehensive Anthropic API integration for Open WebUI built on the **Anthropi
 
 ## 🤝 Contributing
 
-Bug reports and feature requests are welcome! Feel free to [open an issue](https://github.com/Podden/openwebui_anthropic_api_manifold_pipe/issues) if you encounter any problems.
+Bug reports and feature requests are welcome. If something breaks, opens twice, or starts philosophizing in HTML, please [open an issue](https://github.com/Podden/openwebui_anthropic_api_manifold_pipe/issues).
 
 ---
 
@@ -376,5 +295,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - Built for [Open WebUI](https://github.com/open-webui/open-webui)
 - Powered by [Anthropic Claude](https://www.anthropic.com/)
-- Thanks Balaxxe and nbellochi for their original Pipe
----
+- Based on earlier work by Balaxxe and nbellochi

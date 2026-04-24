@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.7
+version: 0.9.8
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -34,10 +34,24 @@ Supports:
 - Native PDF Upload (visual PDF analysis with charts/images)
 - Agent Skills (pptx, xlsx, docx, pdf and custom skills)
 - Fast Mode (research preview) for Opus 4.6 / 4.7
-- Memory Tool (integrated with OpenWebUI memory system)
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.8
+- Added correct handling of Server Tool Blocks as well (web_search, web_fetch, code_execution family) are now persisted as
+  hidden carriers (`<details type="tool_calls" data-block-kind="server_tool_use|server_tool_result"
+  data-payload-b64="...">`) 
+- web_search / web_fetch now render ONE merged collapsible per call instead of two adjacent
+  blocks. The `server_tool_use` carrier is updated in-place via `replace` event when the
+  matching `*_tool_result` arrives, embedding both payloads (`data-payload-b64` +
+  `data-result-payload-b64`). Replay decodes both into separate API blocks at the original
+  position so tool_use + tool_result ordering is preserved.
+- Removed redundant status events ("🔍 Searching for: …", "🌐 Fetching: …", "Found X results
+  - … +N more", "🌐 URL fetched", error variants). All info now lives inside the collapsible
+  body so it stays inline with the conversation flow and never leaks back to the API
+  (status text is body-only; replay only consumes base64 payloads).
+- A lot of cleanup
+
 v0.9.7
 - Persist thinking block signatures across turns. `<details type="reasoning">`
   blocks now carry a `data-signature` HTML attribute carrying the opaque
@@ -49,6 +63,8 @@ v0.9.7
   anyway on non-tool-result turns).
 
 v0.9.6
+- open-webui 0.9.0+ compatibility update (async DB API)
+- fixed token counting for analytics tab
 - Fixed tool-call history loss (GitHub issue #30): historical assistant messages with
   <details type="tool_calls"> HTML are now parsed back into structured tool_use/tool_result
   blocks instead of being stripped. Claude no longer loses evidence of prior tool calls
@@ -411,7 +427,6 @@ v0.2
 
 import re
 import os
-import shutil
 import base64
 import traceback
 import inspect
@@ -424,7 +439,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote
-from typing import Any, Callable, List, Union, Dict, Optional
+from typing import Any, Callable, List, Union, Dict, Optional, Tuple
 from pydantic import BaseModel, Field
 from anthropic import (
     APIStatusError,
@@ -498,8 +513,12 @@ PATTERN_EMPTY_ATTACHED = re.compile(
 # Pattern to strip OpenWebUI <details type="tool_calls"> blocks from conversation history.
 # These are UI-rendering artifacts that cause Claude 4.6 models to pattern-match and
 # generate fake tool call HTML instead of making actual API tool_use calls.
+# NOTE: negative lookahead excludes our persisted server-tool carrier blocks
+# (which also use type="tool_calls" so OpenWebUI's Svelte parser groups them
+# with adjacent <details type="reasoning"> / <details type="code_interpreter">).
+# Those carriers are identified by data-payload-b64 and processed separately.
 PATTERN_TOOL_CALLS_DETAILS = re.compile(
-    r'\n?<details type="tool_calls"[^>]*>.*?</details>\n?',
+    r'\n?<details type="tool_calls"(?![^>]*data-payload-b64=)[^>]*>.*?</details>\n?',
     flags=re.DOTALL,
 )
 
@@ -508,8 +527,10 @@ PATTERN_TOOL_CALLS_DETAILS = re.compile(
 # Group 1 captures the attributes string (id, name, arguments, result, done, error).
 # Attribute values are html.escape()'d JSON — no raw '"' inside — so a simple
 # `(\w+)="([^"]*)"` attribute parser is safe.
+# Negative lookahead mirrors PATTERN_TOOL_CALLS_DETAILS so server-tool carriers
+# don't get pulled into the client-side tool_use reconstruction path.
 PATTERN_TOOL_CALLS_BLOCK = re.compile(
-    r'\n?<details type="tool_calls"([^>]*)>.*?</details>\n?',
+    r'\n?<details type="tool_calls"(?![^>]*data-payload-b64=)([^>]*)>.*?</details>\n?',
     flags=re.DOTALL,
 )
 PATTERN_TOOL_CALLS_ATTRS = re.compile(r'(\w+)="([^"]*)"')
@@ -527,6 +548,38 @@ PATTERN_REASONING_BLOCK = re.compile(
 # Matches a quoted-line body: strips the leading "> " prefix per line.
 PATTERN_REASONING_QUOTED_LINE = re.compile(r'^>\s?', flags=re.MULTILINE)
 
+# Patterns to MATCH persisted server-tool carrier blocks for round-trip
+# reconstruction into structured Claude API blocks.
+#
+# CARRIER FORMAT: <details type="tool_calls" data-block-kind="server_tool_use|server_tool_result" data-payload-b64="...">
+#
+# type="tool_calls" is critical: OpenWebUI's Svelte parser
+# (GROUPABLE_DETAIL_TYPES = {'tool_calls','reasoning','code_interpreter'})
+# only merges consecutive <details> into the single "Exploring/Explored"
+# bubble when all siblings use one of those three types. Using a custom type
+# like "server_tool_use" placed BETWEEN reasoning and code_interpreter blocks
+# breaks the group and renders as three separate collapsibles.
+#
+# data-block-kind disambiguates server-tool carriers from regular OpenWebUI
+# tool_calls UI blocks (which we still want to strip via
+# PATTERN_TOOL_CALLS_DETAILS above).
+#
+# The opaque block payload (id, name, input for server_tool_use;
+# tool_use_id + content array for *_tool_result) is stored as a base64-encoded
+# JSON blob in ``data-payload-b64`` for byte-exact round-trip — preserving
+# thinking-block ordering (otherwise: 400 "thinking blocks cannot be modified")
+# and prompt-cache prefix stability.
+PATTERN_SERVER_TOOL_USE_BLOCK = re.compile(
+    r'\n?<details type="tool_calls"([^>]*?data-block-kind="server_tool_use"[^>]*)>.*?</details>\n?',
+    flags=re.DOTALL,
+)
+PATTERN_SERVER_TOOL_RESULT_BLOCK = re.compile(
+    r'\n?<details type="tool_calls"([^>]*?data-block-kind="server_tool_result"[^>]*)>.*?</details>\n?',
+    flags=re.DOTALL,
+)
+# Generic data-* attribute extractor for server-tool block attrs.
+PATTERN_DATA_ATTR = re.compile(r'data-([\w-]+)="([^"]*)"')
+
 # Pattern to strip OpenWebUI <details type="code_interpreter"> blocks from conversation history.
 PATTERN_CODE_INTERPRETER_DETAILS = re.compile(
     r'\n?<details type="code_interpreter"[^>]*>.*?</details>\n?',
@@ -540,9 +593,8 @@ PATTERN_COMPACTION_DETAILS = re.compile(
 )
 
 # Note: Some patterns are compiled dynamically at runtime because they depend
-# on user-provided data (filenames, file IDs). See:
+# on user-provided data (filenames). See:
 #   - _remove_specific_sources_from_rag_message() - dynamic filename pattern
-#   - _remove_attached_files_tags() - dynamic file ID pattern
 
 # =============================================================================
 # IMPORTS
@@ -589,16 +641,14 @@ except ImportError:
     Path = None
     FILES_AVAILABLE = False
 
-# =============================================================================
-# CONSTANTS
-# =============================================================================
+# Import OpenWebUI Chats for persisting usage to chat_message table (0.9.0+ analytics)
+try:
+    from open_webui.models.chats import Chats
 
-# Claude memory tool uses filesystem storage (no dependency on OpenWebUI Memories)
-# Files stored under DATA_DIR/claude_memories/{user_id}/memories/
-CLAUDE_MEMORY_DIR = os.path.join(
-    os.environ.get("DATA_DIR", "data"), "claude_memories"
-)
-
+    CHATS_AVAILABLE = True
+except ImportError:
+    Chats = None
+    CHATS_AVAILABLE = False
 
 @dataclass
 class PipeRenderStrategy:
@@ -650,11 +700,6 @@ class PipeRequestContext:
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
     _DEFAULT_API_BASE = "https://api.anthropic.com"
-
-    @property
-    def MODEL_URL(self):
-        base = self.valves.ANTHROPIC_BASE_URL.strip().rstrip("/") if hasattr(self, "valves") and self.valves.ANTHROPIC_BASE_URL.strip() else self._DEFAULT_API_BASE
-        return f"{base}/v1/messages"
 
     # Capability overrides for fields NOT available from the /v1/models API.
     # The API now provides: max_tokens, max_input_tokens, capabilities (thinking, effort, vision, etc.)
@@ -763,11 +808,6 @@ class Pipe:
             default=False,
             description="Enable Fast Mode for Opus 4.6 / 4.7. Up to 2.5x faster output at higher costs",
         )
-        # Not quite finished with testing yet, disabled for now
-        # ENABLE_CLAUDE_MEMORY: bool = Field(
-        #     default=False,
-        #     description="Enable Claude memory tool (files stored per-user under data/claude_memories/)",
-        # )
         ENABLE_INTERLEAVED_THINKING: bool = Field(
             default=True,
             description="Enable interleaved thinking. Claude can generate thinking blocks between tool calls instead of only at the end.",
@@ -953,10 +993,10 @@ class Pipe:
             description="Context editing strategy: none (disabled), clear_tool_results, clear_thinking, or clear_both.",
         )
         CONTEXT_EDITING_THINKING_KEEP: int = Field(
-            default=5,
+            default=0,
             ge=0,
             le=9999,
-            description="How many thinking blocks to keep",
+            description="How many recent assistant turns with thinking blocks to preserve. 0 = keep all (maximizes cache hits — recommended). N>0 = sliding window; Anthropic server-side clears oldest thinking each turn once exceeded, which INVALIDATES the prompt cache prefix on every subsequent request. Only use N>0 if context-window pressure outweighs cache savings.",
         )
         CONTEXT_EDITING_TOOL_TRIGGER: int = Field(
             default=50000,
@@ -993,6 +1033,10 @@ class Pipe:
         self._validated_skills_cache: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = (
             {}
         )
+        # Per-chat_id cache of last request's messages[] signature list,
+        # used by _log_message_hash_diff to identify byte-drift between turns
+        # that invalidates the Anthropic prompt cache.
+        self._cache_diff_state: Dict[str, List[Tuple[str, str]]] = {}
 
     async def get_anthropic_models(self) -> List[dict]:
         """
@@ -1076,7 +1120,7 @@ class Pipe:
     # PDF & FILE HANDLING
     # =========================================================================
 
-    def _get_pdf_base64_from_file_id(self, file_id: str) -> Optional[tuple[str, str]]:
+    async def _get_pdf_base64_from_file_id(self, file_id: str) -> Optional[tuple[str, str]]:
         """
         Read a PDF file from storage and return base64 encoded data.
 
@@ -1091,7 +1135,7 @@ class Pipe:
             return None
 
         try:
-            file = Files.get_file_by_id(file_id)
+            file = await Files.get_file_by_id(file_id)
             if not file:
                 logger.warning(f"File not found: {file_id}")
                 return None
@@ -1136,7 +1180,7 @@ class Pipe:
             logger.error(f"Error reading PDF file {file_id}: {e}")
             return None
 
-    def _get_full_context_pdfs(
+    async def _get_full_context_pdfs(
         self,
         __files__: Optional[List[Dict[str, Any]]],
         previous_marker_metadata: List[str],
@@ -1177,7 +1221,7 @@ class Pipe:
                 continue
 
             # Get base64 encoded PDF
-            result = self._get_pdf_base64_from_file_id(file_id)
+            result = await self._get_pdf_base64_from_file_id(file_id)
             if result:
                 encoded_data, filename = result
                 pdf_documents.append(
@@ -1200,65 +1244,6 @@ class Pipe:
     # =========================================================================
     # RAG (RETRIEVAL-AUGMENTED GENERATION) HANDLING
     # =========================================================================
-
-    def _extract_rag_from_system_message(
-        self, system_messages: List[Dict[str, Any]]
-    ) -> Optional[str]:
-        """
-        Extract RAG content from system messages (when RAG_SYSTEM_CONTEXT is True).
-        Returns the RAG message string if found, None otherwise.
-
-        This handles the case where OpenWebUI puts RAG content in system prompts
-        instead of user messages based on RAG_SYSTEM_CONTEXT env var.
-
-        Args:
-            system_messages: List of system message blocks
-
-        Returns:
-            str: Extracted RAG content including template and context tags, or None
-        """
-        for block in system_messages:
-            if block.get("type") != "text":
-                continue
-
-            text = block.get("text", "")
-
-            # Check if this contains RAG template markers
-            if "### Task:" not in text or "<context>" not in text:
-                continue
-
-            # Extract the RAG portion (from ### Task: to end of </context>)
-            match = PATTERN_RAG_MESSAGE.search(text)
-            if match:
-                logger.debug(
-                    f"📋 RAG: Found RAG content in system message ({len(match.group(0))} chars)"
-                )
-                return match.group(0)
-
-        return None
-
-    def _remove_rag_from_system_messages(
-        self, system_messages: List[Dict[str, Any]]
-    ) -> None:
-        """
-        Remove RAG content from system messages in-place.
-
-        Args:
-            system_messages: List of system message blocks to modify
-        """
-        for i, block in enumerate(system_messages):
-            if block.get("type") != "text":
-                continue
-
-            text = block.get("text", "")
-            match = PATTERN_RAG_MESSAGE.search(text)
-
-            if match:
-                # Remove RAG content
-                cleaned = text[: match.start()] + text[match.end() :]
-                system_messages[i]["text"] = cleaned.strip()
-                logger.debug(f"📋 RAG: Removed RAG from system message")
-                break
 
     def _remove_rag_message(
         self,
@@ -1423,56 +1408,6 @@ class Pipe:
                 processed_messages[i]["content"] = new_content
                 return  # Only process the first matching user message
 
-    def _remove_attached_files_tags(
-        self,
-        processed_messages: List[Dict[str, Any]],
-        file_ids_to_remove: List[str],
-    ) -> None:
-        """
-        Remove <attached_files> or individual <file> tags for files that were processed natively.
-
-        These tags are removed because:
-        - Native PDF uploads are embedded as base64 in the message
-        - Files API uploads are referenced via file_id
-        - Code execution cannot access files by OpenWebUI URL
-
-        Args:
-            processed_messages: List of messages to process
-            file_ids_to_remove: List of OpenWebUI file IDs whose attached_files tags should be removed
-        """
-        if not file_ids_to_remove:
-            return
-
-        # Build pattern to match individual file tags with specific IDs
-        escaped_ids = [re.escape(fid) for fid in file_ids_to_remove]
-        file_tag_pattern = re.compile(
-            r'<file[^>]*url="(' + "|".join(escaped_ids) + r')"[^>]*/?>\s*', re.DOTALL
-        )
-
-        # Pattern to match empty attached_files blocks after removal
-        # PATTERN_EMPTY_ATTACHED is pre-compiled at module level
-
-        for msg in processed_messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if block.get("type") != "text":
-                    continue
-                text = block.get("text", "")
-                original_len = len(text)
-                # First remove matching file tags
-                text = file_tag_pattern.sub("", text)
-                # Then remove empty attached_files blocks
-                text = PATTERN_EMPTY_ATTACHED.sub("", text)
-                if len(text) != original_len:
-                    block["text"] = text
-                    logger.debug(
-                        f"📋 Removed attached_files tags for {len(file_ids_to_remove)} file(s)"
-                    )
-
     # =========================================================================
     # FILES API (UPLOAD, DOWNLOAD, DEDUPLICATION)
     # =========================================================================
@@ -1507,7 +1442,7 @@ class Pipe:
 
             # Create OpenWebUI file record
             file_hash = hashlib.sha256(content).hexdigest()
-            Files.insert_new_file(
+            await Files.insert_new_file(
                 user_id=user_id,
                 form_data=type("FileForm", (), {
                     "model_dump": lambda self_: {
@@ -1593,7 +1528,7 @@ class Pipe:
             content_type = file.get("content_type", "")
             if not content_type:
                 # Fallback: check OpenWebUI file meta for content_type
-                file_record_check = Files.get_file_by_id(file_id_owui)
+                file_record_check = await Files.get_file_by_id(file_id_owui)
                 if file_record_check and file_record_check.meta:
                     content_type = file_record_check.meta.get("content_type", "")
             if content_type and content_type.startswith("image/"):
@@ -1601,7 +1536,7 @@ class Pipe:
                 continue
 
             # Look up OpenWebUI file record for cached anthropic_file_id
-            file_record = Files.get_file_by_id(file_id_owui)
+            file_record = await Files.get_file_by_id(file_id_owui)
             if not file_record:
                 logger.warning(f"File not found in DB: {file_id_owui}")
                 continue
@@ -1641,7 +1576,7 @@ class Pipe:
                     msg_num = current_user_msg_num
 
                     # Cache in OpenWebUI file metadata
-                    Files.update_file_metadata_by_id(file_id_owui, {
+                    await Files.update_file_metadata_by_id(file_id_owui, {
                         "anthropic_file_id": anthropic_file_id,
                         "anthropic_file_msg_idx": msg_num,
                     })
@@ -1687,6 +1622,204 @@ class Pipe:
         if self.valves.CACHE_TTL == "1 hour":
             marker["ttl"] = "1h"
         return marker
+
+    @staticmethod
+    def _strip_payload(payload: dict, max_str: int = 20) -> dict:
+        """Return a copy of the outgoing Anthropic payload with *minimal*
+        structural changes, safe for debug logging.
+
+        Only two things change:
+          1. ``tools`` is replaced with a small summary (count + names +
+             indices carrying cache_control).
+          2. Every string value reachable inside ``messages`` is truncated to
+             ``max_str`` chars + ``…[Nc]`` length marker.
+
+        Everything else — key order, whitespace inside non-messages strings,
+        `system`, `cache_control`, booleans, numbers, None values, extra
+        top-level fields — is left **byte-for-byte** untouched so that two
+        consecutive dumps can be diffed to locate cache-invalidating drift
+        (double newlines, missing spaces, re-ordered keys, etc).
+        """
+        def _clip(s):
+            if isinstance(s, str) and len(s) > max_str:
+                import hashlib as _hl
+                _h = _hl.sha1(s.encode("utf-8", "replace")).hexdigest()[:8]
+                return f"{s[:max_str]}…[{len(s)}c#{_h}]"
+            return s
+
+        def _walk(node):
+            if isinstance(node, dict):
+                return {k: _walk(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [_walk(v) for v in node]
+            if isinstance(node, str):
+                return _clip(node)
+            return node
+
+        stripped: dict = {}
+        for k, v in payload.items():
+            if k == "tools":
+                tools = v or []
+                stripped["tools"] = {
+                    "__tools_count__": len(tools),
+                    "names": [
+                        (t.get("name") or t.get("type") or "?")
+                        for t in tools if isinstance(t, dict)
+                    ],
+                    "cache_control_idx": [
+                        i for i, t in enumerate(tools)
+                        if isinstance(t, dict) and "cache_control" in t
+                    ],
+                }
+            elif k == "messages":
+                stripped["messages"] = _walk(v)
+            else:
+                stripped[k] = v
+        return stripped
+
+    def _log_message_hash_diff(self, chat_id: Optional[str], payload: dict) -> None:
+        """Compare the current outgoing payload.messages[] against the previous
+        request for the same chat_id. Log first divergence index + per-message
+        hash table so we can pinpoint which assistant/user message mutated
+        between turns and broke the Anthropic prompt cache prefix.
+
+        Uses hashlib.sha1 on ``json.dumps(sort_keys=True, separators=(",", ":"))``
+        of each message (minus cache_control markers, which legitimately move).
+        """
+        if not chat_id:
+            return
+        try:
+            msgs = payload.get("messages", []) or []
+
+            def _hash_msg(m: dict) -> tuple[str, str]:
+                """Return (insertion_order_hash, sorted_hash). The SDK sends
+                dicts in Python insertion order, so insertion_order_hash is
+                what the API actually sees for cache purposes. sorted_hash
+                tells us whether the *content* matches regardless of order."""
+                import hashlib
+                try:
+                    canon_ins = json.dumps(m, sort_keys=False, separators=(",", ":"), ensure_ascii=False,
+                                           default=lambda o: repr(o))
+                except Exception:
+                    canon_ins = repr(m)
+                try:
+                    def _strip(obj):
+                        if isinstance(obj, dict):
+                            return {k: _strip(v) for k, v in obj.items() if k != "cache_control"}
+                        if isinstance(obj, list):
+                            return [_strip(v) for v in obj]
+                        return obj
+                    canon_sorted = json.dumps(_strip(m), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                              default=lambda o: repr(o))
+                except Exception:
+                    canon_sorted = repr(m)
+                ins_h = hashlib.sha1(canon_ins.encode("utf-8")).hexdigest()[:10]
+                sort_h = hashlib.sha1(canon_sorted.encode("utf-8")).hexdigest()[:10]
+                return (ins_h, sort_h)
+
+            def _summarize(m: dict) -> str:
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    return f"{role}:text({len(content)}c)"
+                if isinstance(content, list):
+                    parts = []
+                    for b in content:
+                        if not isinstance(b, dict):
+                            parts.append(type(b).__name__)
+                            continue
+                        bt = b.get("type", "?")
+                        if bt == "text":
+                            parts.append(f"text({len(b.get('text', ''))}c)")
+                        elif bt == "tool_use":
+                            parts.append(f"tool_use({b.get('name', '?')})")
+                        elif bt == "tool_result":
+                            c = b.get("content", "")
+                            clen = len(c) if isinstance(c, str) else len(c) if isinstance(c, list) else 0
+                            parts.append(f"tool_result({clen})")
+                        else:
+                            parts.append(bt)
+                    return f"{role}:[{','.join(parts)}]"
+                return f"{role}:?"
+
+            hash_pairs = [_hash_msg(m) for m in msgs]
+            ins_hashes = [h[0] for h in hash_pairs]
+            sort_hashes = [h[1] for h in hash_pairs]
+            summaries = [_summarize(m) for m in msgs]
+            prev_pairs = self._cache_diff_state.get(chat_id, [])
+            prev_ins = [p[0] for p in prev_pairs]
+            prev_sort = [p[1] for p in prev_pairs]
+
+            if prev_pairs:
+                overlap = min(len(prev_pairs), len(hash_pairs))
+                # Check insertion-order (what the API actually sees)
+                ins_first_diff = None
+                for i in range(overlap):
+                    if prev_ins[i] != ins_hashes[i]:
+                        ins_first_diff = i
+                        break
+                # Check sorted/content (what we'd naively consider "the same")
+                sort_first_diff = None
+                for i in range(overlap):
+                    if prev_sort[i] != sort_hashes[i]:
+                        sort_first_diff = i
+                        break
+
+                if ins_first_diff is None and sort_first_diff is None:
+                    logger.info(
+                        f"🧊 CACHE-DIFF chat={chat_id}: prefix FULLY STABLE (ins+sort) over {overlap} msgs "
+                        f"(prev={len(prev_pairs)}, now={len(hash_pairs)}, appended={len(hash_pairs) - overlap}) ✓"
+                    )
+                elif ins_first_diff is not None and sort_first_diff is None:
+                    # CRITICAL: content equal but KEY ORDER diverged → API cache miss!
+                    logger.warning(
+                        f"🔥🔑 CACHE-DIFF chat={chat_id}: KEY-ORDER drift at msg[{ins_first_diff}] "
+                        f"(content identical, but dict insertion order differs → API sees different bytes)"
+                    )
+                elif ins_first_diff == sort_first_diff:
+                    logger.warning(
+                        f"🔥 CACHE-DIFF chat={chat_id}: prefix DIVERGES at msg[{ins_first_diff}] "
+                        f"(content+order both differ, overlap={overlap}, prev={len(prev_pairs)}, now={len(hash_pairs)})"
+                    )
+                else:
+                    logger.warning(
+                        f"🔥 CACHE-DIFF chat={chat_id}: ins_diff@{ins_first_diff}, sort_diff@{sort_first_diff} "
+                        f"(overlap={overlap})"
+                    )
+
+                if ins_first_diff is not None:
+                    lo = max(0, ins_first_diff - 1)
+                    hi = min(max(len(prev_pairs), len(hash_pairs)), ins_first_diff + 3)
+                    for i in range(lo, hi):
+                        pi = prev_ins[i] if i < len(prev_ins) else "----------"
+                        ps = prev_sort[i] if i < len(prev_sort) else "----------"
+                        ni = ins_hashes[i] if i < len(ins_hashes) else "----------"
+                        ns = sort_hashes[i] if i < len(sort_hashes) else "----------"
+                        sm = summaries[i] if i < len(summaries) else "(absent)"
+                        marker = "  " if pi == ni and ps == ns else "**"
+                        logger.warning(
+                            f"  {marker} msg[{i}]: ins prev={pi} now={ni} | sort prev={ps} now={ns} {sm}"
+                        )
+                    # Dump FULL JSON (insertion order) for diffing
+                    try:
+                        if ins_first_diff < len(msgs):
+                            canon_ins = json.dumps(msgs[ins_first_diff], sort_keys=False, separators=(",", ":"), ensure_ascii=False)
+                            logger.warning(
+                                f"  ** msg[{ins_first_diff}] NOW-INS-ORDER ({len(canon_ins)}c): "
+                                f"{canon_ins[:4000]}{'...(truncated)' if len(canon_ins) > 4000 else ''}"
+                            )
+                    except Exception:
+                        pass
+
+            self._cache_diff_state[chat_id] = hash_pairs
+            # Bound memory: keep only last ~20 chats
+            if len(self._cache_diff_state) > 20:
+                # drop oldest inserted (FIFO)
+                oldest = next(iter(self._cache_diff_state))
+                if oldest != chat_id:
+                    self._cache_diff_state.pop(oldest, None)
+        except Exception as e:
+            logger.debug(f"_log_message_hash_diff failed: {e}")
 
     def _apply_cache_control(self, payload: dict, is_tool_loop: bool = False) -> None:
         """Apply cache_control breakpoints to the payload right before sending to the API.
@@ -1858,11 +1991,17 @@ class Pipe:
             "stream": body.get("stream", True),
             "metadata": body.get("metadata", {}),
         }
-        if body.get("temperature") is not None:
+        # Opus 4.7 and the 4.6+ adaptive-thinking family reject sampling params
+        # (temperature / top_p / top_k) — API returns 400. Strip them there.
+        # Heuristic: models that support adaptive thinking (Opus 4.6, Sonnet 4.6,
+        # Opus 4.7) do not accept these fields when adaptive is enabled. On Opus
+        # 4.7 they are rejected unconditionally. Safe to skip for the whole set.
+        _strip_sampling = bool(model_info.get("supports_adaptive_thinking"))
+        if not _strip_sampling and body.get("temperature") is not None:
             payload["temperature"] = float(body.get("temperature", 0))
-        if body.get("top_k") is not None:
+        if not _strip_sampling and body.get("top_k") is not None:
             payload["top_k"] = float(body.get("top_k", 0))
-        if body.get("top_p") is not None:
+        if not _strip_sampling and body.get("top_p") is not None:
             payload["top_p"] = float(body.get("top_p", 0))
 
         # Add data residency if set to US (1.1x token cost)
@@ -2000,7 +2139,7 @@ class Pipe:
             elif __user__["valves"].USE_PDF_NATIVE_UPLOAD:
                 # Native PDF upload (base64 document blocks) — only PDFs
                 pdf_documents_content_blocks, new_marker_metadata = (
-                    self._get_full_context_pdfs(__files__, previous_marker_metadata)
+                    await self._get_full_context_pdfs(__files__, previous_marker_metadata)
                 )
                 if pdf_documents_content_blocks:
                     processed_messages[0]["content"] = (
@@ -2174,11 +2313,14 @@ class Pipe:
                 and enable_thinking
                 and model_info["supports_thinking"]
             ):
+                _keep_val = __user__["valves"].CONTEXT_EDITING_THINKING_KEEP
                 clear_thinking = {
                     "type": "clear_thinking_20251015",
-                    "keep": {
+                    # keep=0 → "all" (preserve all thinking → stable prompt cache).
+                    # keep>0 → sliding window (breaks cache every turn past threshold).
+                    "keep": "all" if _keep_val <= 0 else {
                         "type": "thinking_turns",
-                        "value": __user__["valves"].CONTEXT_EDITING_THINKING_KEEP,
+                        "value": _keep_val,
                     },
                 }
                 context_management.append(clear_thinking)
@@ -2429,7 +2571,7 @@ class Pipe:
         api_tool_names = set()  # Track tools from body.tools (no callable, API passthrough)
 
         # Names reserved for Anthropic server-side tools (skip if found in body.tools)
-        anthropic_server_tool_names = {"web_search", "web_fetch", "memory"}
+        anthropic_server_tool_names = {"web_search", "web_fetch"}
 
         # Extract built-in tools from body.tools (OpenAI format)
         body_tools = body.get("tools", [])
@@ -2558,16 +2700,6 @@ class Pipe:
             claude_tools.append(web_fetch_tool)
             tool_names_seen.add("web_fetch")
             logger.debug(f"Added web_fetch tool: {web_fetch_type}")
-
-        # Add Claude Memory tool if enabled and supported by model
-        # if self.valves.ENABLE_CLAUDE_MEMORY and model_info.get("supports_memory", False):
-        #     claude_tools.append(
-        #         {
-        #             "type": "memory_20250818",
-        #             "name": "memory"
-        #         }
-        #     )
-        #     tool_names_seen.add("memory")
 
         # Process user tools from __tools__ (these have callables for execution)
         if __tools__ and len(__tools__) > 0:
@@ -2784,32 +2916,6 @@ class Pipe:
         flush()
         return messages
 
-    def _extract_compaction_and_text(self, content: str) -> list[dict]:
-        """Extract compaction blocks from a text chunk and return a list of
-        Claude-format blocks (text + compaction) in original order.
-
-        Used by the assistant-branch of ``_convert_content_to_claude_format``
-        when thinking reconstruction needs to process text chunks around
-        reconstructed thinking blocks while still honoring compaction
-        boundaries.
-        """
-        compaction_matches = list(PATTERN_COMPACTION_DETAILS.finditer(content))
-        if not compaction_matches:
-            stripped = content.strip()
-            return [{"type": "text", "text": stripped}] if stripped else []
-        blocks: list[dict] = []
-        last_end = 0
-        for match in compaction_matches:
-            before = content[last_end:match.start()].strip()
-            if before:
-                blocks.append({"type": "text", "text": before})
-            blocks.append({"type": "compaction", "content": match.group(1).strip()})
-            last_end = match.end()
-        after = content[last_end:].strip()
-        if after:
-            blocks.append({"type": "text", "text": after})
-        return blocks
-
     def _convert_content_to_claude_format(
         self, content: Union[str, List[dict], None], role: str = "user"
     ) -> List[dict]:
@@ -2840,66 +2946,89 @@ class Pipe:
                 content = PATTERN_TOOL_CALLS_DETAILS.sub("", content)
                 content = PATTERN_CODE_INTERPRETER_DETAILS.sub("", content)
 
-                # Reconstruct thinking blocks from <details type="reasoning">
-                # HTML. Only blocks carrying a signature are replayable — the
-                # API rejects thinking blocks without a valid signature.
-                # Unsignatured blocks (e.g. from older pipe versions that did
-                # not persist the signature) are silently dropped: the API
-                # would strip them anyway on a non-tool-result turn.
-                thinking_matches = list(PATTERN_REASONING_BLOCK.finditer(content))
-                has_thinking = any(
-                    'data-signature="' in m.group(1) for m in thinking_matches
-                )
-                if has_thinking:
+                # Reconstruct ALL replayable <details> blocks (reasoning,
+                # server_tool_use, *_tool_result, compaction) into their
+                # API-native forms, in original document order. Positional
+                # fidelity is critical: the Anthropic API requires the exact
+                # sequence of thinking + server_tool_use + tool_result blocks
+                # to match the original assistant turn byte-exact, otherwise
+                # subsequent requests 400 with "thinking blocks cannot be
+                # modified" and the prompt cache prefix is invalidated.
+                all_matches: list[tuple[int, str, re.Match]] = []
+                for m in PATTERN_REASONING_BLOCK.finditer(content):
+                    all_matches.append((m.start(), "reasoning", m))
+                for m in PATTERN_SERVER_TOOL_USE_BLOCK.finditer(content):
+                    all_matches.append((m.start(), "server_tool_use", m))
+                for m in PATTERN_SERVER_TOOL_RESULT_BLOCK.finditer(content):
+                    all_matches.append((m.start(), "server_tool_result", m))
+                for m in PATTERN_COMPACTION_DETAILS.finditer(content):
+                    all_matches.append((m.start(), "compaction", m))
+
+                if all_matches:
+                    all_matches.sort(key=lambda t: t[0])
                     blocks: list[dict] = []
                     last_end = 0
-                    for match in thinking_matches:
-                        attrs_str = match.group(1)
+                    for _, kind, match in all_matches:
                         text_before = content[last_end:match.start()]
                         if text_before.strip():
-                            blocks.extend(
-                                self._extract_compaction_and_text(text_before)
+                            blocks.append({"type": "text", "text": text_before})
+                        if kind == "reasoning":
+                            attrs_str = match.group(1)
+                            sig_match = re.search(
+                                r'data-signature="([^"]*)"', attrs_str
                             )
-                        sig_match = re.search(
-                            r'data-signature="([^"]*)"', attrs_str
-                        )
-                        if sig_match:
-                            signature = html.unescape(sig_match.group(1))
-                            body = match.group(2)
-                            thinking_text = html.unescape(
-                                PATTERN_REASONING_QUOTED_LINE.sub("", body)
-                            ).strip()
+                            if sig_match:
+                                signature = html.unescape(sig_match.group(1))
+                                body = match.group(2)
+                                thinking_text = html.unescape(
+                                    PATTERN_REASONING_QUOTED_LINE.sub("", body)
+                                ).strip()
+                                blocks.append({
+                                    "type": "thinking",
+                                    "thinking": thinking_text,
+                                    "signature": signature,
+                                })
+                            # else: unsignatured reasoning → drop
+                        elif kind == "server_tool_use":
+                            attrs_str = match.group(1)
+                            attrs = dict(PATTERN_DATA_ATTR.findall(attrs_str))
+                            payload_b64 = attrs.get("payload-b64", "")
+                            decoded = self._decode_block_payload(payload_b64) if payload_b64 else None
+                            if isinstance(decoded, dict) and decoded.get("type") == "server_tool_use":
+                                blocks.append(decoded)
+                                # If this carrier also embeds the matching
+                                # *_tool_result payload (merged display mode),
+                                # emit it right after so the API sees the
+                                # full tool_use + tool_result pair at the
+                                # original position.
+                                # data-result-kind carries the block type (e.g. "web_search_tool_result")
+                                # and data-result-payload-b64 carries the encoded payload. The decoded
+                                # payload already has "type": "...", so result_kind is just sanity-check.
+                                result_b64 = attrs.get("result-payload-b64", "")
+                                if result_b64:
+                                    result_decoded = self._decode_block_payload(result_b64)
+                                    if (
+                                        isinstance(result_decoded, dict)
+                                        and result_decoded.get("type", "").endswith("_tool_result")
+                                    ):
+                                        blocks.append(result_decoded)
+                            # else: legacy/missing payload → drop
+                        elif kind == "server_tool_result":
+                            attrs_str = match.group(1)
+                            attrs = dict(PATTERN_DATA_ATTR.findall(attrs_str))
+                            payload_b64 = attrs.get("payload-b64", "")
+                            decoded = self._decode_block_payload(payload_b64) if payload_b64 else None
+                            if isinstance(decoded, dict) and decoded.get("type", "").endswith("_tool_result"):
+                                blocks.append(decoded)
+                            # else: legacy/missing payload → drop
+                        elif kind == "compaction":
                             blocks.append({
-                                "type": "thinking",
-                                "thinking": thinking_text,
-                                "signature": signature,
+                                "type": "compaction",
+                                "content": match.group(1).strip(),
                             })
-                        # else: drop unsignatured reasoning block
                         last_end = match.end()
                     after = content[last_end:]
                     if after.strip():
-                        blocks.extend(self._extract_compaction_and_text(after))
-                    return blocks
-
-                # Strip any unsignatured reasoning HTML from the remaining
-                # content so it doesn't leak to the API as plain text.
-                if thinking_matches:
-                    content = PATTERN_REASONING_BLOCK.sub("", content)
-
-                # Extract compaction display blocks as API-native {type: "compaction"}
-                # blocks so the API recognises the boundary and drops prior content.
-                compaction_matches = list(PATTERN_COMPACTION_DETAILS.finditer(content))
-                if compaction_matches:
-                    blocks = []
-                    last_end = 0
-                    for match in compaction_matches:
-                        before = content[last_end:match.start()].strip()
-                        if before:
-                            blocks.append({"type": "text", "text": before})
-                        blocks.append({"type": "compaction", "content": match.group(1).strip()})
-                        last_end = match.end()
-                    after = content[last_end:].strip()
-                    if after:
                         blocks.append({"type": "text", "text": after})
                     return blocks
 
@@ -3064,45 +3193,6 @@ class Pipe:
                             "content": str(result_item["result"]),
                         })
         return claude_tool_results
-
-    def _safe_json(self, obj: Any) -> Any:
-        """Recursively convert obj to JSON-serializable form."""
-
-        if isinstance(obj, (str, int, float, bool)) or obj is None:
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._safe_json(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._safe_json(v) for v in obj]
-        if hasattr(obj, "dict"):
-            try:
-                return self._safe_json(obj.dict())
-            except Exception:
-                pass
-        if hasattr(obj, "model_dump"):
-            try:
-                return self._safe_json(obj.model_dump())
-            except Exception:
-                pass
-        return f"<UNSERIALIZABLE {type(obj).__name__}>"
-
-    async def _emit_debug_citation(
-        self,
-        request_ctx: PipeRequestContext,
-        name: str,
-        value: Any,
-    ) -> None:
-        serial = self._safe_json(value)
-        await request_ctx.emit_event(
-            {
-                "type": "citation",
-                "data": {
-                    "document": [json.dumps(serial, indent=2)],
-                    "metadata": [{"source": name}],
-                    "source": {"name": name},
-                },
-            }
-        )
 
     def _handle_message_start_usage(
         self,
@@ -3437,7 +3527,7 @@ class Pipe:
                     try:
                         openwebui_model_id = __metadata__.get("model_id") or body.get("model", "")
                         if openwebui_model_id and MODELS_AVAILABLE:
-                            owui_model = Models.get_model_by_id(openwebui_model_id)
+                            owui_model = await Models.get_model_by_id(openwebui_model_id)
                             if owui_model:
                                 # ModelModel has .meta (ModelMeta pydantic model), not .info
                                 meta = owui_model.meta
@@ -3451,18 +3541,16 @@ class Pipe:
                                     from open_webui.models.skills import Skills as SkillsModel
 
                                     user_id = __user__.get("id", "") if __user__ else ""
-                                    accessible = {
-                                        s.id
-                                        for s in SkillsModel.get_skills_by_user_id(user_id, "read")
-                                    }
+                                    accessible_skills = await SkillsModel.get_skills_by_user_id(user_id, "read")
+                                    accessible = {s.id for s in accessible_skills}
                                     logger.debug(f"Accessible skills for user: {accessible}")
-                                    skill_ids = [
-                                        sid
-                                        for sid in model_skill_ids
-                                        if sid in accessible
-                                        and (s := SkillsModel.get_skill_by_id(sid))
-                                        and s.is_active
-                                    ]
+                                    skill_ids = []
+                                    for sid in model_skill_ids:
+                                        if sid not in accessible:
+                                            continue
+                                        s = await SkillsModel.get_skill_by_id(sid)
+                                        if s and s.is_active:
+                                            skill_ids.append(sid)
                                     logger.debug(f"Resolved skill_ids: {skill_ids}")
                     except Exception as e:
                         logger.debug(f"Could not resolve skill IDs: {e}")
@@ -3515,7 +3603,7 @@ class Pipe:
                         openwebui_model_id = body["model"]
 
                     if openwebui_model_id:
-                        model = Models.get_model_by_id(openwebui_model_id)
+                        model = await Models.get_model_by_id(openwebui_model_id)
                         if model:
                             params = dict(model.params or {})
                             if params.get("function_calling") != "native":
@@ -3537,7 +3625,7 @@ class Pipe:
                                 params["function_calling"] = "native"
                                 form_data = model.model_dump()
                                 form_data["params"] = params
-                                Models.update_model_by_id(
+                                await Models.update_model_by_id(
                                     openwebui_model_id, ModelForm(**form_data)
                                 )
                 except Exception as e:
@@ -3553,20 +3641,6 @@ class Pipe:
             payload, headers, new_marker_metadata, api_tool_names = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
             )
-
-            if __user__["valves"].DEBUG_MODE:
-                await self._emit_debug_citation(request_ctx, "Payload", payload)
-                await self._emit_debug_citation(request_ctx, "Headers", headers)
-                await self._emit_debug_citation(request_ctx, "body", body)
-                await self._emit_debug_citation(request_ctx, "__metadata__", __metadata__ or {})
-                await self._emit_debug_citation(request_ctx, "__user__", __user__)
-                await self._emit_debug_citation(request_ctx, "__files__", __files__ or [])
-                await self._emit_debug_citation(request_ctx, "__tools__", __tools__ or {})
-                await self._emit_debug_citation(request_ctx, "new_marker_metadata", new_marker_metadata or {})
-                await self._emit_debug_citation(request_ctx, "Valves: ", self.valves.__dict__)
-                await self._emit_debug_citation(request_ctx, "UserValves: ", __user__["valves"].__dict__)
-                if __task__:
-                    await self._emit_debug_citation(request_ctx, "__task__", __task_body__)
 
             # =========================================================================
             # PHASE 3: STREAMING STATE INITIALIZATION
@@ -3627,6 +3701,13 @@ class Pipe:
             active_server_tool_name = None
             active_server_tool_id = None
             server_tool_input_buffer = ""  # Accumulate server tool input JSON
+            # Tracks emitted server_tool_use carrier blocks by tool_use_id so
+            # web_search / web_fetch result handlers can update_content_block()
+            # to merge the result display INTO the same collapsible instead of
+            # emitting a second adjacent <details>. Value also stores the
+            # original tool_input so we can rebuild the merged carrier with
+            # both payloads (tool_use + tool_result).
+            server_tool_use_carriers: dict[str, dict] = {}
             text_editor_file_content = ""  # Accumulate file_text for text_editor
             text_editor_file_path = ""  # Track file path for text_editor
             text_editor_command = ""  # Track text_editor command (create/view/edit)
@@ -3699,71 +3780,29 @@ class Pipe:
                 stream_output_tokens = 0
 
                 try:
-                    # Verbose tool loop logging
-                    msg_summary = []
-                    for msg in payload_for_stream.get("messages", []):
-                        role = msg.get("role", "?")
-                        content = msg.get("content", "")
-                        if isinstance(content, list):
-                            block_types = [b.get("type", "?") for b in content]
-                            # Count thinking blocks and check signatures
-                            thinking_info = []
-                            for b in content:
-                                if b.get("type") == "thinking":
-                                    sig_len = len(b.get("signature", ""))
-                                    think_len = len(b.get("thinking", ""))
-                                    thinking_info.append(f"thinking({think_len}c,sig={sig_len}c)")
-                                elif b.get("type") == "redacted_thinking":
-                                    thinking_info.append(f"redacted(data={len(b.get('data', ''))}c)")
-                            detail = ",".join(block_types)
-                            if thinking_info:
-                                detail += f" [{'; '.join(thinking_info)}]"
-                            msg_summary.append(f"{role}:[{detail}]")
-                        elif isinstance(content, str):
-                            msg_summary.append(f"{role}:text({len(content)}c)")
-                        else:
-                            msg_summary.append(f"{role}:?")
-                    logger.info(
-                        f"🔄 Tool loop iter {tool_loop_iteration} | "
-                        f"calls so far: {current_function_calls}/{max_function_calls} | "
-                        f"messages: {len(payload_for_stream.get('messages', []))} | "
-                        f"container: {payload_for_stream.get('container', 'NONE')} | "
-                        f"msg_flow: {' → '.join(msg_summary[-6:]) if msg_summary else 'empty'}"
-                    )
-
-                    # Debug: comprehensive payload summary before API call
-                    if logger.isEnabledFor(logging.DEBUG):
-                        _tools = payload_for_stream.get("tools", [])
-                        _tool_names = [t.get("name", t.get("type", "?")) for t in _tools]
-                        _sys = payload_for_stream.get("system", [])
-                        _sys_len = sum(len(s.get("text", "")) for s in _sys) if isinstance(_sys, list) else len(str(_sys))
-                        _msgs = payload_for_stream.get("messages", [])
-                        # Last message detail
-                        _last_msg = _msgs[-1] if _msgs else {}
-                        _last_role = _last_msg.get("role", "?")
-                        _last_content = _last_msg.get("content", "")
-                        if isinstance(_last_content, list):
-                            _last_detail = [b.get("type", "?") for b in _last_content]
-                            # For tool_result, show tool IDs
-                            _tool_result_ids = [b.get("tool_use_id", "")[:20] for b in _last_content if b.get("type") == "tool_result"]
-                            _last_summary = f"[{','.join(_last_detail)}]" + (f" tool_ids={_tool_result_ids}" if _tool_result_ids else "")
-                        elif isinstance(_last_content, str):
-                            _last_summary = f"text({len(_last_content)}c)"
-                        else:
-                            _last_summary = "?"
-                        logger.debug(
-                            f"📤 API payload: model={payload_for_stream.get('model', '?')} | "
-                            f"tools={len(_tools)}:{_tool_names} | "
-                            f"system={_sys_len}c | "
-                            f"container={payload_for_stream.get('container', 'NONE')} | "
-                            f"max_tokens={payload_for_stream.get('max_tokens', '?')} | "
-                            f"thinking={payload_for_stream.get('thinking', {}).get('type', 'off')} | "
-                            f"last_msg={_last_role}:{_last_summary}"
-                        )
-
-                    stream_event_counts = {}  # Track event types for diagnostics
+                    stream_event_counts = {}  # Track event types for diagnostics#
                     # Apply cache breakpoints right before sending to API
                     self._apply_cache_control(payload_for_stream, is_tool_loop=(tool_loop_iteration > 1))
+                    # Log message-hash diff vs previous request on same chat_id
+                    # to pinpoint byte-drift that breaks the prompt cache prefix.
+                    _diff_chat_id = __metadata__.get("chat_id") if __metadata__ else None
+                    self._log_message_hash_diff(_diff_chat_id, payload_for_stream)
+                    # Dump the full (stripped) outgoing payload so we can audit
+                    # cache_control placement, tool list, message order and byte
+                    # drift across turns without logging megabytes of base64.
+                    try:
+                        logger.debug(
+                            "[PAYLOAD] iter=%d %s",
+                            tool_loop_iteration,
+                            json.dumps(
+                                self._strip_payload(payload_for_stream),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                        )
+                    except Exception as _pl_err:
+                        logger.debug(f"[PAYLOAD] strip/log failed: {_pl_err}")
                     async with client.beta.messages.stream(
                         **payload_for_stream
                     ) as stream:
@@ -3872,26 +3911,6 @@ class Pipe:
                                         if in_code_execution:
                                             code_exec_had_web_tools = True
 
-                                    if active_server_tool_name == "web_search":
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "🔍 Searching the web...",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
-                                    elif active_server_tool_name == "web_fetch":
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "🌐 Fetching URL...",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
                                     elif active_server_tool_name == "code_execution":
                                         # Finalize any previous live-streamed block before starting new one
                                         if code_exec_current_code:
@@ -3932,6 +3951,13 @@ class Pipe:
                                 elif content_type == "bash_code_execution_tool_result":
                                     logger.debug(
                                         f"Processing bash_code_execution_tool_result: {content_block}"
+                                    )
+                                    # Persist hidden payload for API replay (display block is stripped on reload).
+                                    await self._persist_server_tool_result(
+                                        content_block,
+                                        "bash_code_execution_tool_result",
+                                        emit_message_delta,
+                                        summary_text="🖥️ bash result",
                                     )
                                     result_block = getattr(
                                         content_block, "content", None
@@ -4006,6 +4032,13 @@ class Pipe:
                                     logger.debug(
                                         f"Processing text_editor_code_execution_tool_result: {content_block}"
                                     )
+                                    # Persist hidden payload for API replay (display block is stripped on reload).
+                                    await self._persist_server_tool_result(
+                                        content_block,
+                                        "text_editor_code_execution_tool_result",
+                                        emit_message_delta,
+                                        summary_text="✏️ text_editor result",
+                                    )
                                     result_block = getattr(
                                         content_block, "content", None
                                     )
@@ -4063,6 +4096,13 @@ class Pipe:
                                 elif content_type == "code_execution_tool_result":
                                     logger.debug(
                                         "Processing code_execution_tool_result"
+                                    )
+                                    # Persist hidden payload for API replay (display block is stripped on reload).
+                                    await self._persist_server_tool_result(
+                                        content_block,
+                                        "code_execution_tool_result",
+                                        emit_message_delta,
+                                        summary_text="🐍 code_execution result",
                                     )
                                     result_block = getattr(content_block, "content", None)
                                     stdout = ""
@@ -4135,6 +4175,7 @@ class Pipe:
                                     content_items = getattr(
                                         content_block, "content", None
                                     )
+                                    wstr_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
                                     # Check for error: content is a single error object (not a list)
                                     error_code = None
                                     if content_items and not isinstance(content_items, list):
@@ -4144,15 +4185,23 @@ class Pipe:
                                     if error_code:
                                         error_msg = f"⚠️ Web search error: {error_code}"
                                         logger.warning(f"web_search error: {error_code}")
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": error_msg,
-                                                    "done": True,
-                                                },
-                                            }
-                                        )
+                                        # Status event removed: error info is shown inside the
+                                        # merged server_tool_use details block (body).
+                                        # Merge error result into the existing server_tool_use
+                                        # carrier so only ONE collapsible is rendered.
+                                        err_payload = {"type": "web_search_tool_result_error", "error_code": error_code}
+                                        carrier_info = server_tool_use_carriers.pop(wstr_tool_use_id, None) if wstr_tool_use_id else None
+                                        if carrier_info:
+                                            merged = self._format_server_tool_use_block(
+                                                tool_name=carrier_info["tool_name"],
+                                                tool_use_id=wstr_tool_use_id,
+                                                tool_input=carrier_info["tool_input"],
+                                                result_payload=err_payload,
+                                                result_block_type="web_search_tool_result",
+                                                result_summary=error_msg,
+                                                result_display_body=f"**{error_msg}** `{error_code}`",
+                                            )
+                                            await update_content_block(carrier_info["block"], merged)
                                     elif content_items and isinstance(content_items, list) and len(content_items) > 0:
                                             # Extract first result title for status
                                             first_result = (
@@ -4176,44 +4225,102 @@ class Pipe:
                                             else:
                                                 status_desc = "Web Search Complete"
 
-                                            await emit_event_local(
-                                                {
-                                                    "type": "status",
-                                                    "data": {
-                                                        "description": status_desc,
-                                                        "done": True,
-                                                    },
-                                                }
-                                            )
+                                            # Status event removed: result info is shown inside
+                                            # the merged server_tool_use details block (body).
+                                            # Merge result INTO the existing server_tool_use carrier:
+                                            # summary updates to "Found X results…", body becomes URL
+                                            # list, and the carrier embeds both tool_use + tool_result
+                                            # payloads for API replay. One visible collapsible only.
+                                            if wstr_tool_use_id:
+                                                serialized_items = []
+                                                display_lines = []
+                                                for item in content_items:
+                                                    if hasattr(item, "model_dump"):
+                                                        item_d = item.model_dump(exclude_none=True)
+                                                    elif isinstance(item, dict):
+                                                        item_d = item
+                                                    else:
+                                                        continue
+                                                    serialized_items.append(item_d)
+                                                    t = item_d.get("title") or ""
+                                                    u = item_d.get("url") or ""
+                                                    if u:
+                                                        display_lines.append(f"- [{html.escape(t or u)}]({u})")
+                                                display_body = "\n".join(display_lines[:10])
+                                                # Prepend the status line so it shows in the body
+                                                # when the user expands the collapsible.
+                                                if status_desc:
+                                                    display_body = f"**{status_desc}**\n\n{display_body}" if display_body else f"**{status_desc}**"
+                                                carrier_info = server_tool_use_carriers.pop(wstr_tool_use_id, None)
+                                                if carrier_info:
+                                                    merged = self._format_server_tool_use_block(
+                                                        tool_name=carrier_info["tool_name"],
+                                                        tool_use_id=wstr_tool_use_id,
+                                                        tool_input=carrier_info["tool_input"],
+                                                        result_payload=serialized_items,
+                                                        result_block_type="web_search_tool_result",
+                                                        result_summary=status_desc,
+                                                        result_display_body=display_body,
+                                                    )
+                                                    await update_content_block(carrier_info["block"], merged)
                                 elif content_type == "web_fetch_tool_result":
                                     logger.debug("Processing web_fetch_tool_result")
                                     # Check for errors (error is in content.error_code)
                                     result_content = getattr(content_block, "content", None)
+                                    wftr_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
                                     error_code = None
                                     if result_content:
                                         content_type_inner = getattr(result_content, "type", "")
                                         if content_type_inner == "web_fetch_tool_error":
                                             error_code = getattr(result_content, "error_code", "unknown")
                                     if error_code:
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": f"🌐 Fetch failed: {error_code}",
-                                                    "done": True,
-                                                },
-                                            }
-                                        )
+                                        # Status event removed: error info shown inside details body.
+                                        if wftr_tool_use_id:
+                                            err_payload = {"type": "web_fetch_tool_error", "error_code": error_code}
+                                            carrier_info = server_tool_use_carriers.pop(wftr_tool_use_id, None)
+                                            if carrier_info:
+                                                merged = self._format_server_tool_use_block(
+                                                    tool_name=carrier_info["tool_name"],
+                                                    tool_use_id=wftr_tool_use_id,
+                                                    tool_input=carrier_info["tool_input"],
+                                                    result_payload=err_payload,
+                                                    result_block_type="web_fetch_tool_result",
+                                                    result_summary=f"🌐 Fetch failed: {error_code}",
+                                                    result_display_body=f"**🌐 Fetch failed:** `{error_code}`",
+                                                )
+                                                await update_content_block(carrier_info["block"], merged)
                                     else:
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "🌐 URL fetched",
-                                                    "done": True,
-                                                },
-                                            }
-                                        )
+                                        # Status event removed: fetched URL shown inside details body.
+                                        # Merge web_fetch result into existing carrier (single collapsible).
+                                        if wftr_tool_use_id and result_content is not None:
+                                            if hasattr(result_content, "model_dump"):
+                                                serialized = result_content.model_dump(exclude_none=True)
+                                            elif isinstance(result_content, dict):
+                                                serialized = result_content
+                                            else:
+                                                serialized = None
+                                            if serialized is not None:
+                                                fetch_url = ""
+                                                if isinstance(serialized, dict):
+                                                    fetch_url = serialized.get("url") or ""
+                                                status_line = (
+                                                    f"**🌐 URL fetched:** {fetch_url}"
+                                                    if fetch_url
+                                                    else "**🌐 URL fetched**"
+                                                )
+                                                display_body = status_line
+                                                carrier_info = server_tool_use_carriers.pop(wftr_tool_use_id, None)
+                                                if carrier_info:
+                                                    merged = self._format_server_tool_use_block(
+                                                        tool_name=carrier_info["tool_name"],
+                                                        tool_use_id=wftr_tool_use_id,
+                                                        tool_input=carrier_info["tool_input"],
+                                                        result_payload=serialized,
+                                                        result_block_type="web_fetch_tool_result",
+                                                        result_summary=f"🌐 URL fetched: {fetch_url}" if fetch_url else "🌐 URL fetched",
+                                                        result_display_body=display_body,
+                                                    )
+                                                    await update_content_block(carrier_info["block"], merged)
                                 elif content_type == "tool_search_tool_result":
                                     logger.debug(
                                         f" Processing tool search result event: {event}"
@@ -4429,15 +4536,9 @@ class Pipe:
                                                         current_search_query = (
                                                             new_query
                                                         )
-                                                        await emit_event_local(
-                                                            {
-                                                                "type": "status",
-                                                                "data": {
-                                                                    "description": f"🔍 Searching for: {current_search_query}",
-                                                                    "done": False,
-                                                                },
-                                                            }
-                                                        )
+                                                        # Status event removed: search query is shown
+                                                        # inside the merged server_tool_use details
+                                                        # block (summary text + body).
                                             except Exception as e:
                                                 logger.debug(
                                                     f"Web search query extraction error: {e}"
@@ -4447,17 +4548,9 @@ class Pipe:
                                                 parsed = json.loads(server_tool_input_buffer)
                                                 if "url" in parsed:
                                                     fetch_url = parsed["url"]
-                                                    # Show truncated URL in status
-                                                    display_url = fetch_url[:60] + "..." if len(fetch_url) > 60 else fetch_url
-                                                    await emit_event_local(
-                                                        {
-                                                            "type": "status",
-                                                            "data": {
-                                                                "description": f"🌐 Fetching: {display_url}",
-                                                                "done": False,
-                                                            },
-                                                        }
-                                                    )
+                                                    # Status event removed: URL is shown inside
+                                                    # the merged server_tool_use details block.
+                                                    _ = fetch_url
                                             except Exception:
                                                 pass
                                         elif (
@@ -4684,6 +4777,39 @@ class Pipe:
                                     elif active_server_tool_name == "web_fetch":
                                         pass
 
+                                    # Persist server_tool_use blocks into assistant content so they
+                                    # survive the OpenWebUI DB round-trip. Without this, the next turn
+                                    # replays the assistant message with thinking blocks shifted out
+                                    # of their original positions and the Anthropic API rejects it with:
+                                    #   "thinking blocks cannot be modified"
+                                    # (Also invalidates the prompt cache.) The visible
+                                    # <details type="code_interpreter"> display block is stripped on
+                                    # replay (PATTERN_CODE_INTERPRETER_DETAILS), so the hidden payload
+                                    # block here is the only API-replayable carrier.
+                                    SERVER_TOOLS_TO_PERSIST = (
+                                        "web_search", "web_fetch",
+                                        "code_execution", "bash_code_execution",
+                                        "text_editor_code_execution",
+                                    )
+                                    if active_server_tool_name in SERVER_TOOLS_TO_PERSIST and active_server_tool_id:
+                                        try:
+                                            tool_input = json.loads(server_tool_input_buffer) if server_tool_input_buffer else {}
+                                        except (json.JSONDecodeError, ValueError):
+                                            tool_input = {}
+                                        persisted_block = self._format_server_tool_use_block(
+                                            tool_name=active_server_tool_name,
+                                            tool_use_id=active_server_tool_id,
+                                            tool_input=tool_input,
+                                        )
+                                        await emit_message_delta(persisted_block)
+                                        # Record for later in-place merge with tool_result
+                                        # (web_search / web_fetch). See web_*_tool_result handlers.
+                                        server_tool_use_carriers[active_server_tool_id] = {
+                                            "block": persisted_block,
+                                            "tool_name": active_server_tool_name,
+                                            "tool_input": tool_input,
+                                        }
+
                                     active_server_tool_name = None
                                     active_server_tool_id = None
                                     server_tool_input_buffer = ""
@@ -4762,29 +4888,6 @@ class Pipe:
                                                 tool_name,
                                                 len(running_tool_tasks),
                                             )
-                                        # elif tool_name == "memory" and self.valves.ENABLE_CLAUDE_MEMORY:
-                                        #     # Memory tool - bridge to OpenWebUI memory system
-                                        #     tool_call_data_list.append(tool_call_data)
-
-                                        #     # Execute memory tool operation
-                                        #     mem_user_id = __user__.get("id", "") if __user__ else ""
-                                        #     task = asyncio.create_task(
-                                        #         self._handle_memory_tool(
-                                        #             command=tool_input.get("command", "view"),
-                                        #             path=tool_input.get("path", "/memories"),
-                                        #             user_id=mem_user_id,
-                                        #             file_text=tool_input.get("file_text", ""),
-                                        #             old_str=tool_input.get("old_str", ""),
-                                        #             new_str=tool_input.get("new_str", ""),
-                                        #             insert_line=tool_input.get("insert_line", 0),
-                                        #             new_path=tool_input.get("new_path", ""),
-                                        #         )
-                                        #     )
-                                        #     running_tool_tasks.append(task)
-
-                                        #     logger.debug(
-                                        #         f"🧠 Started memory tool execution: {tool_input.get('command', 'view')} {tool_input.get('path', '/memories')}"
-                                        #     )
                                         elif tool_name in builtin_tools and builtin_tools[tool_name].get("callable"):
                                             # Builtin tool from OpenWebUI - execute with proper context
                                             tool_call_data_list.append(tool_call_data)
@@ -4957,7 +5060,7 @@ class Pipe:
                                                 if PROCESS_TOOL_RESULT_AVAILABLE and __request__:
                                                     try:
                                                         tool_result, tool_result_files, tool_result_embeds = (
-                                                            process_tool_result(
+                                                            await process_tool_result(
                                                                 __request__,
                                                                 tool_name,
                                                                 tool_result,
@@ -5581,6 +5684,21 @@ class Pipe:
             done_data["usage"] = total_usage
         await emit_event_local({"type": "chat:completion", "data": done_data})
 
+        # Persist usage to chat_message.usage column for the 0.9.0+ analytics page.
+        # chat:completion events are NOT persisted by the socket event emitter
+        # (only status|message|replace|embeds|files|source are), so without this
+        # direct DB write the analytics tab never sees our token counts.
+        if include_usage and total_usage and CHATS_AVAILABLE and __metadata__:
+            chat_id = __metadata__.get("chat_id")
+            message_id = __metadata__.get("message_id")
+            if chat_id and message_id and not str(chat_id).startswith("local:"):
+                try:
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, message_id, {"usage": dict(total_usage)}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to persist usage to chat_message: {e}")
+
         if __user__["valves"].DEBUG_MODE:
             # DEBUG: content already streamed via emit_event_local; skipping duplicate
             pass
@@ -5616,6 +5734,18 @@ class Pipe:
             }
 
             logger.debug(f"Task payload: {json.dumps(task_payload, indent=2)}")
+            try:
+                logger.debug(
+                    "[PAYLOAD] task %s",
+                    json.dumps(
+                        self._strip_payload(task_payload),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                )
+            except Exception as _pl_err:
+                logger.debug(f"[PAYLOAD] task strip/log failed: {_pl_err}")
 
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
@@ -5666,198 +5796,6 @@ class Pipe:
                     processed.append({"role": role, "content": " ".join(text_parts)})
 
         return processed
-
-    # =========================================================================
-    # MEMORY SYSTEM (FILESYSTEM-BACKED CLAUDE MEMORY TOOL)
-    # =========================================================================
-
-    def _get_user_memory_dir(self, user_id: str) -> str:
-        """Get the memory directory for a specific user, creating it if needed."""
-        user_dir = os.path.join(CLAUDE_MEMORY_DIR, user_id, "memories")
-        os.makedirs(user_dir, exist_ok=True)
-        return user_dir
-
-    def _resolve_memory_path(self, user_id: str, clean_path: str) -> str:
-        """Resolve a memory path to an absolute filesystem path, ensuring it stays within the user's memory dir."""
-        user_dir = self._get_user_memory_dir(user_id)
-        resolved = os.path.realpath(os.path.join(user_dir, clean_path))
-        # Prevent path traversal
-        if not resolved.startswith(os.path.realpath(user_dir)):
-            raise ValueError("Path traversal not allowed")
-        return resolved
-
-    async def _handle_memory_tool(
-        self,
-        command: str,
-        path: str,
-        user_id: str,
-        file_text: str = "",
-        old_str: str = "",
-        new_str: str = "",
-        insert_line: int = 0,
-        new_path: str = "",
-    ) -> str:
-        """
-        Handle Claude memory tool operations using filesystem storage.
-
-        Memory files are stored as actual files on disk under:
-            {DATA_DIR}/claude_memories/{user_id}/memories/
-
-        This matches Anthropic's file/path model directly — each user
-        gets their own directory, files support subdirectories, and all
-        operations (view/create/str_replace/insert/delete/rename) are
-        natural filesystem operations with no embedding overhead.
-
-        Args:
-            command: Memory operation (view, create, str_replace, insert, delete, rename)
-            path: File path in memory namespace
-            user_id: OpenWebUI user ID
-            file_text: Content for create operations
-            old_str: String to find for str_replace
-            new_str: Replacement string for str_replace
-            insert_line: Line number for insert operations
-            new_path: New path for rename operations
-
-        Returns:
-            String result of the operation
-        """
-        try:
-            # Normalize path - strip leading /memories/
-            clean_path = path.strip("/")
-            if clean_path.startswith("memories/"):
-                clean_path = clean_path[len("memories/"):]
-            elif clean_path == "memories":
-                clean_path = ""
-
-            user_dir = self._get_user_memory_dir(user_id)
-
-            if command == "view":
-                if not clean_path:
-                    # Directory listing
-                    if not os.path.exists(user_dir):
-                        return "/memories/ (empty directory)\n\nNo memory files stored yet. Use 'create' to add memory files."
-
-                    entries = []
-                    for root, dirs, files in os.walk(user_dir):
-                        rel_root = os.path.relpath(root, user_dir)
-                        for f in sorted(files):
-                            rel_path = f if rel_root == "." else os.path.join(rel_root, f)
-                            full_path = os.path.join(root, f)
-                            try:
-                                size = os.path.getsize(full_path)
-                                entries.append(f"  {rel_path}  ({size} bytes)")
-                            except OSError:
-                                entries.append(f"  {rel_path}")
-
-                    lines = ["/memories/"]
-                    if entries:
-                        lines.extend(entries)
-                    else:
-                        lines.append("  (no files yet)")
-                    return "\n".join(lines)
-                else:
-                    # View specific file
-                    file_path = self._resolve_memory_path(user_id, clean_path)
-                    if os.path.isdir(file_path):
-                        # Subdirectory listing
-                        entries = []
-                        for item in sorted(os.listdir(file_path)):
-                            full = os.path.join(file_path, item)
-                            if os.path.isfile(full):
-                                size = os.path.getsize(full)
-                                entries.append(f"  {item}  ({size} bytes)")
-                            elif os.path.isdir(full):
-                                entries.append(f"  {item}/")
-                        return f"/memories/{clean_path}/\n" + "\n".join(entries) if entries else f"/memories/{clean_path}/ (empty)"
-                    elif os.path.isfile(file_path):
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            return f.read() or "(empty file)"
-                    else:
-                        return f"Error: File '{clean_path}' not found in /memories/"
-
-            elif command == "create":
-                if not file_text:
-                    return "Error: file_text is required for create command"
-                if not clean_path:
-                    return "Error: path with filename is required (e.g., /memories/notes.md)"
-
-                file_path = self._resolve_memory_path(user_id, clean_path)
-                # Create parent directories if needed
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                existed = os.path.exists(file_path)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(file_text)
-                return f"{'Updated' if existed else 'Created'} file: /memories/{clean_path}"
-
-            elif command == "str_replace":
-                if not clean_path:
-                    return "Error: path is required for str_replace command"
-                file_path = self._resolve_memory_path(user_id, clean_path)
-                if not os.path.isfile(file_path):
-                    return f"Error: File '{clean_path}' not found"
-
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if old_str not in content:
-                    return "Error: old_str not found in file content"
-                content = content.replace(old_str, new_str, 1)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                return f"Updated file: /memories/{clean_path}"
-
-            elif command == "insert":
-                if not clean_path:
-                    return "Error: path is required for insert command"
-                file_path = self._resolve_memory_path(user_id, clean_path)
-                if not os.path.isfile(file_path):
-                    return f"Error: File '{clean_path}' not found"
-
-                with open(file_path, "r", encoding="utf-8") as f:
-                    lines = f.read().split("\n")
-                insert_idx = max(0, min(insert_line, len(lines)))
-                lines.insert(insert_idx, new_str)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines))
-                return f"Inserted text at line {insert_line} in /memories/{clean_path}"
-
-            elif command == "delete":
-                if not clean_path:
-                    return "Error: path is required for delete command"
-                file_path = self._resolve_memory_path(user_id, clean_path)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-                    return f"Deleted file: /memories/{clean_path}"
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-                    return f"Deleted directory: /memories/{clean_path}"
-                return f"Error: File '{clean_path}' not found or could not be deleted"
-
-            elif command == "rename":
-                if not clean_path or not new_path:
-                    return "Error: path and new_path are required for rename command"
-
-                src_path = self._resolve_memory_path(user_id, clean_path)
-                new_clean = new_path.strip("/")
-                if new_clean.startswith("memories/"):
-                    new_clean = new_clean[len("memories/"):]
-                if not new_clean:
-                    return "Error: new_path must include a filename (e.g., /memories/new_name.md)"
-
-                dst_path = self._resolve_memory_path(user_id, new_clean)
-                if not os.path.exists(src_path):
-                    return f"Error: File '{clean_path}' not found"
-                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                os.rename(src_path, dst_path)
-                return f"Renamed /memories/{clean_path} to /memories/{new_clean}"
-
-            else:
-                return f"Error: Unknown memory command '{command}'"
-
-        except ValueError as e:
-            return f"Error: {str(e)}"
-        except Exception as e:
-            logger.error(f"Memory tool error: {e}")
-            return f"Error: {str(e)}"
 
     # =========================================================================
     # ERROR HANDLING
@@ -5965,29 +5903,6 @@ class Pipe:
             },
             __event_emitter__,
         )
-
-    # =========================================================================
-    # TOOL EXECUTION
-    # =========================================================================
-
-    async def _run_tool_callable(
-        self,
-        tool_callable: Callable[..., Awaitable[Any]],
-        args: Dict[str, Any],
-        tool_name: str,
-    ) -> Any:
-        try:
-            return await asyncio.wait_for(
-                tool_callable(**args),
-                timeout=self.valves.TOOL_CALL_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            message = f"Error: Tool '{tool_name}' timed out after {self.valves.TOOL_CALL_TIMEOUT} seconds"
-            self.logger.debug(message)
-            return message
-        except Exception as exc:
-            self.logger.debug(f"Tool '%s' failed", tool_name, exc_info=exc)
-            return f"Error: Tool '{tool_name}' failed: {exc}"
 
     # =========================================================================
     # TEXT PROCESSING & MEMORY EXTRACTION
@@ -6194,6 +6109,184 @@ class Pipe:
     # IMMEDIATE BLOCK FORMATTING HELPERS
     # These format individual blocks immediately when they finish streaming
     # =========================================================================
+    @staticmethod
+    def _encode_block_payload(payload: Any) -> str:
+        """Base64-encode a server-tool block payload (JSON) for byte-exact
+        round-trip through OpenWebUI storage."""
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+    @staticmethod
+    def _decode_block_payload(payload_b64: str) -> Optional[Any]:
+        """Decode a base64-encoded JSON payload. Returns None on failure."""
+        try:
+            return json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+        except Exception:
+            return None
+
+    def _format_server_tool_use_block(
+        self,
+        tool_name: str,
+        tool_use_id: str,
+        tool_input: Any,
+        display_body: str = "",
+        *,
+        result_payload: Optional[Any] = None,
+        result_block_type: str = "",
+        result_summary: str = "",
+        result_display_body: str = "",
+    ) -> str:
+        """Persist a server_tool_use block (web_search, web_fetch, code_execution…)
+        as collapsible <details> HTML carrying the opaque payload in a
+        ``data-payload-b64`` attribute. Needed so the block can be
+        reconstructed byte-exact on the next turn's API replay — otherwise
+        thinking-block positions shift and the API rejects the assistant
+        message with "thinking blocks cannot be modified".
+
+        If ``result_payload`` + ``result_block_type`` are provided, the carrier
+        ALSO embeds the matching *_tool_result payload via ``data-result-payload-b64``
+        and ``data-result-block-type``. This lets a single visible collapsible
+        represent BOTH the tool call and its result (API replay still emits
+        two separate blocks in their original order).
+        """
+        payload = {
+            "type": "server_tool_use",
+            "id": tool_use_id,
+            "name": tool_name,
+            "input": tool_input if isinstance(tool_input, (dict, list)) else {},
+        }
+        payload_b64 = self._encode_block_payload(payload)
+        icon = {"web_search": "🔍", "web_fetch": "🌐"}.get(tool_name, "🔧")
+        hint = ""
+        if isinstance(tool_input, dict):
+            hint = tool_input.get("query") or tool_input.get("url") or ""
+        default_summary = f"{icon} {tool_name}"
+        if hint:
+            default_summary += f": {str(hint)[:120]}"
+
+        result_attrs = ""
+        if result_payload is not None and result_block_type:
+            result_payload_b64 = self._encode_block_payload({
+                "type": result_block_type,
+                "tool_use_id": tool_use_id,
+                "content": result_payload,
+            })
+            # NOTE: attribute key MUST NOT contain "type=" as a substring.
+            # marked's attribute tokenizer `(\w+)="(.*?)"` greedily picks up
+            # `type="..."` anywhere in the tag and overwrites the primary
+            # `type="tool_calls"`. Using `data-result-kind` instead of
+            # `data-result-block-type` avoids that collision.
+            result_attrs = (
+                f' data-result-kind="{html.escape(result_block_type)}"'
+                f' data-result-payload-b64="{result_payload_b64}"'
+            )
+            summary_text = result_summary or default_summary
+            body_src = result_display_body or display_body
+        else:
+            summary_text = default_summary
+            body_src = display_body
+
+        # NOTE: type="tool_calls" (not "server_tool_use") is intentional —
+        # OpenWebUI's Svelte parser only groups consecutive <details> into a
+        # single "Exploring/Explored" bubble when each one carries
+        # type ∈ {tool_calls, reasoning, code_interpreter}. A custom type
+        # between reasoning and code_interpreter would break the group.
+        # data-block-kind disambiguates our carriers from regular OpenWebUI
+        # tool_calls UI artifacts (which we still strip on replay).
+        #
+        # CRITICAL: empty body MUST NOT produce a blank line between
+        # <summary> and </details>. Markdown tokenizer treats `\n\n` as
+        # block break and splits the adjacent <details> out of the group.
+        body_part = f"{body_src}\n" if body_src else ""
+        return (
+            f'<details type="tool_calls" done="true"'
+            f' data-block-kind="server_tool_use"'
+            f' data-tool-name="{html.escape(tool_name)}"'
+            f' data-tool-use-id="{html.escape(tool_use_id)}"'
+            f' data-payload-b64="{payload_b64}"'
+            f'{result_attrs}>\n'
+            f'<summary>{html.escape(summary_text)}</summary>\n'
+            f"{body_part}"
+            f"</details>\n"
+        )
+
+    def _format_server_tool_result_block(
+        self,
+        block_type: str,
+        tool_use_id: str,
+        content_payload: Any,
+        display_body: str = "",
+        summary_text: str = "",
+    ) -> str:
+        """Persist a *_tool_result block (web_search/web_fetch/code_execution
+        results) as collapsible <details> HTML with opaque payload in
+        ``data-payload-b64``. See _format_server_tool_use_block for rationale.
+        """
+        payload = {
+            "type": block_type,
+            "tool_use_id": tool_use_id,
+            "content": content_payload,
+        }
+        payload_b64 = self._encode_block_payload(payload)
+        summary = summary_text or block_type
+        # NOTE: type="tool_calls" — see _format_server_tool_use_block.
+        # Empty body avoids `\n\n` which breaks markdown grouping.
+        body_part = f"{display_body}\n" if display_body else ""
+        return (
+            f'<details type="tool_calls" done="true"'
+            f' data-block-kind="server_tool_result"'
+            f' data-block-type="{html.escape(block_type)}"'
+            f' data-tool-use-id="{html.escape(tool_use_id)}"'
+            f' data-payload-b64="{payload_b64}">\n'
+            f"<summary>{html.escape(summary)}</summary>\n"
+            f"{body_part}"
+            f"</details>\n"
+        )
+
+    def _serialize_tool_result_content(self, result_block: Any) -> Optional[Any]:
+        """Best-effort serialization of a Claude server-tool result payload
+        into a JSON-serializable form. Returns None if nothing to persist."""
+        if result_block is None:
+            return None
+        if hasattr(result_block, "model_dump"):
+            try:
+                return result_block.model_dump(exclude_none=True, mode="json")
+            except Exception:
+                try:
+                    return result_block.model_dump(exclude_none=True)
+                except Exception:
+                    return None
+        if isinstance(result_block, (dict, list, str, int, float, bool)):
+            return result_block
+        return None
+
+    async def _persist_server_tool_result(
+        self,
+        content_block: Any,
+        block_type: str,
+        emit_message_delta,
+        summary_text: str = "",
+    ) -> None:
+        """Emit a hidden <details type="server_tool_result"> carrying the full
+        API payload, so the next turn can reconstruct the exact assistant
+        block sequence. Required alongside the visible display block
+        (<details type="code_interpreter">) which is stripped on replay."""
+        tool_use_id = getattr(content_block, "tool_use_id", "") or ""
+        if not tool_use_id:
+            return
+        result_block = getattr(content_block, "content", None)
+        serialized = self._serialize_tool_result_content(result_block)
+        if serialized is None:
+            serialized = {}
+        persisted = self._format_server_tool_result_block(
+            block_type=block_type,
+            tool_use_id=tool_use_id,
+            content_payload=serialized,
+            display_body="",
+            summary_text=summary_text or block_type,
+        )
+        await emit_message_delta(persisted)
+
     def _format_compaction_block(self, summary: str) -> str:
         """Format a compaction block as a collapsible <details> for display/storage."""
         return (
