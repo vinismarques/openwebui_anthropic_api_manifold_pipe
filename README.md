@@ -1,6 +1,19 @@
 # 🚀 Anthropic API Manifold Pipe for Open WebUI
 
-> Near-complete Anthropic Messages API parity for OpenWebUI — model auto-discovery, native streaming, citations, web search/fetch, code execution, Files API, Agent Skills, prompt caching, context editing, compaction, and programmatic tool calling. This pipe targets the **Anthropic Messages API** directly through the official **Anthropic Python SDK** and keeps the OpenWebUI experience close to Anthropic-native behavior while still playing nicely with OpenWebUI models, tools, filters, files, notes, channels, and task generation.
+> Near-complete Anthropic Messages API parity for OpenWebUI — model auto-discovery, native streaming, citations, web search/fetch, code execution, Files API, Agent Skills, prompt caching, context editing, compaction, and programmatic tool calling.
+
+---
+
+## 📌 Current status
+
+- **Current pipe version:** `0.9.10`
+- **Recommended OpenWebUI:** `0.9.0+`
+- **Minimum practical OpenWebUI for good UX:** `0.8.11+`
+- **Model list and capabilities are fetched dynamically** from Anthropic's Models API (`max_input_tokens`, `max_tokens`, thinking/effort support, compaction support, etc.)
+- **Current Anthropic model docs focus on:** `Claude Opus 4.7`, `Claude Sonnet 4.6`, `Claude Haiku 4.5`
+- **Anthropic deprecation note:** `Claude Sonnet 4` and `Claude Opus 4` are deprecated and retire on **2026-06-15**
+
+This pipe targets the **Anthropic Messages API** directly through the official **Anthropic Python SDK** and keeps the OpenWebUI experience close to Anthropic-native behavior while still playing nicely with OpenWebUI models, tools, filters, files, notes, channels, and task generation.
 
 ---
 
@@ -15,8 +28,20 @@
 | **Execution** | Anthropic code execution, persistent container reuse across turns, unified code/tool/output display, programmatic tool calling |
 | **Files** | Native PDF upload, Anthropic Files API upload/download, file persistence markers, code-exec file roundtrips |
 | **Skills** | Prebuilt and custom Agent Skills, skill validation, API-side skill support via Files API + code execution |
-| **Context efficiency** | Prompt caching, optional 1-hour cache TTL, token/cache stats, context editing, compaction, tool search |
+| **Context efficiency** | Prompt caching, optional 1-hour cache TTL, token/cache stats, context editing, compaction, tool search, Advisor sub-inference |
 | **OpenWebUI integration** | Notes, channels, task generation, built-in tools, MCP tools, toggle filters, companion filter for native Anthropic buttons |
+
+---
+
+## 🧠 Anthropic / Claude notes reflected in this pipe
+
+- The Anthropic docs now treat **Opus 4.7** as the flagship generally available model for the hardest agentic and coding workloads.
+- **Opus 4.7** and **Sonnet 4.6** expose a **1M token** context window; **Haiku 4.5** uses **200k**.
+- Modern Claude models expose capabilities through the **Models API**, which this pipe reads directly.
+- `thinking.display: "omitted"` suppresses streamed `thinking_delta` events; only the thinking block shell and signature are emitted.
+- Anthropic's **Files API** remains **beta** and is especially useful together with code execution and skills.
+- Anthropic's **Skills API** relies on **code execution + files + skills beta headers**; this pipe handles that plumbing for you.
+- Anthropic's **effort** parameter is now the recommended control for adaptive-thinking models; `xhigh` is **Opus 4.7 only**.
 
 ---
 
@@ -28,6 +53,9 @@
 |-----------|------|
 | **Main Pipe** | [anthropic_pipe](https://openwebui.com/f/podden/anthropic_pipe) |
 | **Thinking Toggle** | [anthropic_pipe_thinking_toggle](https://openwebui.com/f/podden/anthropic_pipe_thinking_toggle) |
+| **Web Search Toggle** | [anthropic_web_search_toggle](https://openwebui.com/f/podden/anthropic_web_search_toggle) |
+| **Code Execution Toggle** | [anthropic_pipe_code_execution_toggle](https://openwebui.com/f/podden/anthropic_pipe_code_execution_toggle) |
+| **Files API Toggle** | [anthropic_pipe_files_toggle](https://openwebui.com/f/podden/anthropic_pipe_files_toggle) |
 | **Companion Filter** | [anthropic_manifold_companion](https://openwebui.com/f/podden/anthropic_manifold_companion) |
 
 ### Option 2: Manual installation
@@ -35,7 +63,7 @@
 1. Open **Admin Settings** → **Functions** → **+ New Function**
 2. Paste the source for `anthropic_pipe.py`
 3. Repeat for the toggle filters you want to use
-4. Optionally install the **Companion Filter** if you want to use Anthropics Version of code_execution and web_search instead of open-webuis
+4. Optionally install the **Companion Filter**
 5. Set the admin valves described below
 
 ### Recommended OpenWebUI model configuration
@@ -45,7 +73,29 @@ For each Claude model in **Admin Settings → Models**:
 1. Attach the toggle filters you want available for that model
 2. Set **Function Calling** to **`Native`**
 3. Optionally attach the **Companion Filter** if you want OpenWebUI's built-in `web_search` / `code_interpreter` buttons to route to Anthropic-native tools
-4. If you plan to use **Skills** or **Files API**, you need to use anthropics code_execution and the companion filter
+4. If you plan to use **Skills** or **Files API** workflows heavily, prefer models with strong tool and code-exec support (today that usually means **Opus 4.7** or **Sonnet 4.6**)
+
+---
+
+## 🔌 OpenWebUI compatibility notes
+
+Recent OpenWebUI releases matter for this pipe:
+
+- **0.8.11**
+   - grouped consecutive reasoning/tool blocks into single collapsible summaries
+   - improved tool-call streaming persistence and reasoning spinner behavior
+   - added upstream `WEB_FETCH_MAX_CONTENT_LENGTH` support
+- **0.8.12**
+   - rich embeds from tool calls remain visible outside collapsed groups
+- **0.9.0**
+   - async plugin/backend migration for Tools, Functions, Pipes, Filters, and Actions
+   - built-in and MCP tools reach pipes more reliably
+   - richer Anthropic-compatible tool result content and citation rendering
+   - active filter badges can expose valve configuration shortcuts directly in chat
+- **0.9.2**
+   - persisted skill mentions inject into system prompts reliably on stored chats
+
+If you fork this pipe or copy code into your own plugin, note that OpenWebUI `0.9.0+` moved DB/model helpers to async. The pipe is already migrated, but custom additions must also follow the async model/helper rules. See the official migration guide: https://docs.openwebui.com/features/extensibility/plugin/migration/to-0.9.0
 
 ---
 
@@ -67,10 +117,9 @@ For each Claude model in **Admin Settings → Models**:
 | `CACHE_TTL` | `5 minutes` | Anthropic cache TTL (`1 hour` is also supported) |
 | `WEB_SEARCH_USER_CITY / REGION / COUNTRY / TIMEZONE` | `""` | Default search-location hints for Anthropic web search |
 | `ENABLE_PROGRAMMATIC_TOOL_CALLING` | `false` | Allows Claude to call OpenWebUI tools from inside code execution |
-| `ENABLE_TOOL_SEARCH` | `true` | Deferred tool loading with search for large tool sets |
-| `TOOL_SEARCH_TYPE` | `bm25` | Tool search mode: `bm25` or `regex` |
-| `TOOL_SEARCH_MAX_DESCRIPTION_LENGTH` | `100` | Tools with longer JSON definitions are deferred for lazy loading |
-| `TOOL_SEARCH_EXCLUDE_TOOLS` | `[web_search, web_fetch, code_execution_20250825, code_execution_20260120]` | Always keep these tools loaded |
+| `ENABLE_BASH_TOOL` | `false` | Enable Claude's native `bash_20250124` tool, bridged to Open Terminal's `run_command`. Only activates when `run_command` is present in tools. |
+| `ENABLE_TEXT_EDITOR_TOOL` | `false` | Enable Claude's native `text_editor_20250728` (`str_replace_based_edit_tool`), bridged to `write_file` + `replace_file_content` (+ `run_command` fallback for `view`/`insert`). Only activates when both callables are present. |
+| `TEXT_EDITOR_MAX_CHARACTERS` | `10000` | Anthropic-side truncation limit for text_editor `view` results |
 | `DATA_RESIDENCY` | `global` | Anthropic `inference_geo` routing: `global` or `us` |
 | `REQUEST_TIMEOUT` | `300` | Anthropic API timeout in seconds |
 | `TOOL_CALL_TIMEOUT` | `30` | Per-tool execution timeout in seconds |
@@ -109,6 +158,19 @@ For each Claude model in **Admin Settings → Models**:
 | `ENABLE_DYNAMIC_FILTERING` | `false` | Enables Anthropic dynamic filtering flow for web search/fetch on supported models |
 | `USE_FILES_API` | `false` | Upload chat files to Anthropic Files API for code execution / skills |
 | `SKILLS` | `[]` | Skill IDs such as `pptx`, `xlsx`, `docx`, `pdf`, or custom uploaded skill IDs |
+
+#### Tool Search and Advisor
+
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `ENABLE_TOOL_SEARCH` | `true` | Deferred tool loading with search for large tool sets (beta `advanced-tool-use-2025-11-20`) |
+| `TOOL_SEARCH_TYPE` | `bm25` | Tool search mode: `bm25` or `regex` |
+| `TOOL_SEARCH_MAX_DESCRIPTION_LENGTH` | `100` | Tools with longer JSON definitions are deferred for lazy loading |
+| `TOOL_SEARCH_EXCLUDE_TOOLS` | `[web_search, web_fetch, code_execution_20250825, code_execution_20260120]` | Always keep these tools loaded |
+| `ENABLE_ADVISOR_TOOL` | `false` | Enables the Advisor tool (beta `advisor-tool-2026-03-01`). Executor model consults a stronger advisor (Opus 4.7) mid-generation for strategic guidance. Billed at the advisor's rate. |
+| `ADVISOR_MODEL` | `claude-opus-4-7` | Advisor model (only `claude-opus-4-7` is currently supported) |
+| `ADVISOR_MAX_USES` | `0` | Max advisor calls per request (`0` = unlimited). Beyond this, further calls return `advisor_tool_result_error` with `max_uses_exceeded`. |
+| `ADVISOR_CACHING` | `off` | Ephemeral prompt caching for the advisor transcript: `off`, `5m`, or `1h` |
 
 #### Compaction and context editing
 
@@ -151,30 +213,38 @@ For each Claude model in **Admin Settings → Models**:
 
 ## 📝 Recent pipe changes
 
+### `v0.9.11`
+- Added async handling for Open Terminal `run_command` ↔ Anthropic `bash` tool bridging
+- Added all Anthropic server tools to the hardcoded tool-search excludes so they never get deferred
+
+### `v0.9.10`
+- Added an experimental path for Anthropic's native `bash_20250124` tool via Open Terminal (`ENABLE_BASH_TOOL`)
+- Added an experimental path for Anthropic's native `text_editor_20250728` / `str_replace_based_edit_tool` via Open Terminal (`ENABLE_TEXT_EDITOR_TOOL`)
+
+### `v0.9.9`
+- Fixed tool-search block reconstruction so results render as a collapsible instead of a status message
+- Added experimental Advisor tool support (beta `advisor-tool-2026-03-01`) with `ENABLE_ADVISOR_TOOL`, `ADVISOR_MODEL`, `ADVISOR_MAX_USES`, and `ADVISOR_CACHING`
+
 ### `v0.9.8`
-- Persist `server_tool_use` / `server_tool_result` blocks as hidden carriers so native Anthropic server tools survive multi-turn replay
-- Merge `web_search` / `web_fetch` use + result into a **single** collapsible block per call
-- Remove redundant status spam for search/fetch; details stay inline in the conversation instead
+- Complete overhaul of how message blocks are recreated for a new turn to align with Anthropic cache restrictions
+- Cache should now stay intact on new turns even when using **RAG**, **image/PDF upload**, **memory**, **tools**, and similar flows
+- Group tool / thinking output into **one** collapsible UI block
 
 ### `v0.9.7`
-- Persist thinking block signatures across turns
-- Reconstruct historical reasoning blocks back into structured Anthropic `thinking` blocks for better continuity and cache behavior
+- Preserve thinking signatures across turns for better replay continuity and cache behavior
 
 ### `v0.9.6`
-- OpenWebUI `0.9.0+` compatibility update for async DB/model APIs
-- Replay historical `<details type="tool_calls">` back into structured tool blocks so Claude stops losing prior tool-call history
+- Updated for Open WebUI `0.9.0+` async APIs
 
 ### `v0.9.5`
-- Add **Claude Opus 4.7** support
-- Add `xhigh` effort
-- Clamp unsupported effort values per model automatically
+- Added **Claude Opus 4.7** and the new **`xhigh`** effort level
 
 ### `v0.9.4`
 - Add cache statistics to token-count output
 
 ### `v0.9.3`
-- Move **compaction** and **context editing** from admin valves to **UserValves**
-- Upgrade `SHOW_TOKEN_COUNT` from boolean to `Off` / `On` / `With Cache`
+- Moved **Compaction** and **Context Editing** into **UserValves**
+- Upgraded token display to **`Off / On / With Cache`**
 
 ### `v0.9.2`
 - Add compaction and client-side pre-trim before request submission

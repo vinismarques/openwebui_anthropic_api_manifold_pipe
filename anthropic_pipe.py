@@ -52,50 +52,27 @@ v0.9.9
   `ADVISOR_MAX_USES` (0=unlimited), `ADVISOR_CACHING` (off/5m/1h ephemeral).
 
 v0.9.8
-- Added correct handling of Server Tool Blocks as well (web_search, web_fetch, code_execution family) are now persisted as
-  hidden carriers (`<details type="tool_calls" data-block-kind="server_tool_use|server_tool_result"
-  data-payload-b64="...">`) 
-- web_search / web_fetch now render ONE merged collapsible per call instead of two adjacent
-  blocks. The `server_tool_use` carrier is updated in-place via `replace` event when the
-  matching `*_tool_result` arrives, embedding both payloads (`data-payload-b64` +
-  `data-result-payload-b64`). Replay decodes both into separate API blocks at the original
-  position so tool_use + tool_result ordering is preserved.
-- Removed redundant status events ("🔍 Searching for: …", "🌐 Fetching: …", "Found X results
-  - … +N more", "🌐 URL fetched", error variants). All info now lives inside the collapsible
-  body so it stays inline with the conversation flow and never leaks back to the API
-  (status text is body-only; replay only consumes base64 payloads).
-- A lot of cleanup
+- Complete overhaul of how message blocks are recreated for a new turn to align with
+    Anthropic cache restrictions.
+- Cache now should not break on new turns even when using RAG, image or PDF upload,
+    memory, tools, and similar flows.
+- Refactored tool / thinking output so grouped activity renders as one collapsible UI block.
 
 v0.9.7
-- Persist thinking block signatures across turns. `<details type="reasoning">`
-  blocks now carry a `data-signature` HTML attribute carrying the opaque
-  server-issued signature, and historical reasoning blocks are reconstructed
-  as structured {type:"thinking", thinking, signature} API blocks on replay.
-  This enables Opus 4.5+/Sonnet 4.6/Mythos thinking-preservation cache hits
-  and keeps reasoning continuity intact across multi-turn conversations.
-  Unsignatured legacy blocks are silently dropped (API would strip them
-  anyway on non-tool-result turns).
+- Preserves thinking signatures across turns for better replay continuity and cache behavior.
 
 v0.9.6
-- open-webui 0.9.0+ compatibility update (async DB API)
-- fixed token counting for analytics tab
-- Fixed tool-call history loss (GitHub issue #30): historical assistant messages with
-  <details type="tool_calls"> HTML are now parsed back into structured tool_use/tool_result
-  blocks instead of being stripped. Claude no longer loses evidence of prior tool calls
-  on follow-up turns and stops re-executing tools wastefully. Interrupted (done="false")
-  calls synthesize is_error tool_results to keep the chain valid.
+- Updated for Open WebUI 0.9.0+ async APIs.
 
 v0.9.5
-- Added Opus 4.7
-- Added new "xhigh" effort level (Opus 4.7 only)
-- Effort values are now clamped per-model: xhigh -> high on non-Opus-4.7, max -> high on models that don't support it
+- Added Claude Opus 4.7 and the new xhigh effort level.
 
 v0.9.4
 - Added Cache Statistics to Token Count Message
 
 v0.9.3
-- Moved compaction and context editing valves to UserValves
-- SHOW_TOKEN_COUNT valve upgraded from bool to "Off"/"On"/"With Cache" — "With Cache" shows cache read/write tokens and TTL
+- Moved Compaction and Context Editing into UserValves.
+- Upgraded token display to Off / On / With Cache.
 
 v0.9.2
 - added compaction and client-side compaction trim: drops messages before the last compaction boundary before sending
