@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.8
+version: 0.9.11
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,20 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.11
+- Added async handling for run_command <-> bash tool
+- Added all anthropic server tools as TOOL_SEARCH_EXCLUDE_TOOLS
+
+v0.9.10
+- Added Experimental path for using Anthropics native (`bash_20250124`) to use with OpenTerminal. Use Valve `ENABLE_BASH_TOOL`
+- Added Experimental path for using Anthripics native (`text_editor_20250728` / `str_replace_based_edit_tool`) tools to use with Open Terminal. Use Valve `ENABLE_TEXT_EDITOR_TOOL`.
+
+v0.9.9
+- Fixed Tool Search Block reconstruction as well. Displays collapsible instead of status
+- Added Experimental support for the Advisor tool support (beta `advisor-tool-2026-03-01`). New valves:
+  `ENABLE_ADVISOR_TOOL`, `ADVISOR_MODEL` (default claude-opus-4-7),
+  `ADVISOR_MAX_USES` (0=unlimited), `ADVISOR_CACHING` (off/5m/1h ephemeral).
+
 v0.9.8
 - Added correct handling of Server Tool Blocks as well (web_search, web_fetch, code_execution family) are now persisted as
   hidden carriers (`<details type="tool_calls" data-block-kind="server_tool_use|server_tool_result"
@@ -865,23 +879,25 @@ class Pipe:
             default=False,
             description="Enable programmatic tool calling. Claude can call tools from within code execution. Requires code execution to be active.",
         )
-        ENABLE_TOOL_SEARCH: bool = Field(
-            default=True,
-            description="Enable tool search. Allows Claude to search for tools by name/description when many tools are available.",
+        ENABLE_BASH_TOOL: bool = Field(
+            default=False,
+            description="EXPERIMENTAL: Enable Claude's native bash tool (bash_20250124) in OpenTerminal",
         )
-        TOOL_SEARCH_TYPE: Literal["regex", "bm25"] = Field(
-            default="bm25",
-            description="Type of tool search: 'regex' for pattern matching or 'bm25' for natural language search.",
+        BASH_TOOL_TIMEOUT: int = Field(
+            default=120,
+            ge=5,
+            le=900,
+            description="Max seconds to wait for an Open Terminal bash command to finish before returning the partial output. Open Terminal's run_command is async — the pipe polls get_process_status until completion or this timeout.",
         )
-        TOOL_SEARCH_MAX_DESCRIPTION_LENGTH: int = Field(
-            default=100,
-            ge=10,
-            le=10000,
-            description="Maximum tool description length. Tools with longer JSON definitions will be deferred for lazy loading.",
+        ENABLE_TEXT_EDITOR_TOOL: bool = Field(
+            default=False,
+            description="EXPERIMENTAL: Use Claude's native text editor tool (text_editor_20250728 / str_replace_based_edit_tool) in OpenTerminal",
         )
-        TOOL_SEARCH_EXCLUDE_TOOLS: List[str] = Field(
-            default=["web_search", "web_fetch", "code_execution_20250825", "code_execution_20260120"],
-            description="Tools to exclude from defer_loading when tool search is enabled. These tools will always be loaded immediately.",
+        TEXT_EDITOR_MAX_CHARACTERS: int = Field(
+            default=10000,
+            ge=1000,
+            le=200000,
+            description="Max characters returned by text_editor `view` command before truncation (Anthropic-side truncation via `max_characters`).",
         )
         DATA_RESIDENCY: Literal["global", "us"] = Field(
             default="global",
@@ -890,13 +906,13 @@ class Pipe:
         REQUEST_TIMEOUT: int = Field(
             default=300,
             ge=30,
-            le=1800,
+            le=9999,
             description="Request timeout in seconds for Anthropic API calls. Increase if using slow local rerankers or large context (e.g. 600 for Top-K 15+).",
         )
         TOOL_CALL_TIMEOUT: int = Field(
             default=30,
             ge=10,
-            le=600,
+            le=9999,
             description="Timeout in seconds for individual tool call execution.",
         )
 
@@ -962,6 +978,44 @@ class Pipe:
         ENABLE_DYNAMIC_FILTERING: bool = Field(
             default=False,
             description="Use dynamic filtering for web search/fetch on supported models (4.6+). Much slower (~60s vs ~7s) but produces higher quality results by orchestrating multiple searches/fetches and filtering content via code execution. Trades speed for context efficiency.",
+        )
+        # Tool Search (advanced-tool-use) — per-user
+        ENABLE_TOOL_SEARCH: bool = Field(
+            default=True,
+            description="Enable tool search. Allows Claude to search for tools by name/description when many tools are available.",
+        )
+        TOOL_SEARCH_TYPE: Literal["regex", "bm25"] = Field(
+            default="bm25",
+            description="Type of tool search: 'regex' for pattern matching or 'bm25' for natural language search.",
+        )
+        TOOL_SEARCH_MAX_DESCRIPTION_LENGTH: int = Field(
+            default=100,
+            ge=10,
+            le=10000,
+            description="Maximum tool description length. Tools with longer JSON definitions will be deferred for lazy loading.",
+        )
+        TOOL_SEARCH_EXCLUDE_TOOLS: List[str] = Field(
+            default=[],
+            description="Excluded Tool always load. Anthropic Tools are excluded by default.",
+        )
+        # Advisor tool (advisor-tool-2026-03-01) — per-user
+        ENABLE_ADVISOR_TOOL: bool = Field(
+            default=False,
+            description="Enable the Advisor tool. A faster executor model consults a stronger advisor model mid-generation for strategic guidance.",
+        )
+        ADVISOR_MODEL: Literal["claude-opus-4-7"] = Field(
+            default="claude-opus-4-7",
+            description="Advisor model ID.",
+        )
+        ADVISOR_MAX_USES: int = Field(
+            default=0,
+            ge=0,
+            le=100,
+            description="Max advisor calls per request (0 = unlimited).",
+        )
+        ADVISOR_CACHING: Literal["off", "5m", "1h"] = Field(
+            default="off",
+            description="Enable prompt caching for the advisor's own transcript across calls within a conversation.",
         )
         # Files API and Skills Settings
         USE_FILES_API: bool = Field(
@@ -2294,8 +2348,12 @@ class Pipe:
             logger.info(f"📦 Reusing container from previous turn: {previous_container_id}")
 
         # Add advanced tool use beta (for programmatic calling and tool search)
-        if self.valves.ENABLE_TOOL_SEARCH or self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+        if __user__["valves"].ENABLE_TOOL_SEARCH or self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
             beta_headers.append("advanced-tool-use-2025-11-20")
+
+        # Add advisor tool beta
+        if __user__["valves"].ENABLE_ADVISOR_TOOL:
+            beta_headers.append("advisor-tool-2026-03-01")
 
         # Add context editing strategies if enabled
         context_editing_strategy = __user__["valves"].CONTEXT_EDITING_STRATEGY
@@ -2573,6 +2631,29 @@ class Pipe:
         # Names reserved for Anthropic server-side tools (skip if found in body.tools)
         anthropic_server_tool_names = {"web_search", "web_fetch"}
 
+        # Open Terminal bridge activation: if native bash / text_editor tools
+        # are enabled AND the required Open Terminal callables are present,
+        # route Claude's native tool calls through them and hide the raw
+        # callables from the regular tool list (Claude only sees the native
+        # bash / str_replace_based_edit_tool definitions).
+        has_run_command = bool(__tools__ and "run_command" in __tools__ and __tools__["run_command"].get("callable"))
+        has_write_file = bool(__tools__ and "write_file" in __tools__ and __tools__["write_file"].get("callable"))
+        has_replace_file = bool(__tools__ and "replace_file_content" in __tools__ and __tools__["replace_file_content"].get("callable"))
+        bash_active = self.valves.ENABLE_BASH_TOOL and has_run_command
+        text_editor_active = (
+            self.valves.ENABLE_TEXT_EDITOR_TOOL and has_write_file and has_replace_file
+        )
+        terminal_hidden_names: set[str] = set()
+        if bash_active:
+            terminal_hidden_names.add("run_command")
+        if text_editor_active:
+            terminal_hidden_names.update({"write_file", "replace_file_content"})
+        if terminal_hidden_names:
+            logger.debug(
+                f"Open Terminal bridge active: hiding {sorted(terminal_hidden_names)} "
+                f"(bash={bash_active}, text_editor={text_editor_active})"
+            )
+
         # Extract built-in tools from body.tools (OpenAI format)
         body_tools = body.get("tools", [])
         if body_tools:
@@ -2587,6 +2668,12 @@ class Pipe:
                     # Skip tools that will be handled by Anthropic server-side tools
                     if name in anthropic_server_tool_names:
                         logger.info(f"Skipping body tool '{name}' — handled by Anthropic server tool")
+                        continue
+
+                    # Skip Open Terminal callables that are being bridged to
+                    # native bash / text_editor tools.
+                    if name in terminal_hidden_names:
+                        logger.info(f"Skipping body tool '{name}' — bridged to native Claude tool")
                         continue
 
                     # Convert OpenAI format to Claude format
@@ -2701,6 +2788,49 @@ class Pipe:
             tool_names_seen.add("web_fetch")
             logger.debug(f"Added web_fetch tool: {web_fetch_type}")
 
+        # Add advisor tool if enabled (beta). Executor↔advisor pair validation
+        # is enforced server-side — invalid pairs return 400 invalid_request_error.
+        # The advisor sub-inference is billed at the advisor model's rates.
+        if __user__["valves"].ENABLE_ADVISOR_TOOL:
+            advisor_tool: dict = {
+                "type": "advisor_20260301",
+                "name": "advisor",
+                "model": __user__["valves"].ADVISOR_MODEL,
+            }
+            if __user__["valves"].ADVISOR_MAX_USES > 0:
+                advisor_tool["max_uses"] = __user__["valves"].ADVISOR_MAX_USES
+            if __user__["valves"].ADVISOR_CACHING != "off":
+                advisor_tool["caching"] = {
+                    "type": "ephemeral",
+                    "ttl": __user__["valves"].ADVISOR_CACHING,
+                }
+            claude_tools.append(advisor_tool)
+            tool_names_seen.add("advisor")
+            logger.debug(
+                f"Added advisor tool: model={__user__['valves'].ADVISOR_MODEL} "
+                f"max_uses={__user__['valves'].ADVISOR_MAX_USES or 'unlimited'} "
+                f"caching={__user__['valves'].ADVISOR_CACHING}"
+            )
+
+        # Inject native bash tool (bridged to Open Terminal's run_command)
+        if bash_active:
+            claude_tools.append({"type": "bash_20250124", "name": "bash"})
+            tool_names_seen.add("bash")
+            logger.debug("Added native bash tool (bridged to run_command)")
+
+        # Inject native text editor tool (bridged to write_file + replace_file_content)
+        if text_editor_active:
+            claude_tools.append({
+                "type": "text_editor_20250728",
+                "name": "str_replace_based_edit_tool",
+                "max_characters": self.valves.TEXT_EDITOR_MAX_CHARACTERS,
+            })
+            tool_names_seen.add("str_replace_based_edit_tool")
+            logger.debug(
+                f"Added native text_editor tool (bridged to write_file+replace_file_content, "
+                f"max_characters={self.valves.TEXT_EDITOR_MAX_CHARACTERS})"
+            )
+
         # Process user tools from __tools__ (these have callables for execution)
         if __tools__ and len(__tools__) > 0:
             for tool_name, tool_data in __tools__.items():
@@ -2720,6 +2850,13 @@ class Pipe:
                 # Skip if toolname starts with _ or __
                 if name.startswith("_"):
                     logger.debug(f"Skipping private tool: {name}")
+                    continue
+
+                # Skip Open Terminal callables that are bridged to native
+                # Claude bash / text_editor tools — they must not appear as
+                # regular user tools or Claude will see duplicates.
+                if name in terminal_hidden_names:
+                    logger.debug(f"Skipping bridged Open Terminal tool: {name}")
                     continue
 
                 description = spec.get("description", f"Tool: {name}")
@@ -2754,17 +2891,45 @@ class Pipe:
             model_info_ptc = self.get_model_info(actual_model_name)
             is_programmatic_active = model_info_ptc.get("supports_programmatic_calling", False)
 
+        # Anthropic-managed tools (server-side or special client tools wired by
+        # this pipe) MUST NEVER be deferred via tool_search — their names are
+        # not exposed in the regular tool registry the search picks from, and
+        # several have version-specific shapes the search can't reproduce.
+        # Hard-coded in addition to the user-configurable exclude list.
+        # Type identifiers used in tool definitions (advisor_20260301,
+        # web_search_20260209, …) are kept here for documentation; the actual
+        # exclusion key is the tool ``name`` field.
+        ANTHROPIC_BUILTIN_TOOL_NAMES = frozenset({
+            # Server tools — GA
+            "web_search",            # web_search_20260209 / web_search_20250305
+            "web_fetch",             # web_fetch_20260209  / web_fetch_20250910
+            "code_execution",        # code_execution_20260120 / code_execution_20250825
+            "bash_code_execution",
+            "text_editor_code_execution",
+            "tool_search_tool_regex",  # tool_search_tool_regex_20251119
+            "tool_search_tool_bm25",   # tool_search_tool_bm25_20251119
+            # Server tools — Beta
+            "advisor",               # advisor_20260301 (advisor-tool-2026-03-01)
+            "mcp_toolset",           # mcp-client-2025-11-20
+            # Client tools — bridged by this pipe
+            "memory",                # memory_20250818
+            "bash",                  # bash_20250124
+            "str_replace_based_edit_tool",  # text_editor_20250728 / 20250124
+            "computer",              # computer_20251124 / 20250124
+        })
+
         for claude_tool in claude_tools:
             # Check if tool should be deferred for tool search
             # IMPORTANT: Skip deferring when programmatic tool calling is active
-            if self.valves.ENABLE_TOOL_SEARCH and not is_programmatic_active:
+            if __user__["valves"].ENABLE_TOOL_SEARCH and not is_programmatic_active:
                 # Skip deferring if tool is in exclusion list
                 name = claude_tool["name"]
-                if name not in self.valves.TOOL_SEARCH_EXCLUDE_TOOLS:
+                user_excludes = __user__["valves"].TOOL_SEARCH_EXCLUDE_TOOLS
+                if name not in user_excludes and name not in ANTHROPIC_BUILTIN_TOOL_NAMES:
                     # Calculate tool definition size (JSON representation)
                     tool_json = json.dumps(claude_tool)
                     tool_len = len(tool_json)
-                    if len(tool_json) > self.valves.TOOL_SEARCH_MAX_DESCRIPTION_LENGTH:
+                    if len(tool_json) > __user__["valves"].TOOL_SEARCH_MAX_DESCRIPTION_LENGTH:
                         claude_tool["defer_loading"] = True
                     else:
                         logger.debug(f"Tool '{name}' will be loaded normally")
@@ -2788,7 +2953,7 @@ class Pipe:
                 claude_tool["eager_input_streaming"] = True
 
         if any(tool.get("defer_loading", False) for tool in claude_tools):
-            if self.valves.TOOL_SEARCH_TYPE == "regex":
+            if __user__["valves"].TOOL_SEARCH_TYPE == "regex":
                 tool_search_tool = {
                     "type": "tool_search_tool_regex_20251119",
                     "name": "tool_search_tool_regex",
@@ -4321,95 +4486,196 @@ class Pipe:
                                                         result_display_body=display_body,
                                                     )
                                                     await update_content_block(carrier_info["block"], merged)
+                                elif content_type == "advisor_tool_result":
+                                    logger.debug(
+                                        f" Processing advisor result event: {event}"
+                                    )
+                                    # advisor_tool_result MUST be replayed verbatim — the
+                                    # server constructs the advisor's view from the full
+                                    # transcript, and subsequent turns depend on byte-exact
+                                    # replay (plaintext advisor_result OR opaque
+                                    # advisor_redacted_result) for cache + context fidelity.
+                                    adv_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
+                                    adv_content = getattr(content_block, "content", None)
+                                    adv_inner_type = (
+                                        getattr(adv_content, "type", "")
+                                        if adv_content is not None and hasattr(adv_content, "type")
+                                        else (adv_content.get("type", "") if isinstance(adv_content, dict) else "")
+                                    )
+                                    # Serialize the full content payload for API replay.
+                                    serialized_content: Any = None
+                                    if adv_content is not None:
+                                        if hasattr(adv_content, "model_dump"):
+                                            try:
+                                                serialized_content = adv_content.model_dump(
+                                                    exclude_none=True, mode="json"
+                                                )
+                                            except Exception:
+                                                try:
+                                                    serialized_content = adv_content.model_dump(
+                                                        exclude_none=True
+                                                    )
+                                                except Exception:
+                                                    serialized_content = None
+                                        elif isinstance(adv_content, dict):
+                                            serialized_content = adv_content
+                                    if serialized_content is None:
+                                        serialized_content = {}
+
+                                    if adv_inner_type == "advisor_tool_result_error":
+                                        error_code = (
+                                            getattr(adv_content, "error_code", "unknown")
+                                            if hasattr(adv_content, "error_code")
+                                            else (adv_content.get("error_code", "unknown") if isinstance(adv_content, dict) else "unknown")
+                                        )
+                                        status_desc = f"🧑‍⚖️ Advisor error: {error_code}"
+                                        display_body = f"**{status_desc}** `{html.escape(error_code)}`"
+                                        logger.warning(f"advisor error: {error_code}")
+                                    elif adv_inner_type == "advisor_redacted_result":
+                                        status_desc = "🧑‍⚖️ Advisor: (redacted)"
+                                        display_body = (
+                                            "**🧑‍⚖️ Advisor consulted** _(encrypted output; "
+                                            "content is decrypted server-side on the next turn)_"
+                                        )
+                                    else:
+                                        # advisor_result (plaintext) or unknown success shape
+                                        advice_text = ""
+                                        if hasattr(adv_content, "text"):
+                                            advice_text = getattr(adv_content, "text", "") or ""
+                                        elif isinstance(adv_content, dict):
+                                            advice_text = adv_content.get("text", "") or ""
+                                        preview = advice_text.strip().splitlines()[0] if advice_text.strip() else ""
+                                        status_desc = (
+                                            f"🧑‍⚖️ Advisor: {preview[:80]}"
+                                            if preview
+                                            else "🧑‍⚖️ Advisor consulted"
+                                        )
+                                        if advice_text.strip():
+                                            display_body = advice_text.strip()
+                                        else:
+                                            display_body = "**🧑‍⚖️ Advisor consulted** _(empty response)_"
+
+                                    if adv_tool_use_id:
+                                        carrier_info = server_tool_use_carriers.pop(
+                                            adv_tool_use_id, None
+                                        )
+                                        if carrier_info:
+                                            merged = self._format_server_tool_use_block(
+                                                tool_name=carrier_info["tool_name"],
+                                                tool_use_id=adv_tool_use_id,
+                                                tool_input=carrier_info["tool_input"],
+                                                result_payload=serialized_content,
+                                                result_block_type="advisor_tool_result",
+                                                result_summary=status_desc,
+                                                result_display_body=display_body,
+                                            )
+                                            await update_content_block(
+                                                carrier_info["block"], merged
+                                            )
+                                        else:
+                                            standalone = self._format_server_tool_result_block(
+                                                block_type="advisor_tool_result",
+                                                tool_use_id=adv_tool_use_id,
+                                                content_payload=serialized_content,
+                                                display_body=display_body,
+                                                summary_text=status_desc,
+                                            )
+                                            await emit_message_delta(standalone)
                                 elif content_type == "tool_search_tool_result":
                                     logger.debug(
                                         f" Processing tool search result event: {event}"
                                     )
-                                    # Serialize the tool_search_tool_result block for API preservation
-                                    # These blocks MUST be included verbatim in the next API call
-                                    tool_use_id = getattr(content_block, "tool_use_id", "")
+                                    # tool_search_tool_result MUST be persisted verbatim and
+                                    # replayed on the next API turn — otherwise the prompt
+                                    # cache prefix is invalidated (server_tool_use/tool_result
+                                    # positions must match byte-exact). Merge the result INTO
+                                    # the existing server_tool_use carrier so one collapsible
+                                    # carries both the tool call and its result payload.
+                                    tsr_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
                                     content_obj = getattr(content_block, "content", None)
-                                    tool_refs = []
+                                    # Extract tool_references for display summary
+                                    tool_references = []
                                     if content_obj:
-                                        refs = (
-                                            getattr(content_obj, "tool_references", [])
-                                            if hasattr(content_obj, "tool_references")
-                                            else content_obj.get("tool_references", [])
+                                        if hasattr(content_obj, "tool_references"):
+                                            tool_references = getattr(
+                                                content_obj, "tool_references", []
+                                            ) or []
+                                        elif isinstance(content_obj, dict):
+                                            tool_references = content_obj.get(
+                                                "tool_references", []
+                                            ) or []
+                                    tool_names = []
+                                    for ref in tool_references:
+                                        if hasattr(ref, "tool_name"):
+                                            tool_names.append(getattr(ref, "tool_name", "unknown"))
+                                        elif isinstance(ref, dict):
+                                            tool_names.append(ref.get("tool_name", "unknown"))
+                                    if tool_names:
+                                        status_desc = (
+                                            f"🧰 Found {len(tool_names)} tool(s): "
+                                            f"{', '.join(tool_names[:5])}"
+                                            + (f" +{len(tool_names)-5} more" if len(tool_names) > 5 else "")
                                         )
-                                        for ref in refs:
-                                            tool_refs.append({
-                                                "type": "tool_reference",
-                                                "tool_name": (
-                                                    getattr(ref, "tool_name", "")
-                                                    if hasattr(ref, "tool_name")
-                                                    else ref.get("tool_name", "")
-                                                ),
-                                            })
-                                    # SDK preserves tool_search_tool_result blocks in accumulated message
-                                    # They get stripped as response-only types in _convert_sdk_message_to_api_blocks
-                                    # Only show status events if tool search valve is enabled
-                                    if self.valves.ENABLE_TOOL_SEARCH:
-                                        # Access nested structure: content_block.content.tool_references
-                                        content = getattr(
-                                            content_block, "content", None
-                                        )
-                                        tool_references = []
-                                        if content:
-                                            # Handle both dict and object access patterns
-                                            if hasattr(content, "tool_references"):
-                                                tool_references = getattr(
-                                                    content, "tool_references", []
+                                    else:
+                                        status_desc = "🧰 Tool search: no matching tools"
+                                    display_body = status_desc
+
+                                    # Serialize the full tool_search_tool_result payload for
+                                    # API replay. Must preserve all tool_references fields.
+                                    serialized_content: Any = None
+                                    if content_obj is not None:
+                                        if hasattr(content_obj, "model_dump"):
+                                            try:
+                                                serialized_content = content_obj.model_dump(
+                                                    exclude_none=True, mode="json"
                                                 )
-                                            elif isinstance(content, dict):
-                                                tool_references = content.get(
-                                                    "tool_references", []
-                                                )
+                                            except Exception:
+                                                try:
+                                                    serialized_content = content_obj.model_dump(
+                                                        exclude_none=True
+                                                    )
+                                                except Exception:
+                                                    serialized_content = None
+                                        elif isinstance(content_obj, dict):
+                                            serialized_content = content_obj
+                                    if serialized_content is None:
+                                        # Fallback: rebuild from extracted tool_references only.
+                                        serialized_content = {
+                                            "tool_references": [
+                                                {"type": "tool_reference", "tool_name": n}
+                                                for n in tool_names
+                                            ],
+                                        }
 
-                                        logger.debug(
-                                            f"Tool search result - found {len(tool_references)} tool references"
+                                    if tsr_tool_use_id:
+                                        carrier_info = server_tool_use_carriers.pop(
+                                            tsr_tool_use_id, None
                                         )
-
-                                        if tool_references and len(tool_references) > 0:
-                                            # Extract tool names from references
-                                            tool_names = []
-                                            for ref in tool_references[:5]:
-                                                if hasattr(ref, "tool_name"):
-                                                    tool_names.append(
-                                                        getattr(
-                                                            ref, "tool_name", "unknown"
-                                                        )
-                                                    )
-                                                elif isinstance(ref, dict):
-                                                    tool_names.append(
-                                                        ref.get("tool_name", "unknown")
-                                                    )
-
-                                            status_desc = f"🔍 Found {len(tool_references)} tool(s): {', '.join(tool_names)}"
-                                            logger.debug(
-                                                f"Tool search success: {status_desc}"
+                                        if carrier_info:
+                                            merged = self._format_server_tool_use_block(
+                                                tool_name=carrier_info["tool_name"],
+                                                tool_use_id=tsr_tool_use_id,
+                                                tool_input=carrier_info["tool_input"],
+                                                result_payload=serialized_content,
+                                                result_block_type="tool_search_tool_result",
+                                                result_summary=status_desc,
+                                                result_display_body=display_body,
                                             )
-                                            await emit_event_local(
-                                                {
-                                                    "type": "status",
-                                                    "data": {
-                                                        "description": status_desc,
-                                                        "done": True,
-                                                    },
-                                                }
+                                            await update_content_block(
+                                                carrier_info["block"], merged
                                             )
                                         else:
-                                            logger.debug(
-                                                "Tool search returned no results"
+                                            # No carrier (legacy / missing server_tool_use stop):
+                                            # emit a standalone server_tool_result carrier so
+                                            # the payload still survives the DB round-trip.
+                                            standalone = self._format_server_tool_result_block(
+                                                block_type="tool_search_tool_result",
+                                                tool_use_id=tsr_tool_use_id,
+                                                content_payload=serialized_content,
+                                                display_body=display_body,
+                                                summary_text=status_desc,
                                             )
-                                            await emit_event_local(
-                                                {
-                                                    "type": "status",
-                                                    "data": {
-                                                        "description": "🔍 Tool search: No matching tools found",
-                                                        "done": True,
-                                                    },
-                                                }
-                                            )
+                                            await emit_message_delta(standalone)
                                 elif content_type == "context_cleared":
                                     cleared_info = getattr(content_block, "cleared", {})
                                     cleared_type = (
@@ -4790,6 +5056,8 @@ class Pipe:
                                         "web_search", "web_fetch",
                                         "code_execution", "bash_code_execution",
                                         "text_editor_code_execution",
+                                        "tool_search_tool_regex", "tool_search_tool_bm25",
+                                        "advisor",
                                     )
                                     if active_server_tool_name in SERVER_TOOLS_TO_PERSIST and active_server_tool_id:
                                         try:
@@ -4864,7 +5132,36 @@ class Pipe:
                                             if __tools__
                                             else None
                                         )
-                                        if tool and tool.get("callable"):
+                                        if tool_name == "bash" and self.valves.ENABLE_BASH_TOOL and __tools__ and "run_command" in __tools__:
+                                            # Native bash tool → bridge to run_command
+                                            tool_call_data_list.append(tool_call_data)
+                                            args = tool_input if isinstance(tool_input, dict) else {}
+                                            task = asyncio.create_task(
+                                                self._dispatch_bash_tool(args, __tools__)
+                                            )
+                                            running_tool_tasks.append(task)
+                                            logger.debug(
+                                                f"🚀 Started bash bridge → run_command (task #{len(running_tool_tasks)})"
+                                            )
+                                        elif (
+                                            tool_name == "str_replace_based_edit_tool"
+                                            and self.valves.ENABLE_TEXT_EDITOR_TOOL
+                                            and __tools__
+                                            and "write_file" in __tools__
+                                            and "replace_file_content" in __tools__
+                                        ):
+                                            # Native text_editor tool → bridge to Open Terminal callables
+                                            tool_call_data_list.append(tool_call_data)
+                                            args = tool_input if isinstance(tool_input, dict) else {}
+                                            task = asyncio.create_task(
+                                                self._dispatch_text_editor_tool(args, __tools__)
+                                            )
+                                            running_tool_tasks.append(task)
+                                            logger.debug(
+                                                f"🚀 Started text_editor bridge (cmd={args.get('command', '?')}, "
+                                                f"task #{len(running_tool_tasks)})"
+                                            )
+                                        elif tool and tool.get("callable"):
                                             # User tool with callable - execute directly
                                             tool_call_data_list.append(tool_call_data)
 
@@ -6124,6 +6421,253 @@ class Pipe:
         except Exception:
             return None
 
+    @staticmethod
+    def _stringify_terminal_result(result: Any) -> str:
+        """Normalize Open Terminal callable results to a plain string.
+
+        ``execute_tool_server`` returns a ``(data, headers)`` tuple where
+        ``headers`` is a ``CIMultiDictProxy`` (not JSON-serializable). The
+        OpenWebUI middleware unpacks ``[0]`` before dumping; we do the same
+        here, then JSON-encode the data half.
+        """
+        if isinstance(result, tuple) and result:
+            result = result[0]
+        if isinstance(result, str):
+            return result
+        try:
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(result)
+
+    async def _dispatch_bash_tool(
+        self,
+        tool_input: dict,
+        __tools__: dict,
+    ) -> str:
+        """Bridge native bash tool calls to Open Terminal's run_command callable.
+
+        Open Terminal's `run_command` is *asynchronous*: it returns a process
+        descriptor (``id``, ``status="running"``, empty ``output``) immediately
+        and the actual stdout/stderr must be polled via ``get_process_status``.
+        This wrapper hides that detail from the model — it polls until the
+        process completes (or times out) and returns a single concatenated
+        result string, so Claude's bash tool semantics ("send command, receive
+        output") are preserved.
+
+        - {command: "..."}  → run_command + poll until done.
+        - {restart: true}   → no native restart endpoint exists; reset CWD via `cd ~`.
+        """
+        try:
+            run_cmd = __tools__.get("run_command", {}).get("callable")
+            if not run_cmd:
+                return "Error: run_command callable is not available."
+            if tool_input.get("restart"):
+                await run_cmd(command="cd ~")
+                return "Bash session reset (working dir → $HOME)."
+            command = tool_input.get("command", "")
+            if not command:
+                return "Error: missing required parameter `command`."
+
+            raw = await run_cmd(command=command)
+            data = self._parse_terminal_payload(raw)
+
+            # Synchronous path: server returned a final status (no id, or already done).
+            if not isinstance(data, dict) or "id" not in data:
+                return self._stringify_terminal_result(raw)
+            status = data.get("status")
+            if status and status != "running":
+                return self._format_bash_process_result(data)
+
+            process_id = data["id"]
+            poll_cb = __tools__.get("get_process_status", {}).get("callable")
+            if not poll_cb:
+                # No polling tool available — surface the async descriptor as-is.
+                return self._stringify_terminal_result(raw)
+
+            timeout_s = max(5, int(self.valves.BASH_TOOL_TIMEOUT))
+            deadline = time.monotonic() + timeout_s
+            delay = 0.25  # exponential backoff: 0.25 → 0.5 → 1 → 2 (cap)
+            offset = 0
+            collected: list = list(data.get("output") or [])
+            last_status: dict = data
+            while True:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
+                try:
+                    poll_raw = await poll_cb(id=process_id, offset=offset)
+                except TypeError:
+                    # Older terminal builds may not accept `offset`
+                    poll_raw = await poll_cb(id=process_id)
+                poll_data = self._parse_terminal_payload(poll_raw)
+                if not isinstance(poll_data, dict):
+                    last_status = {"id": process_id, "status": "unknown"}
+                    break
+                last_status = poll_data
+                new_chunk = poll_data.get("output") or []
+                if isinstance(new_chunk, list):
+                    collected.extend(new_chunk)
+                    offset = poll_data.get("next_offset", offset + len(new_chunk))
+                if poll_data.get("status") and poll_data["status"] != "running":
+                    break
+                if time.monotonic() >= deadline:
+                    last_status["status"] = last_status.get("status") or "timeout"
+                    last_status["timed_out_after_s"] = timeout_s
+                    break
+
+            last_status["output"] = collected
+            return self._format_bash_process_result(last_status)
+        except Exception as e:
+            logger.exception("bash dispatch failed")
+            return f"Error executing bash command: {e}"
+
+    @staticmethod
+    def _parse_terminal_payload(raw: Any) -> Any:
+        """Normalize an Open Terminal callable result into a Python object.
+
+        ``execute_tool_server`` returns ``(data, headers)``. ``data`` is usually
+        already a dict, but some callables stringify their JSON. Handle both."""
+        if isinstance(raw, tuple) and raw:
+            raw = raw[0]
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except (TypeError, ValueError):
+                return raw
+        return raw
+
+    @staticmethod
+    def _format_bash_process_result(data: dict) -> str:
+        """Render a completed Open Terminal process descriptor as a readable
+        text payload for Claude. Concatenates ``output`` lines (which may be
+        ``{stream: stdout|stderr, data: "..."}`` objects or plain strings) and
+        appends exit metadata."""
+        chunks_out: list[str] = []
+        chunks_err: list[str] = []
+        for entry in data.get("output") or []:
+            if isinstance(entry, dict):
+                stream = entry.get("stream") or entry.get("type") or "stdout"
+                text = entry.get("data") or entry.get("text") or ""
+                (chunks_err if stream == "stderr" else chunks_out).append(str(text))
+            else:
+                chunks_out.append(str(entry))
+        stdout = "".join(chunks_out).rstrip()
+        stderr = "".join(chunks_err).rstrip()
+
+        parts: list[str] = []
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(f"[stderr]\n{stderr}")
+
+        meta_bits: list[str] = []
+        status = data.get("status")
+        if status and status != "completed":
+            meta_bits.append(f"status={status}")
+        exit_code = data.get("exit_code")
+        if exit_code not in (None, 0):
+            meta_bits.append(f"exit_code={exit_code}")
+        if data.get("truncated"):
+            meta_bits.append("truncated=true")
+        if "timed_out_after_s" in data:
+            meta_bits.append(f"timed_out_after_s={data['timed_out_after_s']}")
+        if meta_bits:
+            parts.append("[" + " ".join(meta_bits) + "]")
+
+        if not parts:
+            return "(no output)"
+        return "\n".join(parts)
+
+    async def _dispatch_text_editor_tool(
+        self,
+        tool_input: dict,
+        __tools__: dict,
+    ) -> str:
+        """Bridge native text_editor (str_replace_based_edit_tool) calls to
+        Open Terminal's write_file / replace_file_content + run_command fallback
+        for view/insert operations.
+        """
+        try:
+            command = tool_input.get("command", "")
+            path = tool_input.get("path", "")
+            run_cmd = __tools__.get("run_command", {}).get("callable")
+
+            if command == "view":
+                # Prefer run_command with sed/cat -n; directory listings use ls.
+                if not run_cmd:
+                    return "Error: run_command callable required for `view`."
+                view_range = tool_input.get("view_range")
+                # Escape path minimally for shell
+                safe_path = path.replace("'", "'\\''")
+                if view_range and isinstance(view_range, list) and len(view_range) == 2:
+                    start, end = view_range
+                    if end == -1:
+                        shell = f"sed -n '{int(start)},$p' '{safe_path}' | nl -ba -s': ' -w1"
+                    else:
+                        shell = f"sed -n '{int(start)},{int(end)}p' '{safe_path}' | nl -ba -s': ' -v{int(start)} -w1"
+                else:
+                    # Detect directory vs file, fall back to ls for dirs
+                    shell = (
+                        f"if [ -d '{safe_path}' ]; then ls -la '{safe_path}'; "
+                        f"else cat -n '{safe_path}'; fi"
+                    )
+                result = await run_cmd(command=shell)
+                text = self._stringify_terminal_result(result)
+                max_chars = self.valves.TEXT_EDITOR_MAX_CHARACTERS
+                if len(text) > max_chars:
+                    text = text[:max_chars] + f"\n…[truncated to {max_chars} chars]"
+                return text
+
+            elif command == "str_replace":
+                replace_cb = __tools__.get("replace_file_content", {}).get("callable")
+                if not replace_cb:
+                    return "Error: replace_file_content callable is not available."
+                old_str = tool_input.get("old_str", "")
+                new_str = tool_input.get("new_str", "")
+                result = await replace_cb(path=path, old_str=old_str, new_str=new_str)
+                return self._stringify_terminal_result(result)
+
+            elif command == "create":
+                write_cb = __tools__.get("write_file", {}).get("callable")
+                if not write_cb:
+                    return "Error: write_file callable is not available."
+                file_text = tool_input.get("file_text", "")
+                result = await write_cb(path=path, content=file_text)
+                return self._stringify_terminal_result(result)
+
+            elif command == "insert":
+                # Implement via run_command: read → splice → write back.
+                if not run_cmd:
+                    return "Error: run_command callable required for `insert`."
+                insert_line = int(tool_input.get("insert_line", 0))
+                insert_text = tool_input.get("insert_text", "")
+                payload = json.dumps({
+                    "path": path,
+                    "line": insert_line,
+                    "text": insert_text,
+                }, ensure_ascii=False)
+                # Embed the JSON inside a python3 heredoc; parse with json.loads
+                # so newlines/quotes in payload are safe.
+                shell = (
+                    "python3 <<'PYEOF'\n"
+                    "import json\n"
+                    f"d=json.loads({json.dumps(payload)})\n"
+                    "p=d['path']; ln=d['line']; t=d['text']\n"
+                    "with open(p,'r',encoding='utf-8') as f: lines=f.readlines()\n"
+                    "ins=t if t.endswith('\\n') else t+'\\n'\n"
+                    "lines.insert(ln, ins)\n"
+                    "with open(p,'w',encoding='utf-8') as f: f.writelines(lines)\n"
+                    "print(f'Inserted {len(ins.splitlines())} line(s) at position {ln} in {p}')\n"
+                    "PYEOF"
+                )
+                result = await run_cmd(command=shell)
+                return self._stringify_terminal_result(result)
+
+            else:
+                return f"Error: unsupported text_editor command '{command}'."
+        except Exception as e:
+            logger.exception("text_editor dispatch failed")
+            return f"Error in text_editor.{tool_input.get('command', '?')}: {e}"
+
     def _format_server_tool_use_block(
         self,
         tool_name: str,
@@ -6156,10 +6700,24 @@ class Pipe:
             "input": tool_input if isinstance(tool_input, (dict, list)) else {},
         }
         payload_b64 = self._encode_block_payload(payload)
-        icon = {"web_search": "🔍", "web_fetch": "🌐"}.get(tool_name, "🔧")
+        icon = {
+            "web_search": "🔍",
+            "web_fetch": "🌐",
+            "tool_search_tool_regex": "🧰",
+            "tool_search_tool_bm25": "🧰",
+            "advisor": "🧑‍⚖️",
+        }.get(tool_name, "🔧")
         hint = ""
         if isinstance(tool_input, dict):
             hint = tool_input.get("query") or tool_input.get("url") or ""
+            if not hint:
+                # tool_search_tool_regex uses "patterns" (list),
+                # tool_search_tool_bm25 uses "queries" (list).
+                for list_key in ("patterns", "queries"):
+                    val = tool_input.get(list_key)
+                    if isinstance(val, list) and val:
+                        hint = ", ".join(str(v) for v in val[:3])
+                        break
         default_summary = f"{icon} {tool_name}"
         if hint:
             default_summary += f": {str(hint)[:120]}"
