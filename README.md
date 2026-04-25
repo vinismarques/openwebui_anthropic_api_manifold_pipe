@@ -1,19 +1,6 @@
 # 🚀 Anthropic API Manifold Pipe for Open WebUI
 
-> Near-complete Anthropic Messages API parity for OpenWebUI — model auto-discovery, native streaming, citations, web search/fetch, code execution, Files API, Agent Skills, prompt caching, context editing, compaction, and programmatic tool calling.
-
----
-
-## 📌 Current status
-
-- **Current pipe version:** `0.9.8`
-- **Recommended OpenWebUI:** `0.9.0+`
-- **Minimum practical OpenWebUI for good UX:** `0.8.11+`
-- **Model list and capabilities are fetched dynamically** from Anthropic's Models API (`max_input_tokens`, `max_tokens`, thinking/effort support, compaction support, etc.)
-- **Current Anthropic model docs focus on:** `Claude Opus 4.7`, `Claude Sonnet 4.6`, `Claude Haiku 4.5`
-- **Anthropic deprecation note:** `Claude Sonnet 4` and `Claude Opus 4` are deprecated and retire on **2026-06-15**
-
-This pipe targets the **Anthropic Messages API** directly through the official **Anthropic Python SDK** and keeps the OpenWebUI experience close to Anthropic-native behavior while still playing nicely with OpenWebUI models, tools, filters, files, notes, channels, and task generation.
+> Near-complete Anthropic Messages API parity for OpenWebUI — model auto-discovery, native streaming, citations, web search/fetch, code execution, Files API, Agent Skills, prompt caching, context editing, compaction, and programmatic tool calling. This pipe targets the **Anthropic Messages API** directly through the official **Anthropic Python SDK** and keeps the OpenWebUI experience close to Anthropic-native behavior while still playing nicely with OpenWebUI models, tools, filters, files, notes, channels, and task generation.
 
 ---
 
@@ -33,18 +20,6 @@ This pipe targets the **Anthropic Messages API** directly through the official *
 
 ---
 
-## 🧠 Anthropic / Claude notes reflected in this pipe
-
-- The Anthropic docs now treat **Opus 4.7** as the flagship generally available model for the hardest agentic and coding workloads.
-- **Opus 4.7** and **Sonnet 4.6** expose a **1M token** context window; **Haiku 4.5** uses **200k**.
-- Modern Claude models expose capabilities through the **Models API**, which this pipe reads directly.
-- `thinking.display: "omitted"` suppresses streamed `thinking_delta` events; only the thinking block shell and signature are emitted.
-- Anthropic's **Files API** remains **beta** and is especially useful together with code execution and skills.
-- Anthropic's **Skills API** relies on **code execution + files + skills beta headers**; this pipe handles that plumbing for you.
-- Anthropic's **effort** parameter is now the recommended control for adaptive-thinking models; `xhigh` is **Opus 4.7 only**.
-
----
-
 ## 📦 Installation
 
 ### Option 1: Install from OpenWebUI Community
@@ -53,9 +28,6 @@ This pipe targets the **Anthropic Messages API** directly through the official *
 |-----------|------|
 | **Main Pipe** | [anthropic_pipe](https://openwebui.com/f/podden/anthropic_pipe) |
 | **Thinking Toggle** | [anthropic_pipe_thinking_toggle](https://openwebui.com/f/podden/anthropic_pipe_thinking_toggle) |
-| **Web Search Toggle** | [anthropic_web_search_toggle](https://openwebui.com/f/podden/anthropic_web_search_toggle) |
-| **Code Execution Toggle** | [anthropic_pipe_code_execution_toggle](https://openwebui.com/f/podden/anthropic_pipe_code_execution_toggle) |
-| **Files API Toggle** | [anthropic_pipe_files_toggle](https://openwebui.com/f/podden/anthropic_pipe_files_toggle) |
 | **Companion Filter** | [anthropic_manifold_companion](https://openwebui.com/f/podden/anthropic_manifold_companion) |
 
 ### Option 2: Manual installation
@@ -63,7 +35,7 @@ This pipe targets the **Anthropic Messages API** directly through the official *
 1. Open **Admin Settings** → **Functions** → **+ New Function**
 2. Paste the source for `anthropic_pipe.py`
 3. Repeat for the toggle filters you want to use
-4. Optionally install the **Companion Filter**
+4. Optionally install the **Companion Filter** if you want to use Anthropics Version of code_execution and web_search instead of open-webuis
 5. Set the admin valves described below
 
 ### Recommended OpenWebUI model configuration
@@ -73,29 +45,7 @@ For each Claude model in **Admin Settings → Models**:
 1. Attach the toggle filters you want available for that model
 2. Set **Function Calling** to **`Native`**
 3. Optionally attach the **Companion Filter** if you want OpenWebUI's built-in `web_search` / `code_interpreter` buttons to route to Anthropic-native tools
-4. If you plan to use **Skills** or **Files API** workflows heavily, prefer models with strong tool and code-exec support (today that usually means **Opus 4.7** or **Sonnet 4.6**)
-
----
-
-## 🔌 OpenWebUI compatibility notes
-
-Recent OpenWebUI releases matter for this pipe:
-
-- **0.8.11**
-   - grouped consecutive reasoning/tool blocks into single collapsible summaries
-   - improved tool-call streaming persistence and reasoning spinner behavior
-   - added upstream `WEB_FETCH_MAX_CONTENT_LENGTH` support
-- **0.8.12**
-   - rich embeds from tool calls remain visible outside collapsed groups
-- **0.9.0**
-   - async plugin/backend migration for Tools, Functions, Pipes, Filters, and Actions
-   - built-in and MCP tools reach pipes more reliably
-   - richer Anthropic-compatible tool result content and citation rendering
-   - active filter badges can expose valve configuration shortcuts directly in chat
-- **0.9.2**
-   - persisted skill mentions inject into system prompts reliably on stored chats
-
-If you fork this pipe or copy code into your own plugin, note that OpenWebUI `0.9.0+` moved DB/model helpers to async. The pipe is already migrated, but custom additions must also follow the async model/helper rules. See the official migration guide: https://docs.openwebui.com/features/extensibility/plugin/migration/to-0.9.0
+4. If you plan to use **Skills** or **Files API**, you need to use anthropics code_execution and the companion filter
 
 ---
 
