@@ -4,9 +4,9 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.11
+version: 0.9.14
 license: MIT
-requirements: pydantic>=2.0.0, anthropic>=0.75.0
+requirements: pydantic>=2.0.0, anthropic>=0.103.0
 environment_variables:
     - ANTHROPIC_API_KEY (required)
 
@@ -33,10 +33,24 @@ Supports:
 - Tool Search (BM25/Regex)
 - Native PDF Upload (visual PDF analysis with charts/images)
 - Agent Skills (pptx, xlsx, docx, pdf and custom skills)
-- Fast Mode (research preview) for Opus 4.6 / 4.7
+- Fast Mode (research preview) for Opus 4.7 / 4.8
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.14
+- Added Claude Opus 4.8
+- Promt caching bugfixes when using native PDF Upload and Images
+
+v0.9.13
+- Token counting is now Claude-Code-style: `total_tokens` only counts NEW tokens (uncached input + cache_creation + output) instead of all tokens
+- Added `ENABLE_CACHE_DIAGNOSTICS` valve for debug purposes
+
+v0.9.12
+- Refactored the pipe into modular source files under `src/anthropic_pipe/`.
+- Extracted request payload creation into `request_payload.py` for cache/debug work.
+- Split streaming content-block handling into per-content modules and added a build step that compiles/minifies the OpenWebUI single-file artifact before deploy.
+- Fixed Anthropic API Skills container payload shape and added clearer Files API / code execution guidance.
+
 v0.9.11
 - Added async handling for run_command <-> bash tool
 - Added all anthropic server tools as TOOL_SEARCH_EXCLUDE_TOOLS
@@ -421,6 +435,7 @@ import os
 import base64
 import traceback
 import inspect
+import hashlib
 from datetime import datetime
 from collections.abc import Awaitable
 import asyncio
@@ -577,6 +592,16 @@ PATTERN_CODE_INTERPRETER_DETAILS = re.compile(
     flags=re.DOTALL,
 )
 
+# Pattern to strip debug-only cache trace blocks from assistant replay.
+# These blocks are written to OpenWebUI message content for post-mortem analysis,
+# but they were never part of Anthropic's assistant response and must not be sent
+# back on the next turn (otherwise the trace feature breaks the very cache it
+# diagnoses).
+PATTERN_CACHE_TRACE_DETAILS = re.compile(
+    r'\n*<details type="cache-trace"[^>]*>.*?</details>\n*',
+    flags=re.DOTALL,
+)
+
 # Pattern to extract compaction blocks from assistant messages for API reconstruction.
 PATTERN_COMPACTION_DETAILS = re.compile(
     r'<details type="compaction"[^>]*>\s*<summary>[^<]*</summary>\s*(.*?)\s*</details>',
@@ -681,12 +706,1885 @@ class PipeRequestContext:
                 await self.emit_replace(text)
                 return
         # First emit or old block not found — append and replace with full text
-        self.final_message.append(new_block)
-        await self.emit_replace(self.text())
+        text = self.pipe._append_block_to_text(self.text(), new_block)
+        await self.emit_replace(text)
 
     def text(self) -> str:
         return "".join(self.final_message)
 
+
+
+
+
+
+
+
+# BEGIN GENERATED SECTION: anthropic_pipe.request_payload
+async def create_request_payload(
+    pipe,
+    body: Dict,
+    __metadata__: dict[str, Any],
+    __user__: Dict[str, Any],
+    __tools__: Optional[Dict[str, Dict[str, Any]]],
+    __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
+    __files__: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[dict, dict, List[str], List[str]]:
+
+    status_cls = globals().get("StatusEmitter")
+    if status_cls:
+        status = status_cls(__event_emitter__)
+    else:
+        class _PayloadStatus:
+            def __init__(self, emit_event):
+                self._emit_event = emit_event
+
+            async def activity(self, description: str) -> None:
+                await self._emit_event(
+                    {"type": "status", "data": {"description": description, "done": False}}
+                )
+
+            async def complete(self, description: str) -> None:
+                await self._emit_event(
+                    {"type": "status", "data": {"description": description, "done": True}}
+                )
+
+            async def notification(self, content: str, *, type: str = "warning") -> None:
+                await self._emit_event(
+                    {"type": "notification", "data": {"type": type, "content": content}}
+                )
+
+        status = _PayloadStatus(__event_emitter__)
+
+    ## General payload creation
+    actual_model_name = body["model"].split("/")[-1]
+    model_info = pipe.get_model_info(actual_model_name)
+    max_tokens_limit = model_info["max_tokens"]
+    requested_max_tokens = body.get("max_tokens", max_tokens_limit)
+    max_tokens = min(requested_max_tokens, max_tokens_limit)
+    payload: dict[str, Any] = {
+        "model": actual_model_name,
+        "max_tokens": max_tokens,
+        "stream": body.get("stream", True),
+        "metadata": body.get("metadata", {}),
+    }
+    # Opus 4.7 / 4.8 and the 4.6+ adaptive-thinking family reject sampling params
+    # (temperature / top_p / top_k) — API returns 400. Strip them there.
+    # Heuristic: models that support adaptive thinking (Opus 4.6, Sonnet 4.6,
+    # Opus 4.7, Opus 4.8) do not accept these fields when adaptive is enabled.
+    # On Opus 4.7 / 4.8 they are rejected unconditionally. Safe to skip for the set.
+    _strip_sampling = bool(model_info.get("supports_adaptive_thinking"))
+    if not _strip_sampling and body.get("temperature") is not None:
+        payload["temperature"] = float(body.get("temperature", 0))
+    if not _strip_sampling and body.get("top_k") is not None:
+        payload["top_k"] = float(body.get("top_k", 0))
+    if not _strip_sampling and body.get("top_p") is not None:
+        payload["top_p"] = float(body.get("top_p", 0))
+
+    # Add data residency if set to US (1.1x token cost)
+    if pipe.valves.DATA_RESIDENCY == "us":
+        payload["inference_geo"] = "us"
+
+    # Add Fast Mode if enabled and model supports it (Opus 4.7 / 4.8)
+    if pipe.valves.ENABLE_FAST_MODE and model_info.get("supports_fast_mode", False):
+        payload["speed"] = "fast"
+        logger.debug("Fast Mode enabled for this request")
+        
+    # Handle "Effort" parameter (maps from OpenWebUI's reasoning_effort or user valves)
+    # Effort works differently based on model capabilities
+    effort_config = None
+    effective_effort = None
+
+    if model_info["supports_effort"]:
+        # Clamp an effort value to what the current model supports.
+        #   xhigh -> high if the model doesn't advertise xhigh (Opus 4.7 only)
+        #   max   -> high if the model doesn't advertise max   (Opus 4.7/4.6, Sonnet 4.6)
+        def _clamp_effort(value: str) -> str:
+            if value == "xhigh" and not model_info.get("supports_effort_xhigh"):
+                return "high"
+            if value == "max" and not model_info.get("supports_effort_max"):
+                return "high"
+            return value
+
+        body_effort = body.get("reasoning_effort")
+        if body_effort in ("low", "medium", "high", "xhigh", "max"):
+            effective_effort = _clamp_effort(body_effort)
+        else:
+            effective_effort = _clamp_effort(__user__["valves"].EFFORT)
+
+        effort_config = {"effort": effective_effort}
+        logger.debug(f"Effort level set to: {effective_effort}")
+
+    # Handle Thinking
+    enable_thinking = __user__["valves"].ENABLE_THINKING or __metadata__.get(
+        "anthropic_thinking", False
+    )
+    if enable_thinking and model_info["supports_thinking"]:
+        # Opus 4.6 (supports adaptive thinking) uses effort as the control
+        if model_info["supports_adaptive_thinking"]:
+            thinking_config = {"type": "adaptive"}
+        else:
+            user_budget = __user__["valves"].THINKING_BUDGET_TOKENS
+            max_tokens = min(
+                body.get("max_tokens", model_info["max_tokens"]),
+                model_info["max_tokens"],
+            )
+            context_limit = model_info.get("context_length", 200000)
+
+            # For Claude 4 models with interleaved thinking+tools, allow up to context window
+            if model_info.get("supports_thinking") and model_info.get(
+                "supports_programmatic_calling"
+            ):
+                thinking_budget = min(user_budget, context_limit)
+            else:
+                # budget_tokens must be < max_tokens
+                thinking_budget = (
+                    min(user_budget, max_tokens - 1) if max_tokens > 1 else 1
+                )
+            thinking_config = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
+            logger.debug(
+                f"Using manual thinking with budget_tokens: {thinking_budget}, effort: {effective_effort}"
+            )
+
+        # Add display mode if not default
+        thinking_display = __user__["valves"].THINKING_DISPLAY
+        if thinking_display == "omitted":
+            thinking_config["display"] = "omitted"
+
+        payload["thinking"] = thinking_config
+
+    # Check if user has memory system enabled
+    user_has_memory_system_enabled = False
+    try:
+        user_has_memory_system_enabled = (
+            __user__.get("settings", {}).get("ui", {}).get("memory", False)
+        )
+    except (AttributeError, TypeError):
+        pass
+    logger.debug(f"Memory system enabled: {user_has_memory_system_enabled}")
+
+    raw_messages = body.get("messages", []) or []
+
+    system_messages, processed_messages, previous_marker_metadata = (
+        pipe._convert_messages_to_claude_format(
+            raw_messages, user_has_memory_system_enabled
+        )
+    )
+    new_marker_metadata: List[str] = []
+
+    # Extract container_id from previous metadata markers for multi-turn container reuse
+    previous_container_id = None
+    for metadata_entry in previous_marker_metadata:
+        # Format: "N:container_id:ENCODED_VALUE"
+        parts = metadata_entry.split(":", 2)
+        if len(parts) >= 3 and parts[1] == "container_id":
+            previous_container_id = unquote(parts[2])
+            logger.debug(f"📦 Restored container_id from marker: {previous_container_id}")
+
+    # Track if Files API uploaded any files (for auto-enabling code execution)
+    has_files_api_uploads = False
+    user_valves_for_features = __user__["valves"]
+    requested_skills = list(getattr(user_valves_for_features, "SKILLS", []) or [])
+    use_files_api = bool(getattr(user_valves_for_features, "USE_FILES_API", False)) or bool(
+        __metadata__.get("enforce_files_api")
+    )
+    has_full_files_attached = any(
+        file.get("type") == "file" and file.get("context", "full") == "full"
+        for file in (__files__ or [])
+    )
+
+    if requested_skills and has_full_files_attached and not use_files_api:
+        await status.activity("Skills require Files API for attached files")
+        await status.notification(
+            "Anthropic API Skills cannot access attached files through OpenWebUI RAG or native PDF upload. "
+            "Enable USE_FILES_API, use the Files API Toggle, or attach the Companion Filter so files are routed to Anthropic Files API."
+        )
+
+    if __files__ and use_files_api and not FILES_AVAILABLE:
+        await status.complete("Files API unavailable")
+        await status.notification(
+            "Anthropic Files API mode was requested, but OpenWebUI Files/Storage support is unavailable in this runtime. "
+            "Enable OpenWebUI Files support or disable Files API mode for this request."
+        )
+
+    # Native-PDF anchors persisted on earlier turns. OpenWebUI drops full-context
+    # files from __files__ on follow-up turns (it only sends a file in __files__
+    # the turn it was attached). Without restoring the document block from these
+    # markers, the native PDF vanishes from the cache prefix on every later turn,
+    # which both hides the PDF from the model and forces a full cache rebuild.
+    has_prior_pdf_markers = any(
+        len(e.split(":", 2)) >= 3 and e.split(":", 2)[1] == "pdf"
+        for e in (previous_marker_metadata or [])
+    )
+
+    if __files__ and use_files_api and FILES_AVAILABLE:
+        # Files API overrules native PDF upload — all files go as container_upload
+        blocks_by_user_msg, uploaded_filenames = await pipe._process_files_api_data(
+            __files__, __event_emitter__, processed_messages
+        )
+        if blocks_by_user_msg:
+            has_files_api_uploads = True
+            # Insert container_upload blocks at the correct user messages
+            user_msg_num = 0
+            for i, msg in enumerate(processed_messages):
+                if msg["role"] == "user" and user_msg_num in blocks_by_user_msg:
+                    # Ensure content is a list
+                    if isinstance(msg["content"], str):
+                        msg["content"] = [{"type": "text", "text": msg["content"]}]
+                    msg["content"] = blocks_by_user_msg[user_msg_num] + msg["content"]
+                if msg["role"] == "user":
+                    user_msg_num += 1
+
+            # Remove RAG sources for uploaded files
+            if uploaded_filenames:
+                logger.debug(f"📋 RAG: Removing {len(uploaded_filenames)} file source(s) from RAG")
+                pipe._remove_specific_sources_from_rag_message(processed_messages, uploaded_filenames)
+
+    elif __user__["valves"].USE_PDF_NATIVE_UPLOAD and (__files__ or has_prior_pdf_markers):
+        # Native PDF upload (base64 document blocks) — only PDFs.
+        # Each PDF is anchored to the user-message it was first attached
+        # to (tracked via metadata markers); never to msg[0]. This keeps
+        # the byte-prefix of the conversation cache-stable across turns.
+        # This branch also runs on follow-up turns with an empty __files__
+        # as long as a prior PDF marker exists, so the document block is
+        # restored at its original anchor instead of disappearing.
+        native_pdf_filenames = list(dict.fromkeys(
+            file.get("name")
+            for file in (__files__ or [])
+            if (
+                file.get("type") == "file"
+                and file.get("context") == "full"
+                and file.get("name", "").lower().endswith(".pdf")
+            )
+            and file.get("name")
+        ))
+        pdf_blocks_by_user_msg, new_marker_metadata = (
+            await pipe._get_full_context_pdfs(
+                __files__, previous_marker_metadata, processed_messages, raw_messages
+            )
+        )
+        if pdf_blocks_by_user_msg:
+            user_msg_num = 0
+            for msg in processed_messages:
+                if msg["role"] == "user":
+                    if user_msg_num in pdf_blocks_by_user_msg:
+                        if isinstance(msg["content"], str):
+                            msg["content"] = [
+                                {"type": "text", "text": msg["content"]}
+                            ]
+                        msg["content"] = (
+                            pdf_blocks_by_user_msg[user_msg_num]
+                            + msg["content"]
+                        )
+                    user_msg_num += 1
+
+        # Remove RAG sources for native-PDF files on every turn, even
+        # when the PDF block itself was restored from prior metadata.
+        # Otherwise OpenWebUI can re-inject the same PDF as <context>
+        # on the latest user message after the PDF is already attached
+        # natively.
+        if native_pdf_filenames:
+            logger.debug(
+                f"📋 RAG: Removing {len(native_pdf_filenames)} native PDF source(s) from RAG"
+            )
+            pipe._remove_specific_sources_from_rag_message(
+                processed_messages, native_pdf_filenames
+            )
+
+    ## Tools Handling
+    # Correct Order for Caching: Tools, System, Messages
+    tools_list, api_tool_names = pipe._convert_tools_to_claude_format(
+        __tools__, body, actual_model_name, __user__, __metadata__
+    )
+
+    activate_code_execution = __metadata__.get(
+        "activate_code_execution_tool", False
+    )
+
+    # Auto-enable code execution when Files API uploaded files (container_upload needs it)
+    if has_files_api_uploads:
+        activate_code_execution = True
+
+    # Auto-enable code execution when programmatic tool calling is active
+    # (programmatic calling requires code execution to orchestrate tool calls)
+    if (
+        pipe.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING
+        and model_info.get("supports_programmatic_calling", False)
+        and tools_list  # Only when there are tools to call programmatically
+    ):
+        activate_code_execution = True
+
+    # Check if any dynamic filtering web tools (20260209) are in tools_list.
+    # These tools cause the API to AUTO-INJECT code_execution internally.
+    # We must NOT add code_execution_20250825 manually when these are present —
+    # doing so triggers: "Auto-injecting tools would conflict with existing tool names"
+    # However, code_execution_20260120 (programmatic) CAN coexist because we provide
+    # it explicitly and the API won't auto-inject a second code_execution.
+    has_dynamic_filtering_tools = any(
+        t.get("type", "").endswith("_20260209") for t in tools_list
+    )
+    has_code_execution = any(
+        t.get("name") == "code_execution" for t in tools_list
+    )
+
+    # Determine which code_execution version to add
+    use_programmatic_code_exec = (
+        pipe.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING
+        and model_info.get("supports_programmatic_calling", False)
+    )
+
+    if activate_code_execution and not has_code_execution:
+        if use_programmatic_code_exec:
+            # Always add code_execution_20260120 for programmatic calling,
+            # even alongside dynamic filtering tools (it supersedes the auto-injected one)
+            code_exec_type = "code_execution_20260120"
+            tools_list.insert(0, {"type": code_exec_type, "name": "code_execution"})
+            has_code_execution = True
+        elif not has_dynamic_filtering_tools:
+            # Only add code_execution_20250825 if no dynamic filtering
+            # (dynamic filtering auto-injects its own code_execution)
+            code_exec_type = "code_execution_20250825"
+            tools_list.insert(0, {"type": code_exec_type, "name": "code_execution"})
+            has_code_execution = True
+        # else: dynamic filtering tools present, no programmatic → let API auto-inject
+
+    if requested_skills and not has_code_execution:
+        await status.activity("Skills require Anthropic code_execution")
+        await status.notification(
+            "Anthropic API Skills require Anthropic code_execution. Enable the Code Execution Toggle, "
+            "or attach the Companion Filter so OpenWebUI code_interpreter requests set activate_code_execution_tool."
+        )
+
+    # Create Headers - check UserValves API key first
+    user_valves = __user__.get("valves") if __user__ else None
+    user_api_key = getattr(user_valves, "ANTHROPIC_API_KEY", "") if user_valves else ""
+    api_key = user_api_key.strip() if user_api_key and user_api_key.strip() else pipe.valves.ANTHROPIC_API_KEY
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": pipe.API_VERSION,
+        "content-type": "application/json",
+    }
+
+    beta_headers: list[str] = []
+
+    # Enable prompt caching if not disabled
+    if pipe.valves.CACHE_CONTROL != "cache disabled":
+        beta_headers.append("prompt-caching-2024-07-31")
+
+    # Add code-execution beta header ONLY when we explicitly added code_execution to tools.
+    # Do NOT add when using dynamic filtering v20260209 web tools — those auto-inject
+    # code_execution internally and the beta header would cause a second injection → duplicate error.
+    if has_code_execution:
+        # code_execution_20260120 doesn't need the old beta header
+        code_exec_is_new = any(
+            t.get("type") == "code_execution_20260120" for t in tools_list
+        )
+        if not code_exec_is_new:
+            beta_headers.append("code-execution-2025-08-25")
+        if activate_code_execution:
+            beta_headers.append("files-api-2025-04-14")
+    if (
+        pipe.valves.ENABLE_INTERLEAVED_THINKING
+        and model_info["supports_thinking"]
+        and not model_info["supports_adaptive_thinking"]
+    ):
+        beta_headers.append("interleaved-thinking-2025-05-14")
+
+    # Add web_fetch beta header when using the older version (20250910)
+    # The newer 20260209 version doesn't need a beta header
+    uses_old_web_fetch = any(
+        t.get("type") == "web_fetch_20250910" for t in tools_list
+    )
+    if pipe.valves.WEB_FETCH and uses_old_web_fetch:
+        beta_headers.append("web-fetch-2025-09-10")
+
+    # Add Files API beta header when files were uploaded but code_execution
+    # wasn't otherwise activated (standalone file upload scenario)
+    if has_files_api_uploads and "files-api-2025-04-14" not in beta_headers:
+        beta_headers.append("files-api-2025-04-14")
+
+    # Skills Integration. Anthropic expects an object container:
+    # {"skills": [...]}, optionally with {"id": previous_container_id} for reuse.
+    if requested_skills and has_code_execution:
+        if "skills-2025-10-02" not in beta_headers:
+            beta_headers.append("skills-2025-10-02")
+        if "files-api-2025-04-14" not in beta_headers:
+            beta_headers.append("files-api-2025-04-14")
+
+        # Validate skills (cached to avoid API calls on every turn)
+        validated_skills = await pipe._validate_and_get_skills(
+            requested_skills,
+            api_key,
+            __event_emitter__,
+        )
+        if validated_skills:
+            container: dict[str, Any] = {"skills": validated_skills}
+            if previous_container_id:
+                container["id"] = previous_container_id
+            payload["container"] = container
+            logger.debug(f"🔧 Added {len(validated_skills)} skills")
+        else:
+            await status.notification(
+                f"No valid Anthropic API Skills found from requested list: {', '.join(requested_skills)}. Skills ignored."
+            )
+    elif previous_container_id:
+        # Reuse container from previous turn for code execution state continuity
+        payload["container"] = previous_container_id
+        logger.info(f"📦 Reusing container from previous turn: {previous_container_id}")
+
+    # Add advanced tool use beta (for programmatic calling and tool search)
+    if __user__["valves"].ENABLE_TOOL_SEARCH or pipe.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+        beta_headers.append("advanced-tool-use-2025-11-20")
+
+    # Add advisor tool beta
+    if __user__["valves"].ENABLE_ADVISOR_TOOL:
+        beta_headers.append("advisor-tool-2026-03-01")
+
+    # Add context editing strategies if enabled
+    context_editing_strategy = __user__["valves"].CONTEXT_EDITING_STRATEGY
+    if context_editing_strategy != "none":
+        if "context-management-2025-06-27" not in beta_headers:
+            beta_headers.append("context-management-2025-06-27")
+
+        # Build context_management array for payload
+        # IMPORTANT: clear_thinking must be FIRST if present (API requirement)
+        context_management = []
+
+        # Add clear_thinking FIRST if needed
+        if (
+            context_editing_strategy in ["clear_thinking", "clear_both"]
+            and enable_thinking
+            and model_info["supports_thinking"]
+        ):
+            _keep_val = __user__["valves"].CONTEXT_EDITING_THINKING_KEEP
+            clear_thinking = {
+                "type": "clear_thinking_20251015",
+                # keep=0 → "all" (preserve all thinking → stable prompt cache).
+                # keep>0 → sliding window (breaks cache every turn past threshold).
+                "keep": "all" if _keep_val <= 0 else {
+                    "type": "thinking_turns",
+                    "value": _keep_val,
+                },
+            }
+            context_management.append(clear_thinking)
+
+        # Add clear_tool_uses SECOND
+        if (
+            context_editing_strategy in ["clear_tool_results", "clear_both"]
+            and len(tools_list) > 2
+        ):
+            clear_tool_uses = {
+                "type": "clear_tool_uses_20250919",
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": __user__["valves"].CONTEXT_EDITING_TOOL_TRIGGER,
+                },
+                "keep": {
+                    "type": "tool_uses",
+                    "value": __user__["valves"].CONTEXT_EDITING_TOOL_KEEP,
+                },
+            }
+            if __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST > 0:
+                clear_tool_uses["clear_at_least"] = {
+                    "type": "input_tokens",
+                    "value": __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST,
+                }
+            if __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT:
+                clear_tool_uses["clear_tool_inputs"] = True
+            context_management.append(clear_tool_uses)
+
+        if context_management:
+            payload["context_management"] = {"edits": context_management}
+
+    # Add compaction if enabled and model supports it. New beta support may need
+    # MODEL_CAPABILITY_OVERRIDES because API capability metadata can lag.
+    if __user__["valves"].ENABLE_COMPACTION and model_info.get("supports_compaction", False):
+        if "context-management-2025-06-27" not in beta_headers:
+            beta_headers.append("context-management-2025-06-27")
+        beta_headers.append("compact-2026-01-12")
+
+        compact_edit: dict[str, Any] = {
+            "type": "compact_20260112",
+            "trigger": {
+                "type": "input_tokens",
+                "value": __user__["valves"].COMPACTION_TRIGGER_TOKENS,
+            },
+        }
+        if __user__["valves"].COMPACTION_INSTRUCTIONS.strip():
+            compact_edit["instructions"] = __user__["valves"].COMPACTION_INSTRUCTIONS.strip()
+
+        if "context_management" not in payload:
+            payload["context_management"] = {"edits": []}
+        payload["context_management"]["edits"].append(compact_edit)
+
+    # Add effort beta header and output_config if effort is configured
+    if model_info["supports_effort"] and effort_config:
+        beta_headers.append("effort-2025-11-24")
+        payload["output_config"] = effort_config
+
+    # Add Fast Mode beta header if enabled and model supports it
+    if pipe.valves.ENABLE_FAST_MODE and model_info.get("supports_fast_mode", False):
+        beta_headers.append("fast-mode-2026-02-01")
+
+    # Cache diagnostics beta — only meaningful with prompt caching active. Always
+    # send `diagnostics.previous_message_id` (null on first turn) so the API can
+    # report `cache_miss_reason` whenever the cache prefix diverged from last turn.
+    if (
+        getattr(pipe.valves, "ENABLE_CACHE_DIAGNOSTICS", False)
+        and pipe.valves.CACHE_CONTROL != "cache disabled"
+    ):
+        beta_headers.append("cache-diagnosis-2026-04-07")
+        chat_id_for_diag = __metadata__.get("chat_id") if __metadata__ else None
+        # Prefer the response id persisted as a `cachediag` marker on the prior
+        # assistant message (survives pipe restarts / multiple workers). Fall
+        # back to the in-memory state dict only if no marker is present.
+        previous_message_id = None
+        for _entry in previous_marker_metadata:
+            _parts = _entry.split(":", 2)
+            if len(_parts) >= 3 and _parts[1] == "cachediag":
+                previous_message_id = unquote(_parts[2])
+        if previous_message_id is None and chat_id_for_diag:
+            previous_message_id = pipe._cache_diagnostics_state.get(chat_id_for_diag)
+        # `diagnostics` is not a native SDK parameter — pass it via extra_body
+        # so the SDK forwards it as-is in the JSON request body.
+        payload.setdefault("extra_body", {})["diagnostics"] = {
+            "previous_message_id": previous_message_id
+        }
+        logger.debug(
+            f"[CACHE-DIAG] previous_message_id={previous_message_id} chat_id={chat_id_for_diag}"
+        )
+
+    if beta_headers and len(beta_headers) > 0:
+        headers["anthropic-beta"] = ",".join(beta_headers)
+        # Add betas list to payload for beta.messages.stream
+        payload["betas"] = beta_headers
+
+        ## Tool Choice Handling
+        if __metadata__.get("web_search_enforced"):
+            # Check if web_search is actually in the tools list
+            has_web_search = any(t.get("name") == "web_search" for t in tools_list)
+            if has_web_search:
+                if "thinking" not in payload:
+                    # No thinking active - enforce web_search
+                    payload["tool_choice"] = {"type": "tool", "name": "web_search"}
+                    logger.debug("Enforcing web_search via tool_choice")
+                else:
+                    # Thinking is active - cannot enforce web_search, but it's still available
+                    payload["tool_choice"] = {"type": "auto"}
+                    logger.debug(
+                        "Thinking active - web_search added but not enforced (tool_choice=auto)"
+                    )
+            else:
+                # No enforcement - use auto tool choice
+                payload["tool_choice"] = {"type": "auto"}
+
+    # API tool_choice passthrough (outside beta_headers block)
+    # If no tool_choice was set by web_search enforcement, pass through from body
+    if "tool_choice" not in payload and body.get("tool_choice"):
+        api_tc = body["tool_choice"]
+        if isinstance(api_tc, dict) and "function" in api_tc:
+            # OpenAI format: {"type": "function", "function": {"name": "X"}}
+            payload["tool_choice"] = {
+                "type": "tool",
+                "name": api_tc["function"]["name"],
+            }
+        elif isinstance(api_tc, str):
+            # OpenAI string format: "auto", "none", "required"
+            mapping = {"auto": "auto", "none": "none", "required": "any"}
+            payload["tool_choice"] = {"type": mapping.get(api_tc, api_tc)}
+        else:
+            # Already in Anthropic format or other dict format
+            payload["tool_choice"] = api_tc
+        logger.debug(f"API tool_choice passthrough: {payload['tool_choice']}")
+
+    payload["tools"] = tools_list
+
+    # Processing Messages and Caching
+    if system_messages and len(system_messages) > 0:
+        payload["system"] = system_messages
+
+    payload["messages"] = processed_messages
+
+    return payload, headers, new_marker_metadata, api_tool_names
+# END GENERATED SECTION: anthropic_pipe.request_payload
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# BEGIN GENERATED SECTION: anthropic_pipe.stream.internal_tool_results
+def _serialize_content_payload(content: Any) -> Any:
+    if content is not None:
+        if hasattr(content, "model_dump"):
+            try:
+                return content.model_dump(exclude_none=True, mode="json")
+            except Exception:
+                try:
+                    return content.model_dump(exclude_none=True)
+                except Exception:
+                    return None
+        if isinstance(content, dict):
+            return content
+    return None
+
+
+async def handle_advisor_result_block_start(
+    content_block: Any,
+    *,
+    pipe: Any,
+    server_tool_use_carriers: dict[str, dict[str, Any]],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+    emit_delta: Callable[[str], Awaitable[None]],
+) -> None:
+    logger.debug(" Processing advisor result event: %s", content_block)
+    tool_use_id = getattr(content_block, "tool_use_id", "") or ""
+    content = getattr(content_block, "content", None)
+    inner_type = (
+        getattr(content, "type", "")
+        if content is not None and hasattr(content, "type")
+        else (content.get("type", "") if isinstance(content, dict) else "")
+    )
+    serialized_content = _serialize_content_payload(content) or {}
+
+    if inner_type == "advisor_tool_result_error":
+        error_code = (
+            getattr(content, "error_code", "unknown")
+            if hasattr(content, "error_code")
+            else (content.get("error_code", "unknown") if isinstance(content, dict) else "unknown")
+        )
+        status_desc = f"🧑‍⚖️ Advisor error: {error_code}"
+        display_body = f"**{status_desc}** `{html.escape(error_code)}`"
+        logger.warning("advisor error: %s", error_code)
+    elif inner_type == "advisor_redacted_result":
+        status_desc = "🧑‍⚖️ Advisor: (redacted)"
+        display_body = (
+            "**🧑‍⚖️ Advisor consulted** _(encrypted output; "
+            "content is decrypted server-side on the next turn)_"
+        )
+    else:
+        advice_text = ""
+        if hasattr(content, "text"):
+            advice_text = getattr(content, "text", "") or ""
+        elif isinstance(content, dict):
+            advice_text = content.get("text", "") or ""
+        preview = advice_text.strip().splitlines()[0] if advice_text.strip() else ""
+        status_desc = f"🧑‍⚖️ Advisor: {preview[:80]}" if preview else "🧑‍⚖️ Advisor consulted"
+        display_body = advice_text.strip() if advice_text.strip() else "**🧑‍⚖️ Advisor consulted** _(empty response)_"
+
+    if tool_use_id:
+        carrier_info = server_tool_use_carriers.pop(tool_use_id, None)
+        if carrier_info:
+            merged = pipe._format_server_tool_use_block(
+                tool_name=carrier_info["tool_name"],
+                tool_use_id=tool_use_id,
+                tool_input=carrier_info["tool_input"],
+                result_payload=serialized_content,
+                result_block_type="advisor_tool_result",
+                result_summary=status_desc,
+                result_display_body=display_body,
+            )
+            await update_content_block(carrier_info["block"], merged)
+        else:
+            standalone = pipe._format_server_tool_result_block(
+                block_type="advisor_tool_result",
+                tool_use_id=tool_use_id,
+                content_payload=serialized_content,
+                display_body=display_body,
+                summary_text=status_desc,
+            )
+            await emit_delta(standalone)
+
+
+async def handle_tool_search_result_block_start(
+    content_block: Any,
+    *,
+    pipe: Any,
+    server_tool_use_carriers: dict[str, dict[str, Any]],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+    emit_delta: Callable[[str], Awaitable[None]],
+) -> None:
+    logger.debug(" Processing tool search result event: %s", content_block)
+    tool_use_id = getattr(content_block, "tool_use_id", "") or ""
+    content_obj = getattr(content_block, "content", None)
+    tool_references = []
+    if content_obj:
+        if hasattr(content_obj, "tool_references"):
+            tool_references = getattr(content_obj, "tool_references", []) or []
+        elif isinstance(content_obj, dict):
+            tool_references = content_obj.get("tool_references", []) or []
+    tool_names = []
+    for ref in tool_references:
+        if hasattr(ref, "tool_name"):
+            tool_names.append(getattr(ref, "tool_name", "unknown"))
+        elif isinstance(ref, dict):
+            tool_names.append(ref.get("tool_name", "unknown"))
+
+    if tool_names:
+        status_desc = (
+            f"🧰 Found {len(tool_names)} tool(s): "
+            f"{', '.join(tool_names[:5])}"
+            + (f" +{len(tool_names)-5} more" if len(tool_names) > 5 else "")
+        )
+    else:
+        status_desc = "🧰 Tool search: no matching tools"
+    display_body = status_desc
+
+    serialized_content = _serialize_content_payload(content_obj)
+    if serialized_content is None:
+        serialized_content = {
+            "tool_references": [
+                {"type": "tool_reference", "tool_name": name}
+                for name in tool_names
+            ],
+        }
+
+    if tool_use_id:
+        carrier_info = server_tool_use_carriers.pop(tool_use_id, None)
+        if carrier_info:
+            merged = pipe._format_server_tool_use_block(
+                tool_name=carrier_info["tool_name"],
+                tool_use_id=tool_use_id,
+                tool_input=carrier_info["tool_input"],
+                result_payload=serialized_content,
+                result_block_type="tool_search_tool_result",
+                result_summary=status_desc,
+                result_display_body=display_body,
+            )
+            await update_content_block(carrier_info["block"], merged)
+        else:
+            standalone = pipe._format_server_tool_result_block(
+                block_type="tool_search_tool_result",
+                tool_use_id=tool_use_id,
+                content_payload=serialized_content,
+                display_body=display_body,
+                summary_text=status_desc,
+            )
+            await emit_delta(standalone)
+
+
+async def handle_context_cleared_block_start(
+    content_block: Any,
+    *,
+    emit_status: Callable[[str], Awaitable[None]],
+) -> None:
+    cleared_info = getattr(content_block, "cleared", {})
+    cleared_type = (
+        getattr(cleared_info, "type", "unknown")
+        if hasattr(cleared_info, "type")
+        else cleared_info.get("type", "unknown")
+    )
+    cleared_tokens = (
+        getattr(cleared_info, "tokens_cleared", 0)
+        if hasattr(cleared_info, "tokens_cleared")
+        else cleared_info.get("tokens_cleared", 0)
+    )
+
+    if cleared_type == "tool_uses":
+        status_desc = f"🧹 Cleared tool results: ~{cleared_tokens:,} tokens removed"
+    elif cleared_type == "thinking":
+        status_desc = f"🧹 Cleared thinking blocks: ~{cleared_tokens:,} tokens removed"
+    else:
+        status_desc = f"🧹 Context cleared: ~{cleared_tokens:,} tokens removed"
+
+    await emit_status(status_desc)
+    logger.debug("Context cleared: type=%s, tokens=%s", cleared_type, cleared_tokens)
+# END GENERATED SECTION: anthropic_pipe.stream.internal_tool_results
+
+# BEGIN GENERATED SECTION: anthropic_pipe.stream.web_tool_results
+async def handle_web_tool_result_block_start(
+    content_type: str,
+    content_block: Any,
+    *,
+    pipe: Any,
+    server_tool_use_carriers: dict[str, dict[str, Any]],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+) -> None:
+    if content_type == "web_search_tool_result":
+        logger.debug(" Processing web search result event: %s", content_block)
+        content_items = getattr(content_block, "content", None)
+        tool_use_id = getattr(content_block, "tool_use_id", "") or ""
+        error_code = None
+        if content_items and not isinstance(content_items, list):
+            content_inner_type = getattr(content_items, "type", "")
+            if content_inner_type == "web_search_tool_result_error":
+                error_code = getattr(content_items, "error_code", "unknown")
+        if error_code:
+            error_msg = f"⚠️ Web search error: {error_code}"
+            logger.warning("web_search error: %s", error_code)
+            err_payload = {"type": "web_search_tool_result_error", "error_code": error_code}
+            carrier_info = server_tool_use_carriers.pop(tool_use_id, None) if tool_use_id else None
+            if carrier_info:
+                merged = pipe._format_server_tool_use_block(
+                    tool_name=carrier_info["tool_name"],
+                    tool_use_id=tool_use_id,
+                    tool_input=carrier_info["tool_input"],
+                    result_payload=err_payload,
+                    result_block_type="web_search_tool_result",
+                    result_summary=error_msg,
+                    result_display_body=f"**{error_msg}** `{error_code}`",
+                )
+                await update_content_block(carrier_info["block"], merged)
+        elif content_items and isinstance(content_items, list) and len(content_items) > 0:
+            first_result = content_items[0] if content_items else None
+            result_title = getattr(first_result, "title", "") if first_result else ""
+            result_count = len(content_items)
+            if result_title and result_count > 0:
+                status_desc = f"Found {result_count} results - {result_title}"
+                if result_count > 1:
+                    status_desc += f" +{result_count-1} more"
+            else:
+                status_desc = "Web Search Complete"
+
+            if tool_use_id:
+                serialized_items = []
+                display_lines = []
+                for item in content_items:
+                    if hasattr(item, "model_dump"):
+                        item_d = item.model_dump(exclude_none=True)
+                    elif isinstance(item, dict):
+                        item_d = item
+                    else:
+                        continue
+                    serialized_items.append(item_d)
+                    title = item_d.get("title") or ""
+                    url = item_d.get("url") or ""
+                    if url:
+                        display_lines.append(f"- [{html.escape(title or url)}]({url})")
+                display_body = "\n".join(display_lines[:10])
+                if status_desc:
+                    display_body = f"**{status_desc}**\n\n{display_body}" if display_body else f"**{status_desc}**"
+                carrier_info = server_tool_use_carriers.pop(tool_use_id, None)
+                if carrier_info:
+                    merged = pipe._format_server_tool_use_block(
+                        tool_name=carrier_info["tool_name"],
+                        tool_use_id=tool_use_id,
+                        tool_input=carrier_info["tool_input"],
+                        result_payload=serialized_items,
+                        result_block_type="web_search_tool_result",
+                        result_summary=status_desc,
+                        result_display_body=display_body,
+                    )
+                    await update_content_block(carrier_info["block"], merged)
+        return
+
+    if content_type == "web_fetch_tool_result":
+        logger.debug("Processing web_fetch_tool_result")
+        result_content = getattr(content_block, "content", None)
+        tool_use_id = getattr(content_block, "tool_use_id", "") or ""
+        error_code = None
+        if result_content:
+            content_type_inner = getattr(result_content, "type", "")
+            if content_type_inner == "web_fetch_tool_error":
+                error_code = getattr(result_content, "error_code", "unknown")
+        if error_code:
+            if tool_use_id:
+                err_payload = {"type": "web_fetch_tool_error", "error_code": error_code}
+                carrier_info = server_tool_use_carriers.pop(tool_use_id, None)
+                if carrier_info:
+                    merged = pipe._format_server_tool_use_block(
+                        tool_name=carrier_info["tool_name"],
+                        tool_use_id=tool_use_id,
+                        tool_input=carrier_info["tool_input"],
+                        result_payload=err_payload,
+                        result_block_type="web_fetch_tool_result",
+                        result_summary=f"🌐 Fetch failed: {error_code}",
+                        result_display_body=f"**🌐 Fetch failed:** `{error_code}`",
+                    )
+                    await update_content_block(carrier_info["block"], merged)
+        elif tool_use_id and result_content is not None:
+            if hasattr(result_content, "model_dump"):
+                serialized = result_content.model_dump(exclude_none=True)
+            elif isinstance(result_content, dict):
+                serialized = result_content
+            else:
+                serialized = None
+            if serialized is not None:
+                fetch_url = serialized.get("url") or "" if isinstance(serialized, dict) else ""
+                display_body = f"**🌐 URL fetched:** {fetch_url}" if fetch_url else "**🌐 URL fetched**"
+                carrier_info = server_tool_use_carriers.pop(tool_use_id, None)
+                if carrier_info:
+                    merged = pipe._format_server_tool_use_block(
+                        tool_name=carrier_info["tool_name"],
+                        tool_use_id=tool_use_id,
+                        tool_input=carrier_info["tool_input"],
+                        result_payload=serialized,
+                        result_block_type="web_fetch_tool_result",
+                        result_summary=f"🌐 URL fetched: {fetch_url}" if fetch_url else "🌐 URL fetched",
+                        result_display_body=display_body,
+                    )
+                    await update_content_block(carrier_info["block"], merged)
+# END GENERATED SECTION: anthropic_pipe.stream.web_tool_results
+
+# BEGIN GENERATED SECTION: anthropic_pipe.stream.code_execution_results
+async def handle_code_execution_result_block_start(
+    content_type: str,
+    content_block: Any,
+    *,
+    pipe: Any,
+    emit_delta: Callable[[str], Awaitable[None]],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+    api_key: str,
+    user_id: str,
+    code_exec_is_web_filtering: bool,
+    code_exec_had_web_tools: bool,
+    code_exec_tool_calls_info: list[Any],
+    code_exec_current_code: str,
+    code_exec_start_time: float,
+    code_exec_last_block: str,
+    last_code_content: str,
+    last_code_language: str,
+    in_code_execution: bool,
+    code_exec_has_user_tools: bool,
+    code_exec_stream_start_idx: int,
+) -> dict[str, Any]:
+    if content_type == "bash_code_execution_tool_result":
+        logger.debug("Processing bash_code_execution_tool_result: %s", content_block)
+        await pipe._persist_server_tool_result(
+            content_block,
+            "bash_code_execution_tool_result",
+            emit_delta,
+            summary_text="🖥️ bash result",
+        )
+        result_block = getattr(content_block, "content", None)
+        if result_block:
+            result_block_type = getattr(result_block, "type", "")
+            if result_block_type == "bash_code_execution_tool_result_error":
+                error_code = getattr(result_block, "error_code", "unknown")
+                error_msg = f"⚠️ Code execution error: {error_code}"
+                logger.warning("bash_code_execution error: %s", error_code)
+                await emit_delta(error_msg)
+                last_code_content = ""
+                return {"last_code_content": last_code_content}
+
+            stdout = getattr(result_block, "stdout", "")
+            stderr = getattr(result_block, "stderr", "")
+            return_code = getattr(result_block, "return_code", None)
+
+            download_links = []
+            files_output = getattr(result_block, "content", [])
+            if files_output:
+                logger.debug("Found %d file outputs", len(files_output))
+                for file_obj in files_output:
+                    logger.debug(" Processing file object: %s", file_obj)
+                    file_id = getattr(file_obj, "file_id", None)
+                    if file_id:
+                        download_link = await pipe._generate_file_download_link(
+                            file_id=file_id,
+                            api_key=api_key,
+                            user_id=user_id,
+                        )
+                        download_links.append(download_link)
+
+            if stdout or stderr or return_code is not None or download_links:
+                if code_exec_is_web_filtering and code_exec_had_web_tools:
+                    logger.debug("Suppressed bash code execution block (web filtering)")
+                else:
+                    duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                    block = pipe._format_code_execution_block(
+                        last_code_content,
+                        "bash",
+                        done=True,
+                        duration=duration,
+                        stdout=stdout,
+                        stderr=stderr,
+                        return_code=return_code,
+                        download_links=download_links,
+                    )
+                    await update_content_block(code_exec_last_block, block)
+                    code_exec_last_block = ""
+                last_code_content = ""
+        return {
+            "last_code_content": last_code_content,
+            "code_exec_last_block": code_exec_last_block,
+        }
+
+    if content_type == "text_editor_code_execution_tool_result":
+        logger.debug("Processing text_editor_code_execution_tool_result: %s", content_block)
+        await pipe._persist_server_tool_result(
+            content_block,
+            "text_editor_code_execution_tool_result",
+            emit_delta,
+            summary_text="✏️ text_editor result",
+        )
+        result_block = getattr(content_block, "content", None)
+        if result_block:
+            result_type = getattr(result_block, "type", "")
+            logger.debug("Text editor result type: %s", result_type)
+
+            if result_type == "text_editor_code_execution_tool_result_error":
+                error_code = getattr(result_block, "error_code", "unknown")
+                error_msg = f"⚠️ Text editor error: {error_code}"
+                logger.warning("text_editor_code_execution error: %s", error_code)
+                await emit_delta(error_msg)
+                last_code_content = ""
+                return {"last_code_content": last_code_content}
+
+            if code_exec_is_web_filtering and code_exec_had_web_tools:
+                logger.debug("Suppressed text editor block (web filtering)")
+                last_code_content = ""
+            elif result_type == "text_editor_code_execution_create_result":
+                if last_code_content and last_code_language == "__inline_text__":
+                    await emit_delta(f"\n\n{last_code_content}\n\n")
+                    last_code_content = ""
+                    last_code_language = ""
+                elif last_code_content:
+                    duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                    block = pipe._format_code_execution_block(
+                        last_code_content,
+                        last_code_language or "python",
+                        done=True,
+                        duration=duration,
+                    )
+                    await update_content_block(code_exec_last_block, block)
+                    code_exec_last_block = ""
+                    last_code_content = ""
+            elif result_type == "text_editor_code_execution_view_result":
+                content = getattr(result_block, "content", "")
+                if content:
+                    await emit_delta(
+                        f"\n<details>\n<summary>📄 File Content</summary>\n\n```\n{content}\n```\n</details>\n"
+                    )
+        return {
+            "last_code_content": last_code_content,
+            "last_code_language": last_code_language,
+            "code_exec_last_block": code_exec_last_block,
+        }
+
+    if content_type == "code_execution_tool_result":
+        logger.debug("Processing code_execution_tool_result")
+        await pipe._persist_server_tool_result(
+            content_block,
+            "code_execution_tool_result",
+            emit_delta,
+            summary_text="🐍 code_execution result",
+        )
+        result_block = getattr(content_block, "content", None)
+        stdout = ""
+        stderr = ""
+        return_code = None
+        download_links = []
+        if result_block:
+            result_block_type = (
+                result_block.get("type", "") if isinstance(result_block, dict)
+                else getattr(result_block, "type", "")
+            )
+            if result_block_type == "code_execution_tool_result_error":
+                error_code = (
+                    result_block.get("error_code", "unknown") if isinstance(result_block, dict)
+                    else getattr(result_block, "error_code", "unknown")
+                )
+                error_msg = f"⚠️ Code execution error: {error_code}"
+                logger.warning("code_execution error: %s", error_code)
+                await emit_delta(error_msg)
+                return {
+                    "last_code_content": "",
+                    "in_code_execution": False,
+                    "code_exec_is_web_filtering": False,
+                }
+
+            if isinstance(result_block, dict):
+                stdout = result_block.get("stdout", "")
+                stderr = result_block.get("stderr", "")
+                return_code = result_block.get("return_code", None)
+                files_output = result_block.get("content", []) or []
+            else:
+                stdout = getattr(result_block, "stdout", "")
+                stderr = getattr(result_block, "stderr", "")
+                return_code = getattr(result_block, "return_code", None)
+                files_output = getattr(result_block, "content", []) or []
+
+            if files_output:
+                logger.debug("Found %d generic code_execution file outputs", len(files_output))
+                for file_obj in files_output:
+                    file_id = (
+                        file_obj.get("file_id")
+                        if isinstance(file_obj, dict)
+                        else getattr(file_obj, "file_id", None)
+                    )
+                    if file_id:
+                        download_link = await pipe._generate_file_download_link(
+                            file_id=file_id,
+                            api_key=api_key,
+                            user_id=user_id,
+                        )
+                        download_links.append(download_link)
+
+        if code_exec_is_web_filtering and code_exec_had_web_tools:
+            logger.debug("Suppressed code_execution_tool_result (web filtering)")
+            last_code_content = ""
+        elif stdout or stderr or return_code is not None or code_exec_tool_calls_info or download_links:
+            duration = time.time() - code_exec_start_time if code_exec_start_time else None
+            code_to_show = last_code_content or code_exec_current_code
+            block = pipe._format_code_execution_block(
+                code_to_show,
+                "python",
+                done=True,
+                duration=duration,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                tool_calls_info=code_exec_tool_calls_info,
+                download_links=download_links,
+            )
+            await update_content_block(code_exec_last_block, block)
+            code_exec_last_block = ""
+            last_code_content = ""
+
+        was_web_filtering = code_exec_is_web_filtering and code_exec_had_web_tools
+        _ = was_web_filtering
+
+        return {
+            "last_code_content": last_code_content,
+            "code_exec_last_block": code_exec_last_block,
+            "in_code_execution": False,
+            "code_exec_is_web_filtering": False,
+            "code_exec_has_user_tools": False,
+            "code_exec_had_web_tools": False,
+            "code_exec_tool_calls_info": [],
+            "code_exec_stream_start_idx": -1,
+        }
+
+    return {}
+# END GENERATED SECTION: anthropic_pipe.stream.code_execution_results
+
+# BEGIN GENERATED SECTION: anthropic_pipe.stream.server_tool
+TEXT_EXTENSIONS = {
+    ".md", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".log", ".rst", ".html", ".htm", ".css",
+}
+EXT_TO_LANG = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript", ".sh": "bash",
+    ".sql": "sql", ".r": "r", ".rb": "ruby", ".java": "java", ".c": "c",
+    ".cpp": "cpp", ".go": "go", ".rs": "rust",
+}
+SERVER_TOOLS_TO_PERSIST = (
+    "web_search", "web_fetch", "code_execution", "bash_code_execution",
+    "text_editor_code_execution", "tool_search_tool_regex", "tool_search_tool_bm25",
+    "advisor",
+)
+
+
+async def handle_server_tool_use_block_start(
+    content_block: Any,
+    *,
+    in_code_execution: bool,
+    code_exec_is_web_filtering: bool,
+    code_exec_has_user_tools: bool,
+    code_exec_had_web_tools: bool,
+    code_exec_tool_calls_info: list[Any],
+    code_exec_current_code: str,
+    code_exec_current_lang: str,
+    code_exec_start_time: float,
+    code_exec_last_block: str,
+    final_message: list[str],
+    format_code_execution_block: Callable[..., str],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+    emit_status: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    active_server_tool_name = getattr(content_block, "name", "")
+    active_server_tool_id = getattr(content_block, "id", "")
+    server_tool_input_buffer = ""
+
+    logger.debug(
+        "Server tool started: %s (ID: %s)",
+        active_server_tool_name,
+        active_server_tool_id,
+    )
+    code_exec_start_time = None
+    code_exec_stream_start_idx = None
+
+    if active_server_tool_name in ("web_search", "web_fetch"):
+        if emit_status:
+            await emit_status(
+                "🔍 Searching the web..." if active_server_tool_name == "web_search" else "🌐 Fetching URL..."
+            )
+        if in_code_execution:
+            code_exec_had_web_tools = True
+
+    elif active_server_tool_name == "code_execution":
+        if emit_status:
+            await emit_status("🐍 Running code...")
+        if code_exec_current_code:
+            duration = time.time() - code_exec_start_time if code_exec_start_time else None
+            block = format_code_execution_block(
+                code_exec_current_code,
+                code_exec_current_lang,
+                done=True,
+                duration=duration,
+            )
+            await update_content_block(code_exec_last_block, block)
+            code_exec_last_block = ""
+
+        in_code_execution = True
+        code_exec_is_web_filtering = True
+        code_exec_has_user_tools = False
+        code_exec_had_web_tools = False
+        code_exec_tool_calls_info = []
+        code_exec_stream_start_idx = len(final_message)
+        code_exec_current_code = ""
+        code_exec_current_lang = "python"
+        code_exec_start_time = time.time()
+
+    elif active_server_tool_name in ("bash_code_execution", "text_editor_code_execution"):
+        if emit_status:
+            await emit_status(
+                "💻 Running bash command..."
+                if active_server_tool_name == "bash_code_execution"
+                else "📝 Editing file..."
+            )
+        if code_exec_current_code:
+            duration = time.time() - code_exec_start_time if code_exec_start_time else None
+            block = format_code_execution_block(
+                code_exec_current_code,
+                code_exec_current_lang,
+                done=True,
+                duration=duration,
+            )
+            await update_content_block(code_exec_last_block, block)
+            code_exec_last_block = ""
+
+        code_exec_current_code = ""
+        code_exec_current_lang = "bash" if active_server_tool_name == "bash_code_execution" else "python"
+        code_exec_start_time = time.time()
+
+    elif active_server_tool_name in ("tool_search_tool_regex", "tool_search_tool_bm25"):
+        if emit_status:
+            await emit_status("🧰 Searching available tools...")
+
+    elif active_server_tool_name == "advisor":
+        if emit_status:
+            await emit_status("🧑‍⚖️ Consulting advisor...")
+
+    return {
+        "active_server_tool_name": active_server_tool_name,
+        "active_server_tool_id": active_server_tool_id,
+        "server_tool_input_buffer": server_tool_input_buffer,
+        "in_code_execution": in_code_execution,
+        "code_exec_is_web_filtering": code_exec_is_web_filtering,
+        "code_exec_has_user_tools": code_exec_has_user_tools,
+        "code_exec_had_web_tools": code_exec_had_web_tools,
+        "code_exec_tool_calls_info": code_exec_tool_calls_info,
+        "code_exec_stream_start_idx": code_exec_stream_start_idx,
+        "code_exec_current_code": code_exec_current_code,
+        "code_exec_current_lang": code_exec_current_lang,
+        "code_exec_start_time": code_exec_start_time,
+        "code_exec_last_block": code_exec_last_block,
+    }
+
+
+async def handle_server_tool_input_delta(
+    partial: str,
+    *,
+    active_server_tool_name: str,
+    server_tool_input_buffer: str,
+    current_search_query: str,
+    code_execution_code: str,
+    bash_execution_command: str,
+    text_editor_command: str,
+    text_editor_file_path: str,
+    text_editor_file_content: str,
+    code_exec_is_web_filtering: bool,
+    code_exec_had_web_tools: bool,
+    code_exec_current_code: str,
+    code_exec_current_lang: str,
+    code_exec_last_block: str,
+    format_code_execution_block: Callable[..., str],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+    emit_status: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    server_tool_input_buffer += partial
+
+    if active_server_tool_name == "web_search":
+        try:
+            parsed = json.loads(server_tool_input_buffer)
+            if "query" in parsed:
+                new_query = parsed["query"]
+                logger.debug("Web search query complete: '%s'", new_query)
+                if new_query and new_query != current_search_query:
+                    current_search_query = new_query
+        except Exception as e:
+            logger.debug("Web search query extraction error: %s", e)
+
+    elif active_server_tool_name == "web_fetch":
+        try:
+            parsed = json.loads(server_tool_input_buffer)
+            if "url" in parsed:
+                _ = parsed["url"]
+        except Exception:
+            pass
+
+    elif active_server_tool_name == "code_execution":
+        try:
+            parsed = json.loads(server_tool_input_buffer)
+            if "code" in parsed:
+                code_execution_code = parsed["code"]
+                if not code_exec_is_web_filtering or not code_exec_had_web_tools:
+                    code_exec_current_code = code_execution_code
+                    code_exec_current_lang = parsed.get("language", "python")
+                    block = format_code_execution_block(code_exec_current_code, code_exec_current_lang)
+                    await update_content_block(code_exec_last_block, block)
+                    code_exec_last_block = block
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    elif active_server_tool_name == "bash_code_execution":
+        try:
+            parsed = json.loads(server_tool_input_buffer)
+            if "command" in parsed:
+                bash_execution_command = parsed["command"]
+                if not code_exec_is_web_filtering or not code_exec_had_web_tools:
+                    code_exec_current_code = bash_execution_command
+                    code_exec_current_lang = "bash"
+                    block = format_code_execution_block(code_exec_current_code, code_exec_current_lang)
+                    await update_content_block(code_exec_last_block, block)
+                    code_exec_last_block = block
+                logger.debug("Bash execution command: %s...", bash_execution_command[:100])
+        except Exception as e:
+            logger.debug("Bash execution input extraction error: %s", e)
+
+    elif active_server_tool_name == "text_editor_code_execution":
+        try:
+            parsed = json.loads(server_tool_input_buffer)
+            if "command" in parsed:
+                text_editor_command = parsed["command"]
+            if "path" in parsed:
+                text_editor_file_path = parsed["path"]
+            if "file_text" in parsed:
+                text_editor_file_content = parsed["file_text"]
+                if text_editor_command == "create" and text_editor_file_content:
+                    file_ext = os.path.splitext(text_editor_file_path)[1].lower() if text_editor_file_path else ""
+                    if file_ext not in TEXT_EXTENSIONS:
+                        lang = EXT_TO_LANG.get(file_ext, "python")
+                        block = format_code_execution_block(text_editor_file_content, lang)
+                        await update_content_block(code_exec_last_block, block)
+                        code_exec_last_block = block
+        except Exception as e:
+            logger.debug("Text editor input extraction error: %s", e)
+
+    elif active_server_tool_name in ["tool_search_tool_regex", "tool_search_tool_bm25"]:
+        try:
+            parsed = json.loads(server_tool_input_buffer)
+            if "query" in parsed:
+                search_query = parsed["query"]
+                logger.debug("Tool search query: '%s'", search_query)
+                if emit_status:
+                    await emit_status(f"🔍 Searching tools: {search_query}")
+        except Exception as e:
+            logger.debug("Tool search query extraction error: %s", e)
+
+    return {
+        "server_tool_input_buffer": server_tool_input_buffer,
+        "current_search_query": current_search_query,
+        "code_execution_code": code_execution_code,
+        "bash_execution_command": bash_execution_command,
+        "text_editor_command": text_editor_command,
+        "text_editor_file_path": text_editor_file_path,
+        "text_editor_file_content": text_editor_file_content,
+        "code_exec_current_code": code_exec_current_code,
+        "code_exec_current_lang": code_exec_current_lang,
+        "code_exec_last_block": code_exec_last_block,
+    }
+
+
+async def handle_server_tool_use_block_stop(
+    *,
+    active_server_tool_name: str | None,
+    active_server_tool_id: str | None,
+    server_tool_input_buffer: str,
+    server_tool_use_carriers: dict[str, dict[str, Any]],
+    bash_execution_command: str,
+    text_editor_command: str,
+    text_editor_file_path: str,
+    text_editor_file_content: str,
+    code_execution_code: str,
+    format_server_tool_use_block: Callable[..., str],
+    emit_delta: Callable[[str], Awaitable[None]],
+) -> dict[str, Any]:
+    logger.debug("Server tool block stopped: %s", active_server_tool_name)
+
+    last_code_language = ""
+    last_code_content = ""
+
+    if active_server_tool_name == "bash_code_execution" and bash_execution_command:
+        last_code_language = "bash"
+        last_code_content = bash_execution_command
+    elif (
+        active_server_tool_name == "text_editor_code_execution"
+        and text_editor_command == "create"
+        and text_editor_file_content
+    ):
+        file_ext = os.path.splitext(text_editor_file_path)[1].lower() if text_editor_file_path else ""
+        if file_ext in TEXT_EXTENSIONS:
+            last_code_content = text_editor_file_content
+            last_code_language = "__inline_text__"
+        else:
+            last_code_language = EXT_TO_LANG.get(file_ext, "python")
+            last_code_content = text_editor_file_content
+    elif active_server_tool_name == "code_execution" and code_execution_code:
+        last_code_language = "python"
+        last_code_content = code_execution_code
+
+    if active_server_tool_name in SERVER_TOOLS_TO_PERSIST and active_server_tool_id:
+        try:
+            tool_input = json.loads(server_tool_input_buffer) if server_tool_input_buffer else {}
+        except (json.JSONDecodeError, ValueError):
+            tool_input = {}
+        persisted_block = format_server_tool_use_block(
+            tool_name=active_server_tool_name,
+            tool_use_id=active_server_tool_id,
+            tool_input=tool_input,
+        )
+        await emit_delta(persisted_block)
+        server_tool_use_carriers[active_server_tool_id] = {
+            "block": persisted_block,
+            "tool_name": active_server_tool_name,
+            "tool_input": tool_input,
+        }
+
+    return {
+        "last_code_language": last_code_language,
+        "last_code_content": last_code_content,
+        "active_server_tool_name": None,
+        "active_server_tool_id": None,
+        "server_tool_input_buffer": "",
+        "text_editor_file_content": "",
+        "text_editor_file_path": "",
+        "text_editor_command": "",
+        "bash_execution_command": "",
+        "code_execution_code": "",
+    }
+# END GENERATED SECTION: anthropic_pipe.stream.server_tool
+
+# BEGIN GENERATED SECTION: anthropic_pipe.stream.client_tool
+async def handle_tool_use_block_start(
+    content_block: Any,
+    *,
+    in_code_execution: bool,
+    code_exec_is_web_filtering: bool,
+    code_exec_has_user_tools: bool,
+    tool_progress_blocks: dict[str, str],
+    final_text: Callable[[], str],
+    final_message: list[str],
+    append_block_to_text: Callable[[str, str], str],
+    format_tool_result_block: Callable[..., str],
+    emit_replace: Callable[[str], Awaitable[None]],
+) -> tuple[str, str, str, str, bool, bool]:
+    tool_name = getattr(content_block, "name", "unknown")
+    logger.debug("🔧 Tool use block started: %s", tool_name)
+
+    if in_code_execution and code_exec_is_web_filtering:
+        code_exec_is_web_filtering = False
+        code_exec_has_user_tools = True
+
+    initial_input = getattr(content_block, "input", None) or {}
+    tool_id_at_start = getattr(content_block, "id", "")
+    if initial_input:
+        logger.debug(
+            "🔧 Tool input pre-populated at start: %s",
+            json.dumps(initial_input, ensure_ascii=False)[:200],
+        )
+        tools_buffer = json.dumps(
+            {
+                "type": content_block.type,
+                "id": content_block.id,
+                "name": content_block.name,
+                "input": initial_input,
+            },
+            ensure_ascii=False,
+        )
+    else:
+        tools_buffer = (
+            "{"
+            f'"type": "{content_block.type}", '
+            f'"id": "{content_block.id}", '
+            f'"name": "{content_block.name}", '
+            f'"input": '
+        )
+
+    if not in_code_execution:
+        in_progress_block = format_tool_result_block(
+            tool_id_at_start, tool_name, initial_input or {}, "", done=False
+        )
+        tool_progress_blocks[tool_id_at_start] = in_progress_block
+        text = append_block_to_text(final_text(), in_progress_block)
+        final_message.clear()
+        final_message.append(text)
+        await emit_replace(text)
+
+    return (
+        tool_name,
+        tool_id_at_start,
+        tools_buffer,
+        "",
+        code_exec_is_web_filtering,
+        code_exec_has_user_tools,
+    )
+
+
+async def handle_client_tool_input_delta(
+    partial: str,
+    *,
+    tools_buffer: str,
+    tool_input_buffer: str,
+    in_code_execution: bool,
+    tool_id_at_start: str,
+    tool_name: str,
+    tool_progress_blocks: dict[str, str],
+    try_parse_partial_json: Callable[[str], Any],
+    format_tool_result_block: Callable[..., str],
+    final_text: Callable[[], str],
+    final_message: list[str],
+    emit_event: Callable[[dict[str, Any]], Awaitable[None]],
+) -> tuple[str, str]:
+    tools_buffer += partial
+    tool_input_buffer += partial
+
+    if not in_code_execution and tool_id_at_start in tool_progress_blocks:
+        parsed_input = try_parse_partial_json(tool_input_buffer)
+        if parsed_input is not None:
+            old_block = tool_progress_blocks[tool_id_at_start]
+            new_block = format_tool_result_block(
+                tool_id_at_start, tool_name, parsed_input, "", done=False
+            )
+            text = final_text().replace(old_block, new_block, 1)
+            tool_progress_blocks[tool_id_at_start] = new_block
+            final_message.clear()
+            final_message.append(text)
+            await emit_event({"type": "replace", "data": {"content": text}})
+
+    return tools_buffer, tool_input_buffer
+
+
+async def handle_tool_use_block_stop(
+    *,
+    pipe: Any,
+    tools_buffer: str,
+    tools: dict[str, Any] | None,
+    builtin_tools: dict[str, Any],
+    api_tool_names: list[str],
+    running_tool_tasks: list[Any],
+    emit_delta: Callable[[str], Awaitable[None]],
+) -> tuple[str, bool]:
+    if not tools_buffer:
+        return tools_buffer, False
+
+    try:
+        json.loads(tools_buffer)
+        logger.debug(" tools_buffer already valid JSON: %s", tools_buffer)
+    except json.JSONDecodeError:
+        if tools_buffer.rstrip().endswith('"input":') or tools_buffer.rstrip().endswith(
+            '"input": '
+        ):
+            tools_buffer += " {}"
+            logger.debug(" Added empty input object: %s", tools_buffer)
+        tools_buffer += "}"
+        logger.debug(" Closed tools_buffer in content_block_stop: %s", tools_buffer)
+
+    logger.debug("Parsed tool call: %s", tools_buffer)
+    api_tool_passthrough = False
+
+    try:
+        tool_call_data = json.loads(tools_buffer)
+        tool_name = tool_call_data.get("name", "")
+        tool_input = tool_call_data.get("input", {})
+
+        tool = tools.get(tool_name) if tools else None
+        if (
+            tool_name == "bash"
+            and pipe.valves.ENABLE_BASH_TOOL
+            and tools
+            and "run_command" in tools
+        ):
+            args = tool_input if isinstance(tool_input, dict) else {}
+            task = asyncio.create_task(
+                pipe._await_tool_task_result(
+                    tool_call_data,
+                    pipe._dispatch_bash_tool(args, tools),
+                )
+            )
+            running_tool_tasks.append(task)
+            logger.debug("🚀 Started bash bridge → run_command (task #%d)", len(running_tool_tasks))
+        elif (
+            tool_name == "str_replace_based_edit_tool"
+            and pipe.valves.ENABLE_TEXT_EDITOR_TOOL
+            and tools
+            and "write_file" in tools
+            and "replace_file_content" in tools
+        ):
+            args = tool_input if isinstance(tool_input, dict) else {}
+            task = asyncio.create_task(
+                pipe._await_tool_task_result(
+                    tool_call_data,
+                    pipe._dispatch_text_editor_tool(args, tools),
+                )
+            )
+            running_tool_tasks.append(task)
+            logger.debug(
+                "🚀 Started text_editor bridge (cmd=%s, task #%d)",
+                args.get("command", "?"),
+                len(running_tool_tasks),
+            )
+        elif tool and tool.get("callable"):
+            args = tool_input if isinstance(tool_input, dict) else {}
+            task = asyncio.create_task(
+                pipe._await_tool_task_result(tool_call_data, tool["callable"](**args))
+            )
+            running_tool_tasks.append(task)
+            logger.debug(
+                "🚀 Started immediate execution for user tool '%s' (task #%d)",
+                tool_name,
+                len(running_tool_tasks),
+            )
+        elif tool_name in builtin_tools and builtin_tools[tool_name].get("callable"):
+            args = tool_input if isinstance(tool_input, dict) else {}
+            task = asyncio.create_task(
+                pipe._await_tool_task_result(
+                    tool_call_data,
+                    builtin_tools[tool_name]["callable"](**args),
+                )
+            )
+            running_tool_tasks.append(task)
+            logger.debug(
+                "🚀 Started immediate execution for builtin tool '%s' (task #%d)",
+                tool_name,
+                len(running_tool_tasks),
+            )
+        elif tool_name in api_tool_names:
+            logger.info(
+                "🔄 API tool passthrough for '%s': returning tool input as response",
+                tool_name,
+            )
+            await emit_delta(json.dumps(tool_input, ensure_ascii=False))
+            api_tool_passthrough = True
+        else:
+            logger.warning("Tool '%s' not found in __tools__ or builtin_tools", tool_name)
+
+            async def error_result(tn=tool_name):
+                return json.dumps(
+                    {
+                        "error": f"Tool '{tn}' is not available. It may require server context or is not configured."
+                    },
+                    ensure_ascii=False,
+                )
+
+            task = asyncio.create_task(
+                pipe._await_tool_task_result(tool_call_data, error_result())
+            )
+            running_tool_tasks.append(task)
+    except Exception as e:
+        logger.error("Failed to start tool execution: %s", e)
+
+    return "", api_tool_passthrough
+# END GENERATED SECTION: anthropic_pipe.stream.client_tool
+
+# BEGIN GENERATED SECTION: anthropic_pipe.stream.basic_blocks
+def handle_text_block_start(content_block: Any, chunk: str) -> str:
+    return chunk + (getattr(content_block, "text", "") or "")
+
+
+async def handle_text_delta(
+    delta: Any,
+    *,
+    chunk: str,
+    chunk_count: int,
+) -> tuple[str, int]:
+    text_delta = getattr(delta, "text", "")
+    chunk += text_delta
+    chunk_count += 1
+    return chunk, chunk_count
+
+
+async def handle_text_block_stop(
+    *,
+    chunk: str,
+    chunk_count: int,
+    pending_citation_markers: list[int],
+    final_message: list[str],
+    final_text: Callable[[], str],
+    emit_delta: Callable[[str], Awaitable[None]],
+) -> tuple[str, int, list[int]]:
+    if pending_citation_markers:
+        chunk += "".join(f"[{n}]" for n in pending_citation_markers)
+        pending_citation_markers = []
+    if chunk:
+        if not chunk.endswith("\n"):
+            chunk += "\n"
+        await emit_delta(chunk)
+        chunk = ""
+        chunk_count = 0
+    elif final_message and not final_text().endswith("\n"):
+        await emit_delta("\n")
+    return chunk, chunk_count, pending_citation_markers
+
+
+def handle_thinking_block_start(final_message: list[str]) -> tuple[bool, float, str, str, int]:
+    return True, time.time(), "", "", len(final_message)
+
+
+def handle_redacted_thinking_block_start() -> bool:
+    return True
+
+
+async def handle_thinking_delta(
+    delta: Any,
+    *,
+    thinking_message: str,
+    thinking_last_block: str,
+    format_thinking_block: Callable[..., str],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+) -> tuple[str, str]:
+    thinking_text = getattr(delta, "thinking", "")
+    thinking_message += thinking_text
+    if thinking_text:
+        formatted = format_thinking_block(thinking_message, duration=None)
+        await update_content_block(thinking_last_block, formatted)
+        thinking_last_block = formatted
+    return thinking_message, thinking_last_block
+
+
+def handle_signature_delta(delta: Any, thinking_signature: str) -> str:
+    return thinking_signature + (getattr(delta, "signature", "") or "")
+
+
+async def handle_thinking_block_stop(
+    *,
+    content_type: str,
+    is_model_thinking: bool,
+    thinking_message: str,
+    thinking_signature: str,
+    thinking_start_time: float | None,
+    thinking_stream_start_idx: int,
+    thinking_last_block: str,
+    format_thinking_block: Callable[..., str],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+) -> tuple[bool, str, str, int, str]:
+    if is_model_thinking and content_type in ("thinking", "redacted_thinking"):
+        if content_type == "thinking" and (thinking_message or thinking_signature):
+            duration = time.time() - (thinking_start_time or time.time())
+            formatted = format_thinking_block(
+                thinking_message, duration, signature=thinking_signature
+            )
+            await update_content_block(thinking_last_block, formatted)
+            thinking_last_block = ""
+            logger.debug(
+                "Finalized thinking block (%d chars, %.1fs, sig=%dc)",
+                len(thinking_message),
+                duration,
+                len(thinking_signature),
+            )
+        elif content_type == "redacted_thinking":
+            logger.debug("Redacted thinking block completed (preserved by SDK)")
+        is_model_thinking = False
+        thinking_message = ""
+        thinking_signature = ""
+        thinking_stream_start_idx = -1
+    return (
+        is_model_thinking,
+        thinking_message,
+        thinking_signature,
+        thinking_stream_start_idx,
+        thinking_last_block,
+    )
+
+
+async def handle_compaction_block_start(
+    emit_status: Callable[[str], Awaitable[None]],
+) -> tuple[str, str]:
+    await emit_status("📦 Compacting conversation context...")
+    logger.info("Compaction block started")
+    return "", ""
+
+
+async def handle_compaction_delta(
+    delta: Any,
+    *,
+    compaction_content: str,
+    compaction_last_block: str,
+    format_compaction_block: Callable[[str], str],
+    update_content_block: Callable[[str, str], Awaitable[None]],
+) -> tuple[str, str]:
+    compaction_content += getattr(delta, "content", "")
+    formatted = format_compaction_block(compaction_content)
+    await update_content_block(compaction_last_block, formatted)
+    compaction_last_block = formatted
+    return compaction_content, compaction_last_block
+
+
+async def handle_compaction_block_stop(
+    *,
+    compaction_content: str,
+    emit_status_done: Callable[[str], Awaitable[None]],
+) -> None:
+    logger.info("Compaction summary complete: %d chars", len(compaction_content))
+    await emit_status_done(f"📦 Context compacted ({len(compaction_content)} chars summary)")
+# END GENERATED SECTION: anthropic_pipe.stream.basic_blocks
+
+# BEGIN GENERATED SECTION: anthropic_pipe.stream.status_events
+class StatusEmitter:
+    def __init__(self, emit_event: Callable[[dict[str, Any]], Awaitable[None]]):
+        self._emit_event = emit_event
+        self._response_started = False
+        self._last_description = ""
+        self._last_done: bool | None = None
+        self._last_hidden: bool | None = None
+
+    async def emit(
+        self,
+        description: str,
+        *,
+        done: bool = False,
+        hidden: bool | None = None,
+        force: bool = False,
+    ) -> None:
+        if (
+            not force
+            and description == self._last_description
+            and done == self._last_done
+            and hidden == self._last_hidden
+        ):
+            return
+
+        data: dict[str, Any] = {"description": description, "done": done}
+        if hidden is not None:
+            data["hidden"] = hidden
+        await self._emit_event({"type": "status", "data": data})
+        self._last_description = description
+        self._last_done = done
+        self._last_hidden = hidden
+
+    async def waiting(self) -> None:
+        await self.emit("Waiting for response...", done=False, hidden=False, force=True)
+
+    async def response_started_once(self) -> None:
+        if self._response_started:
+            return
+        self._response_started = True
+        await self.emit("Responding...", done=False)
+
+    async def activity(self, description: str) -> None:
+        await self.emit(description, done=False)
+
+    async def complete(self, description: str) -> None:
+        await self.emit(description, done=True, force=True)
+
+    async def notification(self, content: str, *, type: str = "warning") -> None:
+        await self._emit_event(
+            {"type": "notification", "data": {"type": type, "content": content}}
+        )
+# END GENERATED SECTION: anthropic_pipe.stream.status_events
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
@@ -696,16 +2594,24 @@ class Pipe:
     # The API now provides: max_tokens, max_input_tokens, capabilities (thinking, effort, vision, etc.)
     # These overrides only contain flags that must be derived from model identity.
     MODEL_CAPABILITY_OVERRIDES = {
+        "claude-opus-4-8": {
+            "supports_dynamic_filtering": True,
+            "supports_fast_mode": True,
+            "supports_compaction": True,
+        },
         "claude-opus-4-7": {
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
+            "supports_compaction": True,
         },
         "claude-opus-4-6": {
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
+            "supports_compaction": True,
         },
         "claude-sonnet-4-6": {
             "supports_dynamic_filtering": True,
+            "supports_compaction": True,
         },
     }
 
@@ -724,84 +2630,21 @@ class Pipe:
     # MODEL INFO & INITIALIZATION
     # =========================================================================
 
-    @classmethod
-    def _parse_api_capabilities(cls, model) -> dict:
-        """Parse capabilities from an Anthropic API ModelInfo object into our internal format."""
-        caps = getattr(model, "capabilities", None)
-        _sup = lambda obj, attr="supported": getattr(obj, attr, False) if obj else False
 
-        thinking = getattr(caps, "thinking", None) if caps else None
-        thinking_types = getattr(thinking, "types", None) if thinking else None
-        effort = getattr(caps, "effort", None) if caps else None
-        ctx_mgmt = getattr(caps, "context_management", None) if caps else None
-
-        max_tokens = getattr(model, "max_tokens", 0) or 0
-        max_input = getattr(model, "max_input_tokens", 0) or 0
-
-        info = {
-            "max_tokens": max_tokens if max_tokens > 0 else 4096,
-            "context_length": max_input if max_input > 0 else 200000,
-            "supports_thinking": _sup(thinking),
-            "supports_adaptive_thinking": _sup(getattr(thinking_types, "adaptive", None)) if thinking_types else False,
-            "supports_effort": _sup(effort),
-            "supports_effort_max": _sup(getattr(effort, "max", None)) if effort else False,
-            "supports_effort_xhigh": _sup(getattr(effort, "xhigh", None)) if effort else False,
-            "supports_vision": _sup(getattr(caps, "image_input", None)) if caps else True,
-            "supports_programmatic_calling": _sup(getattr(caps, "code_execution", None)) if caps else False,
-            "supports_compaction": _sup(getattr(ctx_mgmt, "compact_20260112", None)) if ctx_mgmt else False,
-            # All Claude 4+ models support memory
-            "supports_memory": True,
-            # Defaults for fields not in API — overridden by MODEL_CAPABILITY_OVERRIDES
-            "supports_dynamic_filtering": False,
-            "supports_fast_mode": False,
-        }
-
-        # Apply model-specific overrides for fields not available from API
-        model_id = model.id if hasattr(model, "id") else ""
-        overrides = cls.MODEL_CAPABILITY_OVERRIDES.get(model_id, {})
-        info.update(overrides)
-
-        return info
-
-    @classmethod
-    def get_model_info(cls, model_name: str) -> dict:
-        """
-        Get model capabilities by name. Reads from API cache first,
-        falls back to safe defaults for unknown models.
-        """
-        if model_name in cls._api_capabilities_cache:
-            return cls._api_capabilities_cache[model_name]
-
-        # Return conservative defaults for unknown models
-        return {
-            "max_tokens": 4096,
-            "context_length": 200000,
-            "supports_thinking": True,
-            "supports_memory": False,
-            "supports_vision": True,
-            "supports_effort": False,
-            "supports_programmatic_calling": False,
-            "supports_compaction": False,
-            "supports_dynamic_filtering": False,
-            "supports_adaptive_thinking": False,
-            "supports_effort_max": False,
-            "supports_effort_xhigh": False,
-            "supports_fast_mode": False,
-        }
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
         ANTHROPIC_BASE_URL: str = Field(
-            default="",
-            description="Custom base URL for the Anthropic API (e.g. for a proxy). Leave empty to use the default Anthropic endpoint (https://api.anthropic.com).",
+            default="https://api.anthropic.com",
+            description="Custom base URL for the Anthropic API",
         )
         ENABLE_FAST_MODE: bool = Field(
             default=False,
-            description="Enable Fast Mode for Opus 4.6 / 4.7. Up to 2.5x faster output at higher costs",
+            description="Enable Fast Mode for Opus Models. Up to 2.5x faster output at higher costs",
         )
         ENABLE_INTERLEAVED_THINKING: bool = Field(
             default=True,
-            description="Enable interleaved thinking. Claude can generate thinking blocks between tool calls instead of only at the end.",
+            description="Claude can generate thinking blocks between tool calls instead of only at the end.",
         )
         WEB_SEARCH: bool = Field(
             default=True,
@@ -809,13 +2652,13 @@ class Pipe:
         )
         WEB_FETCH: bool = Field(
             default=True,
-            description="Enable web fetch tool for Claude models. Allows Claude to fetch and analyze content from URLs.",
+            description="Allows Claude to fetch and analyze content from URLs.",
         )
         MAX_TOOL_CALLS: int = Field(
             default=15,
             ge=1,
             le=9999,
-            description="Maximum number of tool execution loops allowed per request. Each loop involves Claude generating tool calls, executing them, and feeding results back. Prevents infinite loops.",
+            description="Maximum number of tool execution loops allowed per request.",
         )
         MAX_RETRIES: int = Field(
             default=3,
@@ -834,7 +2677,7 @@ class Pipe:
         )
         CACHE_TTL: Literal["5 minutes", "1 hour"] = Field(
             default="5 minutes",
-            description="Cache time-to-live. 5 minutes is default Anthropic TTL; 1 hour requires no extra cost but keeps caches warm longer across conversations.",
+            description="How long should a cache be kept? 1 hour has increased costs",
         )
         WEB_SEARCH_USER_CITY: str = Field(
             default="",
@@ -854,7 +2697,7 @@ class Pipe:
         )
         ENABLE_PROGRAMMATIC_TOOL_CALLING: bool = Field(
             default=False,
-            description="Enable programmatic tool calling. Claude can call tools from within code execution. Requires code execution to be active.",
+            description="Claude can call tools from within code execution, more latency but more efficient on long running tasks with many tool calls.",
         )
         ENABLE_BASH_TOOL: bool = Field(
             default=False,
@@ -878,13 +2721,13 @@ class Pipe:
         )
         DATA_RESIDENCY: Literal["global", "us"] = Field(
             default="global",
-            description='Data residency for API requests. 1.1x Token Cost for "us".',
+            description='Data residency for API requests. "us" has 1.1x the Token Cost.',
         )
         REQUEST_TIMEOUT: int = Field(
             default=300,
             ge=30,
             le=9999,
-            description="Request timeout in seconds for Anthropic API calls. Increase if using slow local rerankers or large context (e.g. 600 for Top-K 15+).",
+            description="Request timeout in seconds for Anthropic API calls.",
         )
         TOOL_CALL_TIMEOUT: int = Field(
             default=30,
@@ -892,11 +2735,15 @@ class Pipe:
             le=9999,
             description="Timeout in seconds for individual tool call execution.",
         )
+        ENABLE_CACHE_DIAGNOSTICS: bool = Field(
+            default=False,
+            description="Enable Cache Diagnostics. For debugging and development only"
+        )
 
     class UserValves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(
             default="",
-            description="Personal Anthropic API key. If set, overrides the admin-configured key.",
+            description="Overrides the admin-configured API key.",
         )
         ENABLE_THINKING: bool = Field(
             default=False,
@@ -909,16 +2756,16 @@ class Pipe:
             description="Thinking budget tokens",
         )
         THINKING_DISPLAY: Literal["summarized", "omitted"] = Field(
-            default="summarized",
-            description="Thinking display mode. 'summarized' returns summarized thinking (default). 'omitted' skips streaming thinking tokens for faster time-to-first-text.",
+            default="omitted",
+            description="'summarized' returns summarized thinking, 'omitted' hides thinking in favor of faster time-to-first-text.",
         )
         EFFORT: Literal["low", "medium", "high", "xhigh", "max"] = Field(
             default="high",
-            description="Effort level for this user. Also controllable via OpenWebUI's reasoning_effort parameter. 'xhigh' is Opus 4.7 only; 'max' is Opus 4.7 / 4.6 / Sonnet 4.6 only. Unsupported values are clamped down automatically.",
+            description="How much effort should be applied to answer the next requestEffort level for this user. Also controllable via OpenWebUI's reasoning_effort parameter.",
         )
         USE_PDF_NATIVE_UPLOAD: bool = Field(
             default=True,
-            description="Upload PDFs as native base64 documents instead of RAG text extraction. Enables visual PDF analysis (charts, images, layouts). Only applies to 'Use Full Document' mode.",
+            description="Upload PDFs as native base64 documents instead of RAG text extraction. Only applies to 'Use Full Document' mode.",
         )
         SHOW_TOKEN_COUNT: Literal["Off", "On", "With Cache"] = Field(
             default="Off",
@@ -954,12 +2801,11 @@ class Pipe:
         )
         ENABLE_DYNAMIC_FILTERING: bool = Field(
             default=False,
-            description="Use dynamic filtering for web search/fetch on supported models (4.6+). Much slower (~60s vs ~7s) but produces higher quality results by orchestrating multiple searches/fetches and filtering content via code execution. Trades speed for context efficiency.",
+            description="Use dynamic filtering for web search/fetch. Trades speed (~60s vs ~7s) for context efficiency.",
         )
-        # Tool Search (advanced-tool-use) — per-user
         ENABLE_TOOL_SEARCH: bool = Field(
             default=True,
-            description="Enable tool search. Allows Claude to search for tools by name/description when many tools are available.",
+            description="Enables a tool to search for tools before use. Trades latency for token efficiency.",
         )
         TOOL_SEARCH_TYPE: Literal["regex", "bm25"] = Field(
             default="bm25",
@@ -969,19 +2815,19 @@ class Pipe:
             default=100,
             ge=10,
             le=10000,
-            description="Maximum tool description length. Tools with longer JSON definitions will be deferred for lazy loading.",
+            description="Tools with longer JSON definitions characters will be deferred.",
         )
         TOOL_SEARCH_EXCLUDE_TOOLS: List[str] = Field(
             default=[],
-            description="Excluded Tool always load. Anthropic Tools are excluded by default.",
+            description="Excluded Tools are always loaded. Anthropic Tools are excluded by default.",
         )
         # Advisor tool (advisor-tool-2026-03-01) — per-user
         ENABLE_ADVISOR_TOOL: bool = Field(
             default=False,
             description="Enable the Advisor tool. A faster executor model consults a stronger advisor model mid-generation for strategic guidance.",
         )
-        ADVISOR_MODEL: Literal["claude-opus-4-7"] = Field(
-            default="claude-opus-4-7",
+        ADVISOR_MODEL: Literal["claude-opus-4-8"] = Field(
+            default="claude-opus-4-8",
             description="Advisor model ID.",
         )
         ADVISOR_MAX_USES: int = Field(
@@ -997,11 +2843,11 @@ class Pipe:
         # Files API and Skills Settings
         USE_FILES_API: bool = Field(
             default=False,
-            description="Upload files to Anthropic Files API for code execution access. Overrides native PDF upload. Requires code execution.",
+            description="Upload files to Anthropic Files API for code execution access. Overrides native PDF upload. Required for Anthropic API Skills to access attached files; can also be forced by the Files API Toggle or Companion Filter metadata.",
         )
         SKILLS: List[str] = Field(
             default=[],
-            description="Anthropic Skills to use (e.g., 'pptx', 'xlsx', 'docx', 'pdf' or custom skill IDs). Skills are validated against the API.",
+            description="Anthropic API Skills to use (e.g., 'pptx', 'xlsx', 'docx', 'pdf' or custom skill IDs). These are not OpenWebUI Skills. Skills require Anthropic code_execution; attached files require USE_FILES_API or the Files API Toggle / Companion Filter.",
         )
         ENABLE_COMPACTION: bool = Field(
             default=False,
@@ -1051,10 +2897,6 @@ class Pipe:
             default=False,
             description="Also clear tool input parameters when clearing tool results.",
         )
-        DEBUG_MODE: bool = Field(
-            default=False,
-            description="Enable debug mode with verbose logging and additional status events.",
-        )
 
     def __init__(self):
         self.type = "manifold"
@@ -1067,89 +2909,403 @@ class Pipe:
         # Per-chat_id cache of last request's messages[] signature list,
         # used by _log_message_hash_diff to identify byte-drift between turns
         # that invalidates the Anthropic prompt cache.
-        self._cache_diff_state: Dict[str, List[Tuple[str, str]]] = {}
+        self._cache_diff_state: Dict[str, List[Tuple[str, str, str]]] = {}
+        # Per-chat_id cache of the last Anthropic response id. Used by the cache
+        # diagnostics beta (`cache-diagnosis-2026-04-07`) to pass
+        # `diagnostics.previous_message_id` on the next turn so the API can
+        # report where the prompt-cache prefix diverged.
+        self._cache_diagnostics_state: Dict[str, str] = {}
 
-    async def get_anthropic_models(self) -> List[dict]:
-        """
-        Fetches the current list of Anthropic models using the official Anthropic Python SDK.
-        Parses capabilities from the API response and caches them.
-        Returns OpenWebUI model dicts.
-        """
-        # Return cached result if still fresh
-        if (
-            self._api_capabilities_cache
-            and time.time() - self._api_capabilities_cache_ts < self._API_CACHE_TTL
-        ):
-            models = []
-            for name, info in self._api_capabilities_cache.items():
-                models.append(self._build_openwebui_model_entry(name, info))
-            return models
-
-        from anthropic import AsyncAnthropic
-
-        models = []
-        new_cache: Dict[str, dict] = {}
-        try:
-            api_key = self.valves.ANTHROPIC_API_KEY
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
-            async for m in client.models.list():
-                name = m.id
-                display_name = getattr(m, "display_name", name)
-
-                # Parse capabilities directly from API response
-                info = self._parse_api_capabilities(m)
-                info["_display_name"] = display_name
-                new_cache[name] = info
-
-                entry = self._build_openwebui_model_entry(name, info, display_name)
-                models.append(entry)
-
-            # Update class-level cache
-            Pipe._api_capabilities_cache = new_cache
-            Pipe._api_capabilities_cache_ts = time.time()
-            logger.info(f"Cached capabilities for {len(new_cache)} models from API")
-            return models
-        except Exception as e:
-            logging.warning(
-                f"Could not fetch models from SDK/API: {e}"
-            )
-            # If we have stale cache, use it
-            if self._api_capabilities_cache:
-                logging.info("Using stale capability cache as fallback")
-                for name, info in self._api_capabilities_cache.items():
-                    models.append(self._build_openwebui_model_entry(name, info))
-                return models
-            # No cache available — return empty (API key likely invalid)
-            return models
+    # COMPILED PIPE METHOD GROUPS INSERTION POINT
+    # BEGIN GENERATED SECTION: anthropic_pipe.pipe_method_groups
+    def _cache_control_marker(self) -> dict:
+        """Return the cache_control dict based on the CACHE_TTL valve setting."""
+        marker = {"type": "ephemeral"}
+        if self.valves.CACHE_TTL == "1 hour":
+            marker["ttl"] = "1h"
+        return marker
 
     @staticmethod
-    def _build_openwebui_model_entry(
-        name: str, info: dict, display_name: str = ""
-    ) -> dict:
-        return {
-            "id": f"anthropic/{name}",
-            "name": display_name or name,
-            "context_length": info["context_length"],
-            "supports_vision": info["supports_vision"],
-            "supports_thinking": info["supports_thinking"],
-            "is_hybrid_model": info["supports_thinking"],
-            "max_output_tokens": info["max_tokens"],
-            "info": {
-                "meta": {
-                    "capabilities": {
-                        "status_updates": True
-                    }
+    def _dump_sdk_obj(obj: Any) -> Any:
+        """Recursively convert an Anthropic SDK object (or plain dict/list) to a
+        plain Python structure suitable for JSON serialisation."""
+        if obj is None:
+            return None
+        if hasattr(obj, "model_dump"):
+            try:
+                return obj.model_dump(exclude_none=True)
+            except TypeError:
+                return obj.model_dump()
+        if isinstance(obj, dict):
+            return {k: Pipe._dump_sdk_obj(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [Pipe._dump_sdk_obj(v) for v in obj]
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        return str(obj)
+
+    @staticmethod
+    def _strip_payload(payload: dict, max_str: int = 20) -> dict:
+        """Return a copy of the outgoing Anthropic payload with *minimal*
+        structural changes, safe for debug logging.
+
+        Only two things change:
+          1. ``tools`` is replaced with a small summary (count + names +
+             indices carrying cache_control).
+          2. Every string value reachable inside ``messages`` is truncated to
+             ``max_str`` chars + ``…[Nc]`` length marker.
+
+        Everything else — key order, whitespace inside non-messages strings,
+        `system`, `cache_control`, booleans, numbers, None values, extra
+        top-level fields — is left **byte-for-byte** untouched so that two
+        consecutive dumps can be diffed to locate cache-invalidating drift
+        (double newlines, missing spaces, re-ordered keys, etc).
+        """
+        def _clip(s):
+            if isinstance(s, str) and len(s) > max_str:
+                import hashlib as _hl
+                _h = _hl.sha1(s.encode("utf-8", "replace")).hexdigest()[:8]
+                return f"{s[:max_str]}…[{len(s)}c#{_h}]"
+            return s
+
+        def _walk(node):
+            if isinstance(node, dict):
+                return {k: _walk(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [_walk(v) for v in node]
+            if isinstance(node, str):
+                return _clip(node)
+            return node
+
+        stripped: dict = {}
+        for k, v in payload.items():
+            if k == "tools":
+                tools = v or []
+                stripped["tools"] = {
+                    "__tools_count__": len(tools),
+                    "names": [
+                        (t.get("name") or t.get("type") or "?")
+                        for t in tools if isinstance(t, dict)
+                    ],
+                    "cache_control_idx": [
+                        i for i, t in enumerate(tools)
+                        if isinstance(t, dict) and "cache_control" in t
+                    ],
                 }
-            },
-        }
+            elif k == "messages":
+                stripped["messages"] = _walk(v)
+            else:
+                stripped[k] = v
+        return stripped
 
-    async def pipes(self) -> List[dict]:
-        return await self.get_anthropic_models()
+    def _log_message_hash_diff(self, chat_id: Optional[str], payload: dict) -> None:
+        """Compare the current outgoing payload.messages[] against the previous
+        request for the same chat_id. Log first divergence index + per-message
+        hash table so we can pinpoint which assistant/user message mutated
+        between turns and broke the Anthropic prompt cache prefix.
 
-    # =========================================================================
-    # PDF & FILE HANDLING
-    # =========================================================================
+        Uses hashlib.sha1 on ``json.dumps(sort_keys=True, separators=(",", ":"))``
+        of each message (minus cache_control markers, which legitimately move).
+        """
+        if not chat_id:
+            return
+        try:
+            msgs = payload.get("messages", []) or []
+
+            def _strip_cache_control(obj):
+                if isinstance(obj, dict):
+                    return {
+                        k: _strip_cache_control(v)
+                        for k, v in obj.items()
+                        if k != "cache_control"
+                    }
+                if isinstance(obj, list):
+                    return [_strip_cache_control(v) for v in obj]
+                return obj
+
+            def _preview(canon: str, limit: int = 6000) -> str:
+                if len(canon) <= limit:
+                    return canon
+                import hashlib
+                digest = hashlib.sha1(canon.encode("utf-8", "replace")).hexdigest()[:10]
+                return f"{canon[:limit]}...(truncated {len(canon)}c sha1={digest})"
+
+            def _hash_msg(m: dict) -> tuple[str, str, str]:
+                """Return (insertion_order_hash, sorted_hash, preview). The SDK sends
+                dicts in Python insertion order, so insertion_order_hash is
+                what the API actually sees for cache purposes. sorted_hash
+                tells us whether the *content* matches regardless of order.
+
+                ``cache_control`` markers are stripped from both hashes because
+                they are placement hints that legitimately move between turns;
+                treating them as message drift creates false positives.
+                """
+                import hashlib
+                stripped = _strip_cache_control(m)
+                try:
+                    canon_ins = json.dumps(stripped, sort_keys=False, separators=(",", ":"), ensure_ascii=False,
+                                           default=lambda o: repr(o))
+                except Exception:
+                    canon_ins = repr(stripped)
+                try:
+                    canon_sorted = json.dumps(stripped, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                              default=lambda o: repr(o))
+                except Exception:
+                    canon_sorted = repr(stripped)
+                ins_h = hashlib.sha1(canon_ins.encode("utf-8")).hexdigest()[:10]
+                sort_h = hashlib.sha1(canon_sorted.encode("utf-8")).hexdigest()[:10]
+                return (ins_h, sort_h, _preview(canon_ins))
+
+            def _summarize(m: dict) -> str:
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    return f"{role}:text({len(content)}c)"
+                if isinstance(content, list):
+                    parts = []
+                    for b in content:
+                        if not isinstance(b, dict):
+                            parts.append(type(b).__name__)
+                            continue
+                        bt = b.get("type", "?")
+                        if bt == "text":
+                            parts.append(f"text({len(b.get('text', ''))}c)")
+                        elif bt == "tool_use":
+                            parts.append(f"tool_use({b.get('name', '?')})")
+                        elif bt == "tool_result":
+                            c = b.get("content", "")
+                            clen = len(c) if isinstance(c, str) else len(c) if isinstance(c, list) else 0
+                            parts.append(f"tool_result({clen})")
+                        else:
+                            parts.append(bt)
+                    return f"{role}:[{','.join(parts)}]"
+                return f"{role}:?"
+
+            hash_pairs = [_hash_msg(m) for m in msgs]
+            ins_hashes = [h[0] for h in hash_pairs]
+            sort_hashes = [h[1] for h in hash_pairs]
+            previews = [h[2] for h in hash_pairs]
+            summaries = [_summarize(m) for m in msgs]
+            prev_pairs = self._cache_diff_state.get(chat_id, [])
+            prev_ins = [p[0] for p in prev_pairs]
+            prev_sort = [p[1] for p in prev_pairs]
+            prev_previews = [p[2] if len(p) > 2 else "(previous preview unavailable)" for p in prev_pairs]
+
+            if prev_pairs:
+                overlap = min(len(prev_pairs), len(hash_pairs))
+                # Check insertion-order (what the API actually sees)
+                ins_first_diff = None
+                for i in range(overlap):
+                    if prev_ins[i] != ins_hashes[i]:
+                        ins_first_diff = i
+                        break
+                # Check sorted/content (what we'd naively consider "the same")
+                sort_first_diff = None
+                for i in range(overlap):
+                    if prev_sort[i] != sort_hashes[i]:
+                        sort_first_diff = i
+                        break
+
+                if ins_first_diff is None and sort_first_diff is None:
+                    logger.info(
+                        f"🧊 CACHE-DIFF chat={chat_id}: prefix FULLY STABLE (ins+sort) over {overlap} msgs "
+                        f"(prev={len(prev_pairs)}, now={len(hash_pairs)}, appended={len(hash_pairs) - overlap}) ✓"
+                    )
+                elif ins_first_diff is not None and sort_first_diff is None:
+                    # CRITICAL: content equal but KEY ORDER diverged → API cache miss!
+                    logger.warning(
+                        f"🔥🔑 CACHE-DIFF chat={chat_id}: KEY-ORDER drift at msg[{ins_first_diff}] "
+                        f"(content identical, but dict insertion order differs → API sees different bytes)"
+                    )
+                elif ins_first_diff == sort_first_diff:
+                    logger.warning(
+                        f"🔥 CACHE-DIFF chat={chat_id}: prefix DIVERGES at msg[{ins_first_diff}] "
+                        f"(content+order both differ, overlap={overlap}, prev={len(prev_pairs)}, now={len(hash_pairs)})"
+                    )
+                else:
+                    logger.warning(
+                        f"🔥 CACHE-DIFF chat={chat_id}: ins_diff@{ins_first_diff}, sort_diff@{sort_first_diff} "
+                        f"(overlap={overlap})"
+                    )
+
+                if ins_first_diff is not None:
+                    lo = max(0, ins_first_diff - 1)
+                    hi = min(max(len(prev_pairs), len(hash_pairs)), ins_first_diff + 3)
+                    for i in range(lo, hi):
+                        pi = prev_ins[i] if i < len(prev_ins) else "----------"
+                        ps = prev_sort[i] if i < len(prev_sort) else "----------"
+                        ni = ins_hashes[i] if i < len(ins_hashes) else "----------"
+                        ns = sort_hashes[i] if i < len(sort_hashes) else "----------"
+                        sm = summaries[i] if i < len(summaries) else "(absent)"
+                        marker = "  " if pi == ni and ps == ns else "**"
+                        logger.warning(
+                            f"  {marker} msg[{i}]: ins prev={pi} now={ni} | sort prev={ps} now={ns} {sm}"
+                        )
+                    # Dump FULL JSON (insertion order) for diffing
+                    if ins_first_diff < len(prev_previews):
+                        logger.warning(
+                            f"  ** msg[{ins_first_diff}] PREV-INS-ORDER: "
+                            f"{prev_previews[ins_first_diff]}"
+                        )
+                    if ins_first_diff < len(previews):
+                        logger.warning(
+                            f"  ** msg[{ins_first_diff}] NOW-INS-ORDER: "
+                            f"{previews[ins_first_diff]}"
+                        )
+
+            self._cache_diff_state[chat_id] = hash_pairs
+            # Bound memory: keep only last ~20 chats
+            if len(self._cache_diff_state) > 20:
+                # drop oldest inserted (FIFO)
+                oldest = next(iter(self._cache_diff_state))
+                if oldest != chat_id:
+                    self._cache_diff_state.pop(oldest, None)
+        except Exception as e:
+            logger.debug(f"_log_message_hash_diff failed: {e}")
+
+    def _apply_cache_control(self, payload: dict, is_tool_loop: bool = False) -> None:
+        """Apply cache_control breakpoints to the payload right before sending to the API.
+
+        Called once before the initial request and once before each tool loop iteration.
+        Strips all existing cache_control markers first, then applies fresh ones
+        based on the current payload state and valve configuration.
+
+        Anthropic rules:
+        - Max 4 breakpoints, hierarchy: tools → system → messages
+        - Cache prefixes are cumulative (hash depends on all prior blocks)
+        - Never add cache_control to thinking/redacted_thinking blocks (API rejects extra fields)
+        - 20-block lookback window from each explicit breakpoint
+        - Minimum cacheable: 1024-4096 tokens depending on model
+        - Tool_result blocks CAN have cache_control (unless programmatic calling)
+        """
+        cache_level = self.valves.CACHE_CONTROL
+        if cache_level == "cache disabled":
+            return
+
+        # --- Step 1: Strip all existing cache_control from entire payload ---
+        for tool in payload.get("tools", []):
+            tool.pop("cache_control", None)
+        for block in payload.get("system", []):
+            block.pop("cache_control", None)
+        for msg in payload.get("messages", []):
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        block.pop("cache_control", None)
+
+        # --- Step 2: Cache tools (breakpoint 1) ---
+        # Always cache tools at every non-disabled level — tools rarely change
+        # and having a separate breakpoint ensures cache hits even when system/messages change.
+        cache_marker = self._cache_control_marker()
+
+        tools = payload.get("tools", [])
+        if tools:
+            # Find last non-deferred tool for the breakpoint
+            placed = False
+            for i in range(len(tools) - 1, -1, -1):
+                if not tools[i].get("defer_loading", False):
+                    tools[i]["cache_control"] = cache_marker
+                    placed = True
+                    break
+            if not placed:
+                # All deferred — cache the last one anyway
+                tools[-1]["cache_control"] = cache_marker
+
+        if cache_level == "cache tools array only":
+            return
+
+        # --- Step 3: Cache system prompt (breakpoint 2) ---
+        system = payload.get("system", [])
+        if system:
+            # Find last text block with content
+            for i in range(len(system) - 1, -1, -1):
+                block = system[i]
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    block["cache_control"] = cache_marker
+                    break
+
+        if cache_level == "cache tools array and system prompt":
+            return
+
+        # --- Step 4: Cache messages (breakpoint 3) ---
+        # "cache tools array, system prompt and messages"
+        messages = payload.get("messages", [])
+        if not messages:
+            return
+
+        if is_tool_loop:
+            # During tool loops: cache the last tool_result in the newest user message.
+            # This caches the entire conversation (tools + system + all messages up to here)
+            # so the next iteration gets a cache hit on everything.
+            # EXCEPTION: Programmatic tool calling — API rejects cache_control on
+            # tool_result blocks routed through code_execution.
+            if self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+                # With programmatic calling, cache the last assistant message block instead
+                # (thinking blocks excluded — find last text or tool_use block)
+                for msg in reversed(messages):
+                    if msg.get("role") == "assistant":
+                        self._place_cache_on_last_cacheable_block(msg.get("content", []))
+                        break
+            else:
+                # Standard tool loop: cache the last user message block (tool_result)
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", [])
+                        if content:
+                            # tool_result blocks are cacheable
+                            content[-1]["cache_control"] = cache_marker
+                        break
+        else:
+            # Initial request: cache the last stable user message
+            self._cache_last_stable_message(messages)
+
+    def _place_cache_on_last_cacheable_block(self, content_blocks: list) -> None:
+        """Add cache_control to the last block that isn't thinking/redacted_thinking
+        or a tool_use called by code execution (API rejects cache_control on those)."""
+        if not content_blocks:
+            return
+        for i in range(len(content_blocks) - 1, -1, -1):
+            block = content_blocks[i]
+            if isinstance(block, dict):
+                btype = block.get("type")
+                if btype in ("thinking", "redacted_thinking"):
+                    continue
+                # tool_use blocks called by code_execution cannot have cache_control
+                if btype == "tool_use" and block.get("caller"):
+                    continue
+                block["cache_control"] = self._cache_control_marker()
+                return
+
+    def _cache_last_stable_message(self, messages: list) -> None:
+        """Place cache breakpoint on the last stable message, avoiding RAG content
+        and thinking/redacted_thinking blocks.
+
+        RAG content changes per request (injected by OpenWebUI), so caching it
+        would create a new cache entry every time, wasting cache writes.
+        When RAG is detected in the last message, we cache the second-to-last instead.
+        """
+        if not messages:
+            return
+
+        last_msg = messages[-1]
+        last_content = last_msg.get("content", [])
+
+        # Detect RAG content in last message
+        has_rag = False
+        if isinstance(last_content, list):
+            for block in last_content:
+                if block.get("type") == "text":
+                    text = block.get("text", "")
+                    if "<context>" in text or ("### Task:" in text and "<source" in text):
+                        has_rag = True
+                        break
+
+        target_idx = -2 if (has_rag and len(messages) >= 2) else -1
+        target_msg = messages[target_idx]
+        target_content = target_msg.get("content", [])
+
+        self._place_cache_on_last_cacheable_block(target_content)
 
     async def _get_pdf_base64_from_file_id(self, file_id: str) -> Optional[tuple[str, str]]:
         """
@@ -1215,24 +3371,107 @@ class Pipe:
         self,
         __files__: Optional[List[Dict[str, Any]]],
         previous_marker_metadata: List[str],
-    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        processed_messages: List[Dict[str, Any]],
+        raw_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[Dict[int, List[Dict[str, Any]]], List[str]]:
         """
         Extract PDFs from __files__ that should be uploaded as native documents.
 
+        Each PDF is anchored to the user-message it was first attached to so that
+        the byte-prefix of the conversation stays cache-stable across turns. New
+        PDFs are anchored to the most recent user message; PDFs that were already
+        anchored on previous turns are restored at the same anchor index by
+        re-loading the base64 from disk.
+
         Args:
-            __files__: List of file objects from OpenWebUI
-            previous_marker_metadata: List of metadata strings from previous messages
+            __files__: List of file objects from OpenWebUI (current turn).
+            previous_marker_metadata: Marker entries extracted from the prior
+                assistant message. Each entry is "msg_idx:id:url_encoded_value".
+            processed_messages: Full message list — used to count user messages
+                and decide where to anchor new PDFs.
+            raw_messages: Original OpenWebUI messages. Historical user messages
+                can carry a `files` list, which is the most reliable source for
+                restoring the original PDF attachment turn when OpenWebUI keeps
+                passing old full-context files in `__files__`.
 
         Returns:
-            tuple: (List of document blocks for Anthropic API, List of metadata markers for processed PDFs)
+            tuple:
+              - dict[int, list[dict]] mapping user_msg_index → list of document
+                blocks to prepend to that message's content.
+              - list of metadata markers (already formatted strings) that should
+                be appended to the next assistant text response.
         """
-        pdf_documents = []
-        markers = []
+        blocks_by_user_msg: Dict[int, List[Dict[str, Any]]] = {}
+        markers: List[str] = []
 
-        if not __files__ or not FILES_AVAILABLE:
-            return pdf_documents, markers
+        if not FILES_AVAILABLE:
+            return blocks_by_user_msg, markers
 
-        for file in __files__:
+        # Build a lookup of (file_id → msg_idx) for PDFs already anchored on
+        # previous turns. Marker payload for "pdf" is "file_id:filename".
+        prior_pdf_msg_idx: Dict[str, int] = {}
+        prior_pdf_filename: Dict[str, str] = {}
+        for entry in previous_marker_metadata:
+            parts = entry.split(":", 2)
+            if len(parts) < 3 or parts[1] != "pdf":
+                continue
+            try:
+                msg_idx = int(parts[0])
+            except ValueError:
+                continue
+            decoded = unquote(parts[2])
+            file_id_part, _, fname_part = decoded.partition(":")
+            if file_id_part:
+                prior_pdf_msg_idx[file_id_part] = msg_idx
+                if fname_part:
+                    prior_pdf_filename[file_id_part] = fname_part
+
+        # Index of the latest user-message — anchor for newly attached PDFs.
+        user_msg_count = sum(1 for m in processed_messages if m.get("role") == "user")
+        latest_user_msg_idx = max(0, user_msg_count - 1)
+
+        def _collect_file_ids(value: Any) -> List[str]:
+            ids: List[str] = []
+            if isinstance(value, dict):
+                for key in ("id", "file_id"):
+                    file_id_value = value.get(key)
+                    if isinstance(file_id_value, str) and file_id_value:
+                        ids.append(file_id_value)
+                for key in ("file", "meta", "metadata"):
+                    nested = value.get(key)
+                    if nested is not None:
+                        ids.extend(_collect_file_ids(nested))
+            elif isinstance(value, list):
+                for item in value:
+                    ids.extend(_collect_file_ids(item))
+            return ids
+
+        # OpenWebUI may include all historical chat files in __files__ on every
+        # turn. Preserve cache stability by anchoring each file to the user
+        # message that owns it in the raw chat history, not to the latest query.
+        raw_file_msg_idx: Dict[str, int] = {}
+        if raw_messages:
+            raw_user_msg_idx = -1
+            for raw_msg in raw_messages:
+                if not isinstance(raw_msg, dict) or raw_msg.get("role") != "user":
+                    continue
+                raw_user_msg_idx += 1
+                for file_id in _collect_file_ids(raw_msg.get("files")):
+                    raw_file_msg_idx.setdefault(file_id, raw_user_msg_idx)
+
+        # Collect every PDF that needs a native document block this turn, keyed
+        # by file_id → (anchor_msg_idx). Two sources are merged:
+        #   1) the current turn's __files__ (authoritative for new uploads and
+        #      filenames), and
+        #   2) PDFs anchored on previous turns via persisted markers.
+        # OpenWebUI does NOT reliably re-send historical full-context files in
+        # __files__ on follow-up turns. Without (2) the native document block
+        # silently vanishes from the cache prefix on every later turn, which
+        # both hides the PDF from the model and forces a full cache rebuild.
+        pdf_anchor: Dict[str, int] = {}
+        pdf_filename: Dict[str, str] = {}
+
+        for file in __files__ or []:
             # Only process files with 'full' context (not RAG chunks)
             if file.get("type") != "file" or file.get("context") != "full":
                 continue
@@ -1241,40 +3480,59 @@ class Pipe:
             if not file_id:
                 continue
 
-            # Check if it's a PDF
+            # PDF only — non-PDF native uploads aren't supported here
             file_name = file.get("name", "")
             if not file_name.lower().endswith(".pdf"):
                 continue
 
-            # Check if this file was already processed (by checking file_id in metadata)
-            if any(file_id in metadata for metadata in previous_marker_metadata):
-                logger.debug(f"Skipping already processed PDF: {file_name}")
+            # Decide which user message this PDF anchors to. Priority:
+            # 1) persisted marker from earlier pipe turns,
+            # 2) OpenWebUI raw message.files ownership,
+            # 3) latest user message for genuinely new files when no ownership
+            #    metadata is available.
+            pdf_anchor[file_id] = prior_pdf_msg_idx.get(
+                file_id, raw_file_msg_idx.get(file_id, latest_user_msg_idx)
+            )
+            pdf_filename[file_id] = file_name
+
+        # Re-inject PDFs known only from prior-turn markers (OpenWebUI dropped
+        # them from __files__ this turn). Keep their original anchor index so
+        # the byte-prefix stays identical across turns.
+        for file_id, msg_idx in prior_pdf_msg_idx.items():
+            if file_id in pdf_anchor:
                 continue
+            pdf_anchor[file_id] = msg_idx
+            if file_id in prior_pdf_filename:
+                pdf_filename[file_id] = prior_pdf_filename[file_id]
 
-            # Get base64 encoded PDF
+        for file_id, anchor_msg_idx in pdf_anchor.items():
+            # Re-load base64 every turn (Anthropic native PDF blocks have no
+            # file-id reuse; the bytes must be present for the cache prefix to
+            # remain stable)
             result = await self._get_pdf_base64_from_file_id(file_id)
-            if result:
-                encoded_data, filename = result
-                pdf_documents.append(
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": encoded_data,
-                        },
-                        "title": filename,
-                    }
-                )
-                markers.append(
-                    self._create_metadata_marker("pdf", f"{file_id}:{filename}")
-                )
+            if not result:
+                continue
+            encoded_data, filename = result
+            title = pdf_filename.get(file_id) or filename
 
-        return pdf_documents, markers
+            blocks_by_user_msg.setdefault(anchor_msg_idx, []).append(
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": encoded_data,
+                    },
+                    "title": title,
+                }
+            )
+            markers.append(
+                self._create_metadata_marker(
+                    "pdf", f"{file_id}:{title}", messagenum=anchor_msg_idx
+                )
+            )
 
-    # =========================================================================
-    # RAG (RETRIEVAL-AUGMENTED GENERATION) HANDLING
-    # =========================================================================
+        return blocks_by_user_msg, markers
 
     def _remove_rag_message(
         self,
@@ -1439,1037 +3697,6 @@ class Pipe:
                 processed_messages[i]["content"] = new_content
                 return  # Only process the first matching user message
 
-    # =========================================================================
-    # FILES API (UPLOAD, DOWNLOAD, DEDUPLICATION)
-    # =========================================================================
-
-    async def _generate_file_download_link(
-        self,
-        file_id: str,
-        api_key: str,
-        user_id: str,
-    ) -> str:
-        """Download file from Anthropic Files API, save to OpenWebUI, return markdown link."""
-        try:
-            from anthropic import AsyncAnthropic
-            import hashlib
-            import uuid
-
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
-
-            # Get file metadata first
-            file_meta = await client.beta.files.retrieve_metadata(file_id=file_id)
-            filename = getattr(file_meta, "filename", file_id) or file_id
-
-            # Download file content
-            response = await client.beta.files.download(file_id=file_id)
-            content = response.read()
-
-            # Save to OpenWebUI storage
-            owui_file_id = str(uuid.uuid4())
-            storage_filename = f"code_exec_{owui_file_id}_{filename}"
-            file_path = Storage.upload_file(content, storage_filename)
-
-            # Create OpenWebUI file record
-            file_hash = hashlib.sha256(content).hexdigest()
-            await Files.insert_new_file(
-                user_id=user_id,
-                form_data=type("FileForm", (), {
-                    "model_dump": lambda self_: {
-                        "id": owui_file_id,
-                        "hash": file_hash,
-                        "filename": filename,
-                        "path": file_path,
-                        "data": {},
-                        "meta": {
-                            "content_type": getattr(file_meta, "mime_type", "application/octet-stream"),
-                            "size": len(content),
-                            "source": "anthropic_code_execution",
-                            "anthropic_file_id": file_id,
-                        },
-                    }
-                })(),
-            )
-
-            # Return markdown download link
-            base_url = os.environ.get("WEBUI_URL", "")
-            download_url = f"{base_url}/api/v1/files/{owui_file_id}/content"
-            return f"[📥 {filename}]({download_url})"
-
-        except Exception as e:
-            logger.error(f"Failed to download file {file_id}: {e}")
-            return f"⚠️ Failed to download file {file_id}"
-
-    async def _process_files_api_data(
-        self,
-        __files__: Optional[List[Dict[str, Any]]],
-        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
-        processed_messages: List[Dict[str, Any]],
-    ) -> tuple[Dict[int, List[Dict[str, Any]]], List[str]]:
-        """
-        Process files for Anthropic Files API using container_upload.
-
-        Uploads files to Anthropic and caches the file_id in OpenWebUI file metadata.
-        Tracks which user message each file belongs to for correct positioning.
-
-        Returns:
-            tuple: (
-                Dict mapping user_msg_number → list of container_upload blocks,
-                List of filenames that were processed (for RAG source removal)
-            )
-        """
-        blocks_by_user_msg: Dict[int, List[Dict[str, Any]]] = {}
-        processed_filenames: List[str] = []
-
-        if not __files__ or not FILES_AVAILABLE:
-            return blocks_by_user_msg, processed_filenames
-
-        import io
-
-        # Count user messages to determine "current" position for new files
-        user_msg_count = sum(1 for m in processed_messages if m["role"] == "user")
-        current_user_msg_num = max(0, user_msg_count - 1)  # 0-based
-
-        client = None
-        try:
-            from anthropic import AsyncAnthropic
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY, **({"base_url": base_url} if base_url else {}))
-        except ImportError:
-            logger.warning("Anthropic SDK not available for file upload")
-            return blocks_by_user_msg, processed_filenames
-
-        for file in __files__:
-            # Skip non-file entries (RAG chunks, knowledge base refs, etc.)
-            if (
-                file.get("type") != "file"
-                or file.get("context") != "full"
-                or file.get("collection_name")
-                or file.get("docs")
-            ):
-                continue
-
-            file_id_owui = file.get("id")
-            file_name = file.get("name", "unknown")
-            if not file_id_owui:
-                continue
-
-            # Skip images — they use Vision (base64/URL), not Files API
-            content_type = file.get("content_type", "")
-            if not content_type:
-                # Fallback: check OpenWebUI file meta for content_type
-                file_record_check = await Files.get_file_by_id(file_id_owui)
-                if file_record_check and file_record_check.meta:
-                    content_type = file_record_check.meta.get("content_type", "")
-            if content_type and content_type.startswith("image/"):
-                logger.debug(f"Skipping image file for Files API: {file_name} ({content_type})")
-                continue
-
-            # Look up OpenWebUI file record for cached anthropic_file_id
-            file_record = await Files.get_file_by_id(file_id_owui)
-            if not file_record:
-                logger.warning(f"File not found in DB: {file_id_owui}")
-                continue
-
-            meta = file_record.meta or {}
-            anthropic_file_id = meta.get("anthropic_file_id")
-            msg_num = meta.get("anthropic_file_msg_idx")
-
-            if anthropic_file_id:
-                # Cached — reuse without re-uploading
-                if msg_num is None:
-                    msg_num = current_user_msg_num
-                logger.debug(f"♻️ Reusing cached file {file_name} → {anthropic_file_id} (msg {msg_num})")
-            else:
-                # New file — upload to Anthropic
-                try:
-                    file_path = Storage.get_file(file_record.path)
-                    if not file_path or not Path(file_path).is_file():
-                        logger.warning(f"File not on disk: {file_id_owui}")
-                        continue
-
-                    with open(file_path, "rb") as f:
-                        file_content = f.read()
-
-                    await self.emit_event(
-                        {
-                            "type": "status",
-                            "data": {"description": f"☁️ Uploading {file_name}...", "done": False},
-                        },
-                        __event_emitter__,
-                    )
-
-                    upload_result = await client.beta.files.upload(
-                        file=(file_name, io.BytesIO(file_content)),
-                    )
-                    anthropic_file_id = upload_result.id
-                    msg_num = current_user_msg_num
-
-                    # Cache in OpenWebUI file metadata
-                    await Files.update_file_metadata_by_id(file_id_owui, {
-                        "anthropic_file_id": anthropic_file_id,
-                        "anthropic_file_msg_idx": msg_num,
-                    })
-
-                    logger.info(f"☁️ Uploaded {file_name} → {anthropic_file_id} (msg {msg_num})")
-
-                    await self.emit_event(
-                        {
-                            "type": "status",
-                            "data": {"description": f"☁️ Uploaded {file_name}", "done": True},
-                        },
-                        __event_emitter__,
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to upload {file_name}: {e}")
-                    await self.emit_event(
-                        {
-                            "type": "notification",
-                            "data": {"type": "warning", "content": f"Failed to upload {file_name}: {str(e)[:100]}"},
-                        },
-                        __event_emitter__,
-                    )
-                    continue
-
-            # Group container_upload block by user message number
-            if msg_num not in blocks_by_user_msg:
-                blocks_by_user_msg[msg_num] = []
-            blocks_by_user_msg[msg_num].append({
-                "type": "container_upload",
-                "file_id": anthropic_file_id,
-            })
-            processed_filenames.append(file_name)
-
-        return blocks_by_user_msg, processed_filenames
-
-    # =========================================================================
-    # CACHE CONTROL
-    # =========================================================================
-
-    def _cache_control_marker(self) -> dict:
-        """Return the cache_control dict based on the CACHE_TTL valve setting."""
-        marker = {"type": "ephemeral"}
-        if self.valves.CACHE_TTL == "1 hour":
-            marker["ttl"] = "1h"
-        return marker
-
-    @staticmethod
-    def _strip_payload(payload: dict, max_str: int = 20) -> dict:
-        """Return a copy of the outgoing Anthropic payload with *minimal*
-        structural changes, safe for debug logging.
-
-        Only two things change:
-          1. ``tools`` is replaced with a small summary (count + names +
-             indices carrying cache_control).
-          2. Every string value reachable inside ``messages`` is truncated to
-             ``max_str`` chars + ``…[Nc]`` length marker.
-
-        Everything else — key order, whitespace inside non-messages strings,
-        `system`, `cache_control`, booleans, numbers, None values, extra
-        top-level fields — is left **byte-for-byte** untouched so that two
-        consecutive dumps can be diffed to locate cache-invalidating drift
-        (double newlines, missing spaces, re-ordered keys, etc).
-        """
-        def _clip(s):
-            if isinstance(s, str) and len(s) > max_str:
-                import hashlib as _hl
-                _h = _hl.sha1(s.encode("utf-8", "replace")).hexdigest()[:8]
-                return f"{s[:max_str]}…[{len(s)}c#{_h}]"
-            return s
-
-        def _walk(node):
-            if isinstance(node, dict):
-                return {k: _walk(v) for k, v in node.items()}
-            if isinstance(node, list):
-                return [_walk(v) for v in node]
-            if isinstance(node, str):
-                return _clip(node)
-            return node
-
-        stripped: dict = {}
-        for k, v in payload.items():
-            if k == "tools":
-                tools = v or []
-                stripped["tools"] = {
-                    "__tools_count__": len(tools),
-                    "names": [
-                        (t.get("name") or t.get("type") or "?")
-                        for t in tools if isinstance(t, dict)
-                    ],
-                    "cache_control_idx": [
-                        i for i, t in enumerate(tools)
-                        if isinstance(t, dict) and "cache_control" in t
-                    ],
-                }
-            elif k == "messages":
-                stripped["messages"] = _walk(v)
-            else:
-                stripped[k] = v
-        return stripped
-
-    def _log_message_hash_diff(self, chat_id: Optional[str], payload: dict) -> None:
-        """Compare the current outgoing payload.messages[] against the previous
-        request for the same chat_id. Log first divergence index + per-message
-        hash table so we can pinpoint which assistant/user message mutated
-        between turns and broke the Anthropic prompt cache prefix.
-
-        Uses hashlib.sha1 on ``json.dumps(sort_keys=True, separators=(",", ":"))``
-        of each message (minus cache_control markers, which legitimately move).
-        """
-        if not chat_id:
-            return
-        try:
-            msgs = payload.get("messages", []) or []
-
-            def _hash_msg(m: dict) -> tuple[str, str]:
-                """Return (insertion_order_hash, sorted_hash). The SDK sends
-                dicts in Python insertion order, so insertion_order_hash is
-                what the API actually sees for cache purposes. sorted_hash
-                tells us whether the *content* matches regardless of order."""
-                import hashlib
-                try:
-                    canon_ins = json.dumps(m, sort_keys=False, separators=(",", ":"), ensure_ascii=False,
-                                           default=lambda o: repr(o))
-                except Exception:
-                    canon_ins = repr(m)
-                try:
-                    def _strip(obj):
-                        if isinstance(obj, dict):
-                            return {k: _strip(v) for k, v in obj.items() if k != "cache_control"}
-                        if isinstance(obj, list):
-                            return [_strip(v) for v in obj]
-                        return obj
-                    canon_sorted = json.dumps(_strip(m), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                                              default=lambda o: repr(o))
-                except Exception:
-                    canon_sorted = repr(m)
-                ins_h = hashlib.sha1(canon_ins.encode("utf-8")).hexdigest()[:10]
-                sort_h = hashlib.sha1(canon_sorted.encode("utf-8")).hexdigest()[:10]
-                return (ins_h, sort_h)
-
-            def _summarize(m: dict) -> str:
-                role = m.get("role", "?")
-                content = m.get("content", "")
-                if isinstance(content, str):
-                    return f"{role}:text({len(content)}c)"
-                if isinstance(content, list):
-                    parts = []
-                    for b in content:
-                        if not isinstance(b, dict):
-                            parts.append(type(b).__name__)
-                            continue
-                        bt = b.get("type", "?")
-                        if bt == "text":
-                            parts.append(f"text({len(b.get('text', ''))}c)")
-                        elif bt == "tool_use":
-                            parts.append(f"tool_use({b.get('name', '?')})")
-                        elif bt == "tool_result":
-                            c = b.get("content", "")
-                            clen = len(c) if isinstance(c, str) else len(c) if isinstance(c, list) else 0
-                            parts.append(f"tool_result({clen})")
-                        else:
-                            parts.append(bt)
-                    return f"{role}:[{','.join(parts)}]"
-                return f"{role}:?"
-
-            hash_pairs = [_hash_msg(m) for m in msgs]
-            ins_hashes = [h[0] for h in hash_pairs]
-            sort_hashes = [h[1] for h in hash_pairs]
-            summaries = [_summarize(m) for m in msgs]
-            prev_pairs = self._cache_diff_state.get(chat_id, [])
-            prev_ins = [p[0] for p in prev_pairs]
-            prev_sort = [p[1] for p in prev_pairs]
-
-            if prev_pairs:
-                overlap = min(len(prev_pairs), len(hash_pairs))
-                # Check insertion-order (what the API actually sees)
-                ins_first_diff = None
-                for i in range(overlap):
-                    if prev_ins[i] != ins_hashes[i]:
-                        ins_first_diff = i
-                        break
-                # Check sorted/content (what we'd naively consider "the same")
-                sort_first_diff = None
-                for i in range(overlap):
-                    if prev_sort[i] != sort_hashes[i]:
-                        sort_first_diff = i
-                        break
-
-                if ins_first_diff is None and sort_first_diff is None:
-                    logger.info(
-                        f"🧊 CACHE-DIFF chat={chat_id}: prefix FULLY STABLE (ins+sort) over {overlap} msgs "
-                        f"(prev={len(prev_pairs)}, now={len(hash_pairs)}, appended={len(hash_pairs) - overlap}) ✓"
-                    )
-                elif ins_first_diff is not None and sort_first_diff is None:
-                    # CRITICAL: content equal but KEY ORDER diverged → API cache miss!
-                    logger.warning(
-                        f"🔥🔑 CACHE-DIFF chat={chat_id}: KEY-ORDER drift at msg[{ins_first_diff}] "
-                        f"(content identical, but dict insertion order differs → API sees different bytes)"
-                    )
-                elif ins_first_diff == sort_first_diff:
-                    logger.warning(
-                        f"🔥 CACHE-DIFF chat={chat_id}: prefix DIVERGES at msg[{ins_first_diff}] "
-                        f"(content+order both differ, overlap={overlap}, prev={len(prev_pairs)}, now={len(hash_pairs)})"
-                    )
-                else:
-                    logger.warning(
-                        f"🔥 CACHE-DIFF chat={chat_id}: ins_diff@{ins_first_diff}, sort_diff@{sort_first_diff} "
-                        f"(overlap={overlap})"
-                    )
-
-                if ins_first_diff is not None:
-                    lo = max(0, ins_first_diff - 1)
-                    hi = min(max(len(prev_pairs), len(hash_pairs)), ins_first_diff + 3)
-                    for i in range(lo, hi):
-                        pi = prev_ins[i] if i < len(prev_ins) else "----------"
-                        ps = prev_sort[i] if i < len(prev_sort) else "----------"
-                        ni = ins_hashes[i] if i < len(ins_hashes) else "----------"
-                        ns = sort_hashes[i] if i < len(sort_hashes) else "----------"
-                        sm = summaries[i] if i < len(summaries) else "(absent)"
-                        marker = "  " if pi == ni and ps == ns else "**"
-                        logger.warning(
-                            f"  {marker} msg[{i}]: ins prev={pi} now={ni} | sort prev={ps} now={ns} {sm}"
-                        )
-                    # Dump FULL JSON (insertion order) for diffing
-                    try:
-                        if ins_first_diff < len(msgs):
-                            canon_ins = json.dumps(msgs[ins_first_diff], sort_keys=False, separators=(",", ":"), ensure_ascii=False)
-                            logger.warning(
-                                f"  ** msg[{ins_first_diff}] NOW-INS-ORDER ({len(canon_ins)}c): "
-                                f"{canon_ins[:4000]}{'...(truncated)' if len(canon_ins) > 4000 else ''}"
-                            )
-                    except Exception:
-                        pass
-
-            self._cache_diff_state[chat_id] = hash_pairs
-            # Bound memory: keep only last ~20 chats
-            if len(self._cache_diff_state) > 20:
-                # drop oldest inserted (FIFO)
-                oldest = next(iter(self._cache_diff_state))
-                if oldest != chat_id:
-                    self._cache_diff_state.pop(oldest, None)
-        except Exception as e:
-            logger.debug(f"_log_message_hash_diff failed: {e}")
-
-    def _apply_cache_control(self, payload: dict, is_tool_loop: bool = False) -> None:
-        """Apply cache_control breakpoints to the payload right before sending to the API.
-
-        Called once before the initial request and once before each tool loop iteration.
-        Strips all existing cache_control markers first, then applies fresh ones
-        based on the current payload state and valve configuration.
-
-        Anthropic rules:
-        - Max 4 breakpoints, hierarchy: tools → system → messages
-        - Cache prefixes are cumulative (hash depends on all prior blocks)
-        - Never add cache_control to thinking/redacted_thinking blocks (API rejects extra fields)
-        - 20-block lookback window from each explicit breakpoint
-        - Minimum cacheable: 1024-4096 tokens depending on model
-        - Tool_result blocks CAN have cache_control (unless programmatic calling)
-        """
-        cache_level = self.valves.CACHE_CONTROL
-        if cache_level == "cache disabled":
-            return
-
-        # --- Step 1: Strip all existing cache_control from entire payload ---
-        for tool in payload.get("tools", []):
-            tool.pop("cache_control", None)
-        for block in payload.get("system", []):
-            block.pop("cache_control", None)
-        for msg in payload.get("messages", []):
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        block.pop("cache_control", None)
-
-        # --- Step 2: Cache tools (breakpoint 1) ---
-        # Always cache tools at every non-disabled level — tools rarely change
-        # and having a separate breakpoint ensures cache hits even when system/messages change.
-        cache_marker = self._cache_control_marker()
-
-        tools = payload.get("tools", [])
-        if tools:
-            # Find last non-deferred tool for the breakpoint
-            placed = False
-            for i in range(len(tools) - 1, -1, -1):
-                if not tools[i].get("defer_loading", False):
-                    tools[i]["cache_control"] = cache_marker
-                    placed = True
-                    break
-            if not placed:
-                # All deferred — cache the last one anyway
-                tools[-1]["cache_control"] = cache_marker
-
-        if cache_level == "cache tools array only":
-            return
-
-        # --- Step 3: Cache system prompt (breakpoint 2) ---
-        system = payload.get("system", [])
-        if system:
-            # Find last text block with content
-            for i in range(len(system) - 1, -1, -1):
-                block = system[i]
-                if block.get("type") == "text" and block.get("text", "").strip():
-                    block["cache_control"] = cache_marker
-                    break
-
-        if cache_level == "cache tools array and system prompt":
-            return
-
-        # --- Step 4: Cache messages (breakpoint 3) ---
-        # "cache tools array, system prompt and messages"
-        messages = payload.get("messages", [])
-        if not messages:
-            return
-
-        if is_tool_loop:
-            # During tool loops: cache the last tool_result in the newest user message.
-            # This caches the entire conversation (tools + system + all messages up to here)
-            # so the next iteration gets a cache hit on everything.
-            # EXCEPTION: Programmatic tool calling — API rejects cache_control on
-            # tool_result blocks routed through code_execution.
-            if self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
-                # With programmatic calling, cache the last assistant message block instead
-                # (thinking blocks excluded — find last text or tool_use block)
-                for msg in reversed(messages):
-                    if msg.get("role") == "assistant":
-                        self._place_cache_on_last_cacheable_block(msg.get("content", []))
-                        break
-            else:
-                # Standard tool loop: cache the last user message block (tool_result)
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", [])
-                        if content:
-                            # tool_result blocks are cacheable
-                            content[-1]["cache_control"] = cache_marker
-                        break
-        else:
-            # Initial request: cache the last stable user message
-            self._cache_last_stable_message(messages)
-
-    def _place_cache_on_last_cacheable_block(self, content_blocks: list) -> None:
-        """Add cache_control to the last block that isn't thinking/redacted_thinking
-        or a tool_use called by code execution (API rejects cache_control on those)."""
-        if not content_blocks:
-            return
-        for i in range(len(content_blocks) - 1, -1, -1):
-            block = content_blocks[i]
-            if isinstance(block, dict):
-                btype = block.get("type")
-                if btype in ("thinking", "redacted_thinking"):
-                    continue
-                # tool_use blocks called by code_execution cannot have cache_control
-                if btype == "tool_use" and block.get("caller"):
-                    continue
-                block["cache_control"] = self._cache_control_marker()
-                return
-
-    def _cache_last_stable_message(self, messages: list) -> None:
-        """Place cache breakpoint on the last stable message, avoiding RAG content
-        and thinking/redacted_thinking blocks.
-
-        RAG content changes per request (injected by OpenWebUI), so caching it
-        would create a new cache entry every time, wasting cache writes.
-        When RAG is detected in the last message, we cache the second-to-last instead.
-        """
-        if not messages:
-            return
-
-        last_msg = messages[-1]
-        last_content = last_msg.get("content", [])
-
-        # Detect RAG content in last message
-        has_rag = False
-        if isinstance(last_content, list):
-            for block in last_content:
-                if block.get("type") == "text":
-                    text = block.get("text", "")
-                    if "<context>" in text or ("### Task:" in text and "<source" in text):
-                        has_rag = True
-                        break
-
-        target_idx = -2 if (has_rag and len(messages) >= 2) else -1
-        target_msg = messages[target_idx]
-        target_content = target_msg.get("content", [])
-
-        self._place_cache_on_last_cacheable_block(target_content)
-
-    # =========================================================================
-    # PAYLOAD BUILDING & MESSAGE/TOOL CONVERSION
-    # =========================================================================
-
-    async def _create_payload(
-        self,
-        body: Dict,
-        __metadata__: dict[str, Any],
-        __user__: Dict[str, Any],
-        __tools__: Optional[Dict[str, Dict[str, Any]]],
-        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
-        __files__: Optional[List[Dict[str, Any]]] = None,
-    ) -> tuple[dict, dict, List[str]]:
-
-        ## General payload creation
-        actual_model_name = body["model"].split("/")[-1]
-        model_info = self.get_model_info(actual_model_name)
-        max_tokens_limit = model_info["max_tokens"]
-        requested_max_tokens = body.get("max_tokens", max_tokens_limit)
-        max_tokens = min(requested_max_tokens, max_tokens_limit)
-        payload: dict[str, Any] = {
-            "model": actual_model_name,
-            "max_tokens": max_tokens,
-            "stream": body.get("stream", True),
-            "metadata": body.get("metadata", {}),
-        }
-        # Opus 4.7 and the 4.6+ adaptive-thinking family reject sampling params
-        # (temperature / top_p / top_k) — API returns 400. Strip them there.
-        # Heuristic: models that support adaptive thinking (Opus 4.6, Sonnet 4.6,
-        # Opus 4.7) do not accept these fields when adaptive is enabled. On Opus
-        # 4.7 they are rejected unconditionally. Safe to skip for the whole set.
-        _strip_sampling = bool(model_info.get("supports_adaptive_thinking"))
-        if not _strip_sampling and body.get("temperature") is not None:
-            payload["temperature"] = float(body.get("temperature", 0))
-        if not _strip_sampling and body.get("top_k") is not None:
-            payload["top_k"] = float(body.get("top_k", 0))
-        if not _strip_sampling and body.get("top_p") is not None:
-            payload["top_p"] = float(body.get("top_p", 0))
-
-        # Add data residency if set to US (1.1x token cost)
-        if self.valves.DATA_RESIDENCY == "us":
-            payload["inference_geo"] = "us"
-
-        # Add Fast Mode if enabled and model supports it (Opus 4.6 / 4.7)
-        if self.valves.ENABLE_FAST_MODE and model_info.get("supports_fast_mode", False):
-            payload["speed"] = "fast"
-            logger.debug("Fast Mode enabled for this request")
-            
-        # Handle "Effort" parameter (maps from OpenWebUI's reasoning_effort or user valves)
-        # Effort works differently based on model capabilities
-        effort_config = None
-        effective_effort = None
-
-        if model_info["supports_effort"]:
-            # Clamp an effort value to what the current model supports.
-            #   xhigh -> high if the model doesn't advertise xhigh (Opus 4.7 only)
-            #   max   -> high if the model doesn't advertise max   (Opus 4.7/4.6, Sonnet 4.6)
-            def _clamp_effort(value: str) -> str:
-                if value == "xhigh" and not model_info.get("supports_effort_xhigh"):
-                    return "high"
-                if value == "max" and not model_info.get("supports_effort_max"):
-                    return "high"
-                return value
-
-            body_effort = body.get("reasoning_effort")
-            if body_effort in ("low", "medium", "high", "xhigh", "max"):
-                effective_effort = _clamp_effort(body_effort)
-            else:
-                effective_effort = _clamp_effort(__user__["valves"].EFFORT)
-
-            effort_config = {"effort": effective_effort}
-            logger.debug(f"Effort level set to: {effective_effort}")
-
-        # Handle Thinking
-        enable_thinking = __user__["valves"].ENABLE_THINKING or __metadata__.get(
-            "anthropic_thinking", False
-        )
-        if enable_thinking and model_info["supports_thinking"]:
-            # Opus 4.6 (supports adaptive thinking) uses effort as the control
-            if model_info["supports_adaptive_thinking"]:
-                thinking_config = {"type": "adaptive"}
-            else:
-                user_budget = __user__["valves"].THINKING_BUDGET_TOKENS
-                max_tokens = min(
-                    body.get("max_tokens", model_info["max_tokens"]),
-                    model_info["max_tokens"],
-                )
-                context_limit = model_info.get("context_length", 200000)
-
-                # For Claude 4 models with interleaved thinking+tools, allow up to context window
-                if model_info.get("supports_thinking") and model_info.get(
-                    "supports_programmatic_calling"
-                ):
-                    thinking_budget = min(user_budget, context_limit)
-                else:
-                    # budget_tokens must be < max_tokens
-                    thinking_budget = (
-                        min(user_budget, max_tokens - 1) if max_tokens > 1 else 1
-                    )
-                thinking_config = {
-                    "type": "enabled",
-                    "budget_tokens": thinking_budget,
-                }
-                logger.debug(
-                    f"Using manual thinking with budget_tokens: {thinking_budget}, effort: {effective_effort}"
-                )
-
-            # Add display mode if not default
-            thinking_display = __user__["valves"].THINKING_DISPLAY
-            if thinking_display == "omitted":
-                thinking_config["display"] = "omitted"
-
-            payload["thinking"] = thinking_config
-
-        # Check if user has memory system enabled
-        user_has_memory_system_enabled = False
-        try:
-            user_has_memory_system_enabled = (
-                __user__.get("settings", {}).get("ui", {}).get("memory", False)
-            )
-        except (AttributeError, TypeError):
-            pass
-        logger.debug(f"Memory system enabled: {user_has_memory_system_enabled}")
-
-        raw_messages = body.get("messages", []) or []
-
-        system_messages, processed_messages, previous_marker_metadata = (
-            self._convert_messages_to_claude_format(
-                raw_messages, user_has_memory_system_enabled
-            )
-        )
-        new_marker_metadata = ""
-
-        # Extract container_id from previous metadata markers for multi-turn container reuse
-        previous_container_id = None
-        for metadata_entry in previous_marker_metadata:
-            # Format: "N:container_id:ENCODED_VALUE"
-            parts = metadata_entry.split(":", 2)
-            if len(parts) >= 3 and parts[1] == "container_id":
-                previous_container_id = unquote(parts[2])
-                logger.debug(f"📦 Restored container_id from marker: {previous_container_id}")
-
-        # Track if Files API uploaded any files (for auto-enabling code execution)
-        has_files_api_uploads = False
-
-        if __files__:
-            use_files_api = __user__["valves"].USE_FILES_API
-
-            if use_files_api:
-                # Files API overrules native PDF upload — all files go as container_upload
-                blocks_by_user_msg, uploaded_filenames = await self._process_files_api_data(
-                    __files__, __event_emitter__, processed_messages
-                )
-                if blocks_by_user_msg:
-                    has_files_api_uploads = True
-                    # Insert container_upload blocks at the correct user messages
-                    user_msg_num = 0
-                    for i, msg in enumerate(processed_messages):
-                        if msg["role"] == "user" and user_msg_num in blocks_by_user_msg:
-                            # Ensure content is a list
-                            if isinstance(msg["content"], str):
-                                msg["content"] = [{"type": "text", "text": msg["content"]}]
-                            msg["content"] = blocks_by_user_msg[user_msg_num] + msg["content"]
-                        if msg["role"] == "user":
-                            user_msg_num += 1
-
-                    # Remove RAG sources for uploaded files
-                    if uploaded_filenames:
-                        logger.debug(f"📋 RAG: Removing {len(uploaded_filenames)} file source(s) from RAG")
-                        self._remove_specific_sources_from_rag_message(processed_messages, uploaded_filenames)
-
-            elif __user__["valves"].USE_PDF_NATIVE_UPLOAD:
-                # Native PDF upload (base64 document blocks) — only PDFs
-                pdf_documents_content_blocks, new_marker_metadata = (
-                    await self._get_full_context_pdfs(__files__, previous_marker_metadata)
-                )
-                if pdf_documents_content_blocks:
-                    processed_messages[0]["content"] = (
-                        pdf_documents_content_blocks + processed_messages[0]["content"]
-                    )
-
-                    # Remove RAG sources for files that were uploaded natively
-                    native_pdf_filenames = []
-                    for file in __files__:
-                        if (
-                            file.get("type") == "file"
-                            and file.get("context") == "full"
-                            and file.get("name", "").lower().endswith(".pdf")
-                        ):
-                            file_id = file.get("id")
-                            filename = file.get("name")
-                            if file_id and filename and not any(
-                                file_id in metadata
-                                for metadata in previous_marker_metadata
-                            ):
-                                native_pdf_filenames.append(filename)
-
-                    if native_pdf_filenames:
-                        logger.debug(
-                            f"📋 RAG: Removing {len(native_pdf_filenames)} native PDF source(s) from RAG"
-                        )
-                        self._remove_specific_sources_from_rag_message(
-                            processed_messages, native_pdf_filenames
-                        )
-
-        ## Tools Handling
-        # Correct Order for Caching: Tools, System, Messages
-        tools_list, api_tool_names = self._convert_tools_to_claude_format(
-            __tools__, body, actual_model_name, __user__, __metadata__
-        )
-
-        activate_code_execution = __metadata__.get(
-            "activate_code_execution_tool", False
-        )
-
-        # Auto-enable code execution when Files API uploaded files (container_upload needs it)
-        if has_files_api_uploads:
-            activate_code_execution = True
-
-        # Auto-enable code execution when programmatic tool calling is active
-        # (programmatic calling requires code execution to orchestrate tool calls)
-        if (
-            self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING
-            and model_info.get("supports_programmatic_calling", False)
-            and tools_list  # Only when there are tools to call programmatically
-        ):
-            activate_code_execution = True
-
-        # Check if any dynamic filtering web tools (20260209) are in tools_list.
-        # These tools cause the API to AUTO-INJECT code_execution internally.
-        # We must NOT add code_execution_20250825 manually when these are present —
-        # doing so triggers: "Auto-injecting tools would conflict with existing tool names"
-        # However, code_execution_20260120 (programmatic) CAN coexist because we provide
-        # it explicitly and the API won't auto-inject a second code_execution.
-        has_dynamic_filtering_tools = any(
-            t.get("type", "").endswith("_20260209") for t in tools_list
-        )
-        has_code_execution = any(
-            t.get("name") == "code_execution" for t in tools_list
-        )
-
-        # Determine which code_execution version to add
-        use_programmatic_code_exec = (
-            self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING
-            and model_info.get("supports_programmatic_calling", False)
-        )
-
-        if activate_code_execution and not has_code_execution:
-            if use_programmatic_code_exec:
-                # Always add code_execution_20260120 for programmatic calling,
-                # even alongside dynamic filtering tools (it supersedes the auto-injected one)
-                code_exec_type = "code_execution_20260120"
-                tools_list.insert(0, {"type": code_exec_type, "name": "code_execution"})
-                has_code_execution = True
-            elif not has_dynamic_filtering_tools:
-                # Only add code_execution_20250825 if no dynamic filtering
-                # (dynamic filtering auto-injects its own code_execution)
-                code_exec_type = "code_execution_20250825"
-                tools_list.insert(0, {"type": code_exec_type, "name": "code_execution"})
-                has_code_execution = True
-            # else: dynamic filtering tools present, no programmatic → let API auto-inject
-
-        # Create Headers - check UserValves API key first
-        user_valves = __user__.get("valves") if __user__ else None
-        user_api_key = getattr(user_valves, "ANTHROPIC_API_KEY", "") if user_valves else ""
-        api_key = user_api_key.strip() if user_api_key and user_api_key.strip() else self.valves.ANTHROPIC_API_KEY
-
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": self.API_VERSION,
-            "content-type": "application/json",
-        }
-
-        beta_headers: list[str] = []
-
-        # Enable prompt caching if not disabled
-        if self.valves.CACHE_CONTROL != "cache disabled":
-            beta_headers.append("prompt-caching-2024-07-31")
-
-        # Add code-execution beta header ONLY when we explicitly added code_execution to tools.
-        # Do NOT add when using dynamic filtering v20260209 web tools — those auto-inject
-        # code_execution internally and the beta header would cause a second injection → duplicate error.
-        if has_code_execution:
-            # code_execution_20260120 doesn't need the old beta header
-            code_exec_is_new = any(
-                t.get("type") == "code_execution_20260120" for t in tools_list
-            )
-            if not code_exec_is_new:
-                beta_headers.append("code-execution-2025-08-25")
-            if activate_code_execution:
-                beta_headers.append("files-api-2025-04-14")
-        if (
-            self.valves.ENABLE_INTERLEAVED_THINKING
-            and model_info["supports_thinking"]
-            and not model_info["supports_adaptive_thinking"]
-        ):
-            beta_headers.append("interleaved-thinking-2025-05-14")
-
-        # Add web_fetch beta header when using the older version (20250910)
-        # The newer 20260209 version doesn't need a beta header
-        uses_old_web_fetch = any(
-            t.get("type") == "web_fetch_20250910" for t in tools_list
-        )
-        if self.valves.WEB_FETCH and uses_old_web_fetch:
-            beta_headers.append("web-fetch-2025-09-10")
-
-        # Add Files API beta header when files were uploaded but code_execution
-        # wasn't otherwise activated (standalone file upload scenario)
-        if has_files_api_uploads and "files-api-2025-04-14" not in beta_headers:
-            beta_headers.append("files-api-2025-04-14")
-
-        # Skills Integration
-        if activate_code_execution and __user__["valves"].SKILLS:
-            beta_headers.append("skills-2025-10-02")
-
-            # Validate skills (cached to avoid API calls on every turn)
-            validated_skills = await self._validate_and_get_skills(
-                __user__["valves"].SKILLS,
-                self.valves.ANTHROPIC_API_KEY,
-                __event_emitter__,
-            )
-            payload["container"] = validated_skills
-            logger.debug(f"🔧 Added {len(validated_skills)} skills")
-        elif previous_container_id:
-            # Reuse container from previous turn for code execution state continuity
-            payload["container"] = previous_container_id
-            logger.info(f"📦 Reusing container from previous turn: {previous_container_id}")
-
-        # Add advanced tool use beta (for programmatic calling and tool search)
-        if __user__["valves"].ENABLE_TOOL_SEARCH or self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
-            beta_headers.append("advanced-tool-use-2025-11-20")
-
-        # Add advisor tool beta
-        if __user__["valves"].ENABLE_ADVISOR_TOOL:
-            beta_headers.append("advisor-tool-2026-03-01")
-
-        # Add context editing strategies if enabled
-        context_editing_strategy = __user__["valves"].CONTEXT_EDITING_STRATEGY
-        if context_editing_strategy != "none":
-            if "context-management-2025-06-27" not in beta_headers:
-                beta_headers.append("context-management-2025-06-27")
-
-            # Build context_management array for payload
-            # IMPORTANT: clear_thinking must be FIRST if present (API requirement)
-            context_management = []
-
-            # Add clear_thinking FIRST if needed
-            if (
-                context_editing_strategy in ["clear_thinking", "clear_both"]
-                and enable_thinking
-                and model_info["supports_thinking"]
-            ):
-                _keep_val = __user__["valves"].CONTEXT_EDITING_THINKING_KEEP
-                clear_thinking = {
-                    "type": "clear_thinking_20251015",
-                    # keep=0 → "all" (preserve all thinking → stable prompt cache).
-                    # keep>0 → sliding window (breaks cache every turn past threshold).
-                    "keep": "all" if _keep_val <= 0 else {
-                        "type": "thinking_turns",
-                        "value": _keep_val,
-                    },
-                }
-                context_management.append(clear_thinking)
-
-            # Add clear_tool_uses SECOND
-            if (
-                context_editing_strategy in ["clear_tool_results", "clear_both"]
-                and len(tools_list) > 2
-            ):
-                clear_tool_uses = {
-                    "type": "clear_tool_uses_20250919",
-                    "trigger": {
-                        "type": "input_tokens",
-                        "value": __user__["valves"].CONTEXT_EDITING_TOOL_TRIGGER,
-                    },
-                    "keep": {
-                        "type": "tool_uses",
-                        "value": __user__["valves"].CONTEXT_EDITING_TOOL_KEEP,
-                    },
-                }
-                if __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST > 0:
-                    clear_tool_uses["clear_at_least"] = {
-                        "type": "input_tokens",
-                        "value": __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST,
-                    }
-                if __user__["valves"].CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT:
-                    clear_tool_uses["clear_tool_inputs"] = True
-                context_management.append(clear_tool_uses)
-
-            if context_management:
-                payload["context_management"] = {"edits": context_management}
-
-        # Add compaction if enabled and model supports it
-        if __user__["valves"].ENABLE_COMPACTION and model_info.get("supports_compaction", False):
-            if "context-management-2025-06-27" not in beta_headers:
-                beta_headers.append("context-management-2025-06-27")
-            beta_headers.append("compact-2026-01-12")
-
-            compact_edit: dict[str, Any] = {
-                "type": "compact_20260112",
-                "trigger": {
-                    "type": "input_tokens",
-                    "value": __user__["valves"].COMPACTION_TRIGGER_TOKENS,
-                },
-            }
-            if __user__["valves"].COMPACTION_INSTRUCTIONS.strip():
-                compact_edit["instructions"] = __user__["valves"].COMPACTION_INSTRUCTIONS.strip()
-
-            if "context_management" not in payload:
-                payload["context_management"] = {"edits": []}
-            payload["context_management"]["edits"].append(compact_edit)
-
-        # Add effort beta header and output_config if effort is configured
-        if model_info["supports_effort"] and effort_config:
-            beta_headers.append("effort-2025-11-24")
-            payload["output_config"] = effort_config
-
-        # Add Fast Mode beta header if enabled and model supports it
-        if self.valves.ENABLE_FAST_MODE and model_info.get("supports_fast_mode", False):
-            beta_headers.append("fast-mode-2026-02-01")
-
-        if beta_headers and len(beta_headers) > 0:
-            headers["anthropic-beta"] = ",".join(beta_headers)
-            # Add betas list to payload for beta.messages.stream
-            payload["betas"] = beta_headers
-
-            ## Tool Choice Handling
-            if __metadata__.get("web_search_enforced"):
-                # Check if web_search is actually in the tools list
-                has_web_search = any(t.get("name") == "web_search" for t in tools_list)
-                if has_web_search:
-                    if "thinking" not in payload:
-                        # No thinking active - enforce web_search
-                        payload["tool_choice"] = {"type": "tool", "name": "web_search"}
-                        logger.debug("Enforcing web_search via tool_choice")
-                    else:
-                        # Thinking is active - cannot enforce web_search, but it's still available
-                        payload["tool_choice"] = {"type": "auto"}
-                        logger.debug(
-                            "Thinking active - web_search added but not enforced (tool_choice=auto)"
-                        )
-                else:
-                    # No enforcement - use auto tool choice
-                    payload["tool_choice"] = {"type": "auto"}
-
-        # API tool_choice passthrough (outside beta_headers block)
-        # If no tool_choice was set by web_search enforcement, pass through from body
-        if "tool_choice" not in payload and body.get("tool_choice"):
-            api_tc = body["tool_choice"]
-            if isinstance(api_tc, dict) and "function" in api_tc:
-                # OpenAI format: {"type": "function", "function": {"name": "X"}}
-                payload["tool_choice"] = {
-                    "type": "tool",
-                    "name": api_tc["function"]["name"],
-                }
-            elif isinstance(api_tc, str):
-                # OpenAI string format: "auto", "none", "required"
-                mapping = {"auto": "auto", "none": "none", "required": "any"}
-                payload["tool_choice"] = {"type": mapping.get(api_tc, api_tc)}
-            else:
-                # Already in Anthropic format or other dict format
-                payload["tool_choice"] = api_tc
-            logger.debug(f"API tool_choice passthrough: {payload['tool_choice']}")
-
-        payload["tools"] = tools_list
-
-        # Processing Messages and Caching
-        if system_messages and len(system_messages) > 0:
-            payload["system"] = system_messages
-
-        payload["messages"] = processed_messages
-
-        return payload, headers, new_marker_metadata, api_tool_names
-
     def _convert_messages_to_claude_format(
         self, raw_messages, user_has_memory_system_enabled: bool = False
     ) -> tuple[list[dict], list[dict], list[str]]:
@@ -2604,6 +3831,13 @@ class Pipe:
         claude_tools = []
         tool_names_seen = set()  # Track unique tool names
         api_tool_names = set()  # Track tools from body.tools (no callable, API passthrough)
+        forced_tool_name = None
+        requested_tool_choice = body.get("tool_choice")
+        if isinstance(requested_tool_choice, dict):
+            if requested_tool_choice.get("type") == "function":
+                forced_tool_name = (requested_tool_choice.get("function") or {}).get("name")
+            elif requested_tool_choice.get("type") == "tool":
+                forced_tool_name = requested_tool_choice.get("name")
 
         # Names reserved for Anthropic server-side tools (skip if found in body.tools)
         anthropic_server_tool_names = {"web_search", "web_fetch"}
@@ -2902,7 +4136,11 @@ class Pipe:
                 # Skip deferring if tool is in exclusion list
                 name = claude_tool["name"]
                 user_excludes = __user__["valves"].TOOL_SEARCH_EXCLUDE_TOOLS
-                if name not in user_excludes and name not in ANTHROPIC_BUILTIN_TOOL_NAMES:
+                if (
+                    name != forced_tool_name
+                    and name not in user_excludes
+                    and name not in ANTHROPIC_BUILTIN_TOOL_NAMES
+                ):
                     # Calculate tool definition size (JSON representation)
                     tool_json = json.dumps(claude_tool)
                     tool_len = len(tool_json)
@@ -3087,6 +4325,7 @@ class Pipe:
             if role == "assistant":
                 content = PATTERN_TOOL_CALLS_DETAILS.sub("", content)
                 content = PATTERN_CODE_INTERPRETER_DETAILS.sub("", content)
+                content = PATTERN_CACHE_TRACE_DETAILS.sub("", content)
 
                 # Reconstruct ALL replayable <details> blocks (reasoning,
                 # server_tool_use, *_tool_result, compaction) into their
@@ -3336,2852 +4575,6 @@ class Pipe:
                         })
         return claude_tool_results
 
-    def _handle_message_start_usage(
-        self,
-        event: Any,
-        *,
-        include_usage: bool,
-        total_usage: Optional[dict[str, int]],
-        stream_output_tokens: int,
-    ) -> int:
-        """Handle message_start usage accounting and return updated stream output tokens."""
-
-        message = getattr(event, "message", None)
-        if not message:
-            return stream_output_tokens
-
-        request_id = getattr(message, "id", None)
-        logger.debug(f" Message started with ID: {request_id}")
-
-        if not include_usage or total_usage is None:
-            return stream_output_tokens
-
-        usage = getattr(message, "usage", {})
-        if not usage:
-            return stream_output_tokens
-
-        input_tokens = getattr(usage, "input_tokens", 0)
-        current_output_tokens = getattr(usage, "output_tokens", 0)
-
-        total_usage["input_tokens"] += input_tokens
-        diff = current_output_tokens - stream_output_tokens
-        total_usage["output_tokens"] += diff
-        stream_output_tokens = current_output_tokens
-        total_usage["total_tokens"] = input_tokens + current_output_tokens
-
-        if self.valves.CACHE_CONTROL != "cache disabled":
-            cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
-            total_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
-            total_usage["cache_read_input_tokens"] = cache_read_input_tokens
-            total_usage["total_tokens"] += cache_creation_input_tokens + cache_read_input_tokens
-            logger.debug(
-                f" Usage stats: input={input_tokens}, output={current_output_tokens}, "
-                f"cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
-            )
-        else:
-            logger.debug(f" Usage stats: input={input_tokens}, output={current_output_tokens}")
-        logger.debug(f" Accumulated usage: {total_usage}")
-
-        return stream_output_tokens
-
-    async def _handle_stream_exception(
-        self,
-        exc: Exception,
-        *,
-        retry_attempts: int,
-        request_ctx: PipeRequestContext,
-    ) -> tuple[bool, int, str]:
-        """Central stream exception policy.
-
-        Returns: (should_retry, updated_retry_attempts, response_suffix)
-        """
-
-        max_retries = self.valves.MAX_RETRIES
-
-        non_retry_map: dict[type[Exception], str] = {
-            RateLimitError: f"\n\n⚠️ Rate limit exceeded - maximum retries ({max_retries}) reached. Please try again later.",
-            AuthenticationError: f"\n\nError: API key issues. Reason: {getattr(exc, 'message', str(exc))}",
-            PermissionDeniedError: f"\n\nError: Permission denied. Reason: {getattr(exc, 'message', str(exc))}",
-            NotFoundError: f"\n\nError: Resource not found. Reason: {getattr(exc, 'message', str(exc))}",
-            BadRequestError: f"\n\nError: Invalid request format. Reason: {getattr(exc, 'message', str(exc))}",
-            UnprocessableEntityError: f"\n\nError: Unprocessable entity. Reason: {getattr(exc, 'message', str(exc))}",
-        }
-
-        for error_type, suffix in non_retry_map.items():
-            if isinstance(exc, error_type):
-                await self.handle_errors(exc, request_ctx.event_emitter)
-                return (False, retry_attempts, suffix)
-
-        retryable_with_status: list[tuple[type[Exception], str, str]] = [
-            (OverloadedError, "⏳ API overloaded, retrying...", "🔧 API overloaded"),
-            (InternalServerError, "⏳ Server error, retrying...", "🔧 Server error"),
-            (APIConnectionError, "🌐 Connection error, retrying...", "🌐 Network connection failed"),
-        ]
-
-        for error_type, status_label, fail_label in retryable_with_status:
-            if isinstance(exc, error_type):
-                retry_attempts += 1
-                if retry_attempts <= max_retries:
-                    await request_ctx.emit_event(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"{status_label} ({retry_attempts}/{max_retries})",
-                                "done": False,
-                            },
-                        }
-                    )
-                    return (True, retry_attempts, "")
-
-                await self.handle_errors(exc, request_ctx.event_emitter)
-                if isinstance(exc, APIConnectionError):
-                    return (
-                        False,
-                        retry_attempts,
-                        f"\n\n{fail_label} after {max_retries} attempts. Please check your connection.",
-                    )
-                return (
-                    False,
-                    retry_attempts,
-                    f"\n\n{fail_label} - maximum retries ({max_retries}) reached. Please try again later.",
-                )
-
-        if isinstance(exc, APIStatusError):
-            error_body = getattr(exc, "body", None) or {}
-            error_info = error_body.get("error", {}) if isinstance(error_body, dict) else {}
-            is_overloaded = error_info.get("type") == "overloaded_error"
-
-            if is_overloaded and retry_attempts < max_retries:
-                retry_attempts += 1
-                await request_ctx.emit_event(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"⏳ API overloaded (streaming), retrying... ({retry_attempts}/{max_retries})",
-                            "done": False,
-                        },
-                    }
-                )
-                return (True, retry_attempts, "")
-
-            await self.handle_errors(exc, request_ctx.event_emitter)
-            if is_overloaded:
-                return (
-                    False,
-                    retry_attempts,
-                    f"\n\n🔧 API overloaded (streaming) - maximum retries ({max_retries}) reached. Please try again later.",
-                )
-            return (
-                False,
-                retry_attempts,
-                f"\n\nError: Anthropic API error. Reason: {getattr(exc, 'message', str(exc))}",
-            )
-
-        await self.handle_errors(exc, request_ctx.event_emitter)
-        return (
-            False,
-            retry_attempts,
-            f"\n\nError: {type(exc).__name__} occurred. Reason: {exc}",
-        )
-
-    async def _apply_sdk_stop_reason_fallback(
-        self,
-        *,
-        sdk_final_message: Any,
-        conversation_ended: bool,
-        has_pending_tool_calls: bool,
-        tool_calls: list[dict[str, Any]],
-        tool_loop_iteration: int,
-        payload_for_stream: dict[str, Any],
-        stream_event_counts: dict[str, int],
-        request_ctx: PipeRequestContext,
-    ) -> tuple[bool, bool, list[dict[str, Any]]]:
-        """Apply fallback stop-reason logic when message_delta was missing."""
-
-        if not sdk_final_message or conversation_ended or has_pending_tool_calls:
-            return conversation_ended, has_pending_tool_calls, tool_calls
-
-        sdk_stop = getattr(sdk_final_message, "stop_reason", None)
-        sdk_content = getattr(sdk_final_message, "content", [])
-
-        if sdk_stop:
-            logger.info(f"📍 Fallback stop_reason from SDK message: {sdk_stop}")
-            if sdk_stop == "end_turn":
-                conversation_ended = True
-            elif sdk_stop == "tool_use":
-                has_pending_tool_calls = True
-                if not tool_calls:
-                    for block in sdk_content:
-                        if getattr(block, "type", None) == "tool_use":
-                            logger.warning(
-                                f"📍 Rebuilding tool_call from SDK: {getattr(block, 'name', '?')}"
-                            )
-                            tool_calls.append(
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": getattr(block, "id", ""),
-                                    "content": "Error: tool call was not processed during streaming",
-                                    "is_error": True,
-                                }
-                            )
-            elif sdk_stop == "pause_turn":
-                has_pending_tool_calls = True
-                await request_ctx.emit_event(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "⏳ Long-running turn paused, continuing...",
-                            "done": False,
-                        },
-                    }
-                )
-            elif sdk_stop in (
-                "max_tokens",
-                "refusal",
-                "stop_sequence",
-                "model_context_window_exceeded",
-            ):
-                conversation_ended = True
-                if sdk_stop == "max_tokens":
-                    await request_ctx.emit_delta("\n\n⚠️ Maximum token limit reached.")
-                elif sdk_stop == "model_context_window_exceeded":
-                    await request_ctx.emit_delta("\n\n⚠️ Context window exceeded.")
-        elif not sdk_content:
-            logger.warning(
-                f"⚠️ Empty API response (no stop_reason, no content). "
-                f"Container: {payload_for_stream.get('container', 'NONE')}. "
-                f"Events: {stream_event_counts}. Treating as end_turn."
-            )
-            conversation_ended = True
-            if tool_loop_iteration > 1:
-                await request_ctx.emit_delta(
-                    "\n\n⚠️ Code execution continuation returned empty response. "
-                    "The container may have timed out."
-                )
-        else:
-            # stop_reason is None but content exists (e.g. thinking + server_tool blocks
-            # without any text). This typically happens when the API is overloaded and
-            # returns a truncated stream after 200 OK. Anthropic warns:
-            # "When receiving a streaming response via SSE, it's possible that an error
-            # can occur after returning a 200 response."
-            # We leave conversation_ended=False here so the main loop's safety-break
-            # section can detect this and trigger an auto-retry.
-            block_types = [getattr(b, "type", "?") for b in sdk_content]
-            has_text = any(
-                getattr(b, "type", None) == "text"
-                and len(getattr(b, "text", "") or "") > 0
-                for b in sdk_content
-            )
-            logger.warning(
-                f"⚠️ Truncated stream: no stop_reason but content present. "
-                f"Blocks: {block_types}. has_text={has_text}. "
-                f"Container: {payload_for_stream.get('container', 'NONE')}. "
-                f"Events: {stream_event_counts}."
-            )
-            # Don't set conversation_ended — let the safety-break handle retry logic
-
-        return conversation_ended, has_pending_tool_calls, tool_calls
-
-    # =========================================================================
-    # MAIN ENTRY POINT
-    # =========================================================================
-
-    async def pipe(
-        self,
-        body: dict[str, Any],
-        __user__: Dict[str, Any],
-        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
-        __metadata__: dict[str, Any] = {},
-        __tools__: Optional[Dict[str, Dict[str, Any]]] = None,
-        __files__: Optional[Dict[str, Any]] = None,
-        __task__: Optional[dict[str, Any]] = None,
-        __task_body__: Optional[dict[str, Any]] = None,
-        __request__: Optional[Any] = None,
-    ):
-        """
-        OpenWebUI Claude streaming pipe with integrated streaming logic.
-        """
-        # =========================================================================
-        # PHASE 1: RESPONSE ACCUMULATION STATE
-        # =========================================================================
-        request_ctx = PipeRequestContext(pipe=self, event_emitter=__event_emitter__)
-        final_message = request_ctx.final_message
-        emit_event_local = request_ctx.emit_event
-        emit_message_delta = request_ctx.emit_delta
-        emit_message_replace = request_ctx.emit_replace
-        update_content_block = request_ctx.update_content_block
-        final_text = request_ctx.text
-
-
-        try:
-            # =========================================================================
-            # PHASE 2: VALIDATION & SETUP
-            # =========================================================================
-
-            # Debug: Log all Valves and UserValves settings
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"Valves: {self.valves.model_dump()}")
-                user_valves = __user__.get("valves")
-                if user_valves and hasattr(user_valves, "model_dump"):
-                    logger.debug(f"UserValves: {user_valves.model_dump()}")
-                elif user_valves:
-                    logger.debug(f"UserValves: {user_valves}")
-
-            # Get API key - check UserValves first, then fall back to admin valve
-            user_valves = __user__.get("valves")
-            user_api_key = getattr(user_valves, "ANTHROPIC_API_KEY", "") if user_valves else ""
-            api_key = user_api_key.strip() if user_api_key and user_api_key.strip() else self.valves.ANTHROPIC_API_KEY
-            if not api_key or api_key == "Your API Key Here":
-                error_msg = "Error: No API key configured. Set it in admin Valves or your personal UserValves."
-                logger.error(f"{error_msg}")
-                await emit_event_local(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "No API Key Set!",
-                            "done": False,
-                        },
-                    }
-                )
-                return error_msg
-
-            # STEP 1: Detect if task model (generate title, tags, follow-ups etc.), handle it separately
-            if __task__:
-                return await self._run_task_model_request(body)
-
-            # STEP 2: Await tools if needed
-            if inspect.isawaitable(__tools__):
-                __tools__ = await __tools__
-
-            # STEP 2.5: Get builtin tools from OpenWebUI (for tools from body.tools)
-            builtin_tools = {}
-            if BUILTIN_TOOLS_AVAILABLE and __request__:
-                try:
-                    # Determine if memory feature is enabled
-                    memory_enabled = (
-                        __user__.get("settings", {}).get("ui", {}).get("memory", False)
-                        if __user__
-                        else False
-                    )
-                    # Resolve skill IDs for view_skill builtin tool
-                    skill_ids = []
-                    try:
-                        openwebui_model_id = __metadata__.get("model_id") or body.get("model", "")
-                        if openwebui_model_id and MODELS_AVAILABLE:
-                            owui_model = await Models.get_model_by_id(openwebui_model_id)
-                            if owui_model:
-                                # ModelModel has .meta (ModelMeta pydantic model), not .info
-                                meta = owui_model.meta
-                                if meta:
-                                    meta_dict = meta.model_dump() if hasattr(meta, "model_dump") else (meta if isinstance(meta, dict) else {})
-                                    model_skill_ids = set(meta_dict.get("skillIds", []))
-                                else:
-                                    model_skill_ids = set()
-                                logger.debug(f"Model {openwebui_model_id} skill IDs: {model_skill_ids}")
-                                if model_skill_ids:
-                                    from open_webui.models.skills import Skills as SkillsModel
-
-                                    user_id = __user__.get("id", "") if __user__ else ""
-                                    accessible_skills = await SkillsModel.get_skills_by_user_id(user_id, "read")
-                                    accessible = {s.id for s in accessible_skills}
-                                    logger.debug(f"Accessible skills for user: {accessible}")
-                                    skill_ids = []
-                                    for sid in model_skill_ids:
-                                        if sid not in accessible:
-                                            continue
-                                        s = await SkillsModel.get_skill_by_id(sid)
-                                        if s and s.is_active:
-                                            skill_ids.append(sid)
-                                    logger.debug(f"Resolved skill_ids: {skill_ids}")
-                    except Exception as e:
-                        logger.debug(f"Could not resolve skill IDs: {e}")
-
-                    builtin_tools = get_builtin_tools(
-                        __request__,
-                        {
-                            "__user__": __user__,
-                            "__event_emitter__": __event_emitter__,
-                            "__chat_id__": (
-                                __metadata__.get("chat_id") if __metadata__ else None
-                            ),
-                            "__message_id__": (
-                                __metadata__.get("message_id") if __metadata__ else None
-                            ),
-                            "__skill_ids__": skill_ids,
-                        },
-                        features={"memory": memory_enabled},
-                        model={},
-                    )
-                    logger.debug(
-                        f"Loaded {len(builtin_tools)} builtin tools: {list(builtin_tools.keys())}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not load builtin tools: {e}")
-                    builtin_tools = {}
-
-            # Merge external tools from metadata (Open Terminal, external tool servers)
-            # These have callables for execution but are not in __tools__ or builtin_tools
-            metadata_tools = __metadata__.get("tools", {}) if __metadata__ else {}
-            if metadata_tools:
-                for t_name, t_data in metadata_tools.items():
-                    if t_name not in builtin_tools and (not __tools__ or t_name not in __tools__):
-                        if isinstance(t_data, dict) and t_data.get("callable"):
-                            builtin_tools[t_name] = t_data
-                if builtin_tools:
-                    logger.debug(
-                        f"After metadata merge, builtin_tools: {list(builtin_tools.keys())}"
-                    )
-
-            # STEP 3: Auto-enable native function calling if tools are present
-            # This prevents OpenWebUI's function_calling task system from being triggered
-            if __tools__ and MODELS_AVAILABLE:
-                try:
-                    # Get the OpenWebUI model ID from metadata
-                    openwebui_model_id = (
-                        __metadata__.get("model_id") if __metadata__ else None
-                    )
-                    if not openwebui_model_id and body and "model" in body:
-                        openwebui_model_id = body["model"]
-
-                    if openwebui_model_id:
-                        model = await Models.get_model_by_id(openwebui_model_id)
-                        if model:
-                            params = dict(model.params or {})
-                            if params.get("function_calling") != "native":
-                                logger.debug(
-                                    f"Auto-enabling native function calling for model: {openwebui_model_id}"
-                                )
-
-                                # Notify user
-                                await emit_event_local(
-                                    {
-                                        "type": "notification",
-                                        "data": {
-                                            "type": "info",
-                                            "content": f"Enabling native function calling for model: {openwebui_model_id}. Please re-run your query.",
-                                        },
-                                    }
-                                )
-
-                                params["function_calling"] = "native"
-                                form_data = model.model_dump()
-                                form_data["params"] = params
-                                await Models.update_model_by_id(
-                                    openwebui_model_id, ModelForm(**form_data)
-                                )
-                except Exception as e:
-                    logger.warning(
-                        f"Could not auto-enable native function calling: {e}"
-                    )
-
-            # Tell middleware to skip reasoning tag detection — the pipe renders
-            # its own <details type="reasoning"> blocks which must not be re-parsed.
-            if __metadata__ is not None:
-                __metadata__.setdefault("params", {})["reasoning_tags"] = False
-
-            payload, headers, new_marker_metadata, api_tool_names = await self._create_payload(
-                body, __metadata__, __user__, __tools__, __event_emitter__, __files__
-            )
-
-            # =========================================================================
-            # PHASE 3: STREAMING STATE INITIALIZATION
-            # =========================================================================
-            api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            # Use UserValves API key if available (override header-level key too)
-            if user_api_key and user_api_key.strip():
-                api_key = user_api_key.strip()
-                logger.debug("Using user-provided API key from UserValves")
-            request_timeout = self.valves.REQUEST_TIMEOUT
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers, timeout=request_timeout, **({"base_url": base_url} if base_url else {}))
-            payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
-            include_usage = (
-                __user__["valves"].SHOW_TOKEN_COUNT != "Off"
-                or body.get("stream_options", {}).get("include_usage", False)
-            )
-            total_usage: Optional[dict[str, int]] = None
-            if include_usage:
-                total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
-                if self.valves.CACHE_CONTROL != "cache disabled":
-                    total_usage["cache_creation_input_tokens"] = 0
-                    total_usage["cache_read_input_tokens"] = 0
-
-            # Stream configuration from valves
-            token_buffer_size = getattr(self.valves, "TOKEN_BUFFER_SIZE", 1)
-            max_function_calls = self.valves.MAX_TOOL_CALLS
-
-            # Thinking mode state
-            is_model_thinking = False
-            thinking_message = ""
-            thinking_signature = ""  # Accumulates signature_delta events (required for replay)
-            thinking_start_time = None  # Track when thinking started for duration calc
-            thinking_stream_start_idx = -1  # Position in final_message where thinking content starts
-            thinking_last_block = ""  # Tracks current formatted thinking block for content-preserving replace
-
-            # Compaction state
-            compaction_content = ""
-            compaction_last_block = ""  # Tracks current formatted compaction block for content-preserving replace
-
-            # SDK-accumulated message: captured after each stream completes
-            # Replaces manual api_assistant_blocks/thinking_blocks accumulation
-            sdk_final_message = None
-
-            # Tool execution state
-            current_block_type = None  # Track current block type for stop events
-            has_pending_tool_calls = False
-            tools_buffer = ""
-            tool_input_buffer = ""  # Accumulate just the input JSON for live streaming
-            tool_calls = []
-            running_tool_tasks = []  # Async tasks for executing tools immediately
-            tool_call_data_list = []  # Store tool metadata for result matching
-            api_tool_passthrough = False  # Flag for API tool passthrough mode
-            tool_progress_blocks = {}  # Map tool_id → current in-progress block text for replacement
-            # Note: tool_use_blocks and current_tool_caller removed - SDK preserves these in accumulated message
-
-            # Server tool state (web_search, code_execution)
-            active_server_tool_name = None
-            active_server_tool_id = None
-            server_tool_input_buffer = ""  # Accumulate server tool input JSON
-            # Tracks emitted server_tool_use carrier blocks by tool_use_id so
-            # web_search / web_fetch result handlers can update_content_block()
-            # to merge the result display INTO the same collapsible instead of
-            # emitting a second adjacent <details>. Value also stores the
-            # original tool_input so we can rebuild the merged carrier with
-            # both payloads (tool_use + tool_result).
-            server_tool_use_carriers: dict[str, dict] = {}
-            text_editor_file_content = ""  # Accumulate file_text for text_editor
-            text_editor_file_path = ""  # Track file path for text_editor
-            text_editor_command = ""  # Track text_editor command (create/view/edit)
-            bash_execution_command = ""  # Track bash command for code execution
-            code_execution_code = ""  # Track code from programmatic code_execution
-            in_code_execution = False  # Whether we're currently in a code_execution flow
-            code_exec_is_web_filtering = False  # True when code_execution is just dynamic filtering for web tools
-            code_exec_tool_calls_info = []  # Accumulate tool call info for unified display
-            code_exec_stream_start_idx = -1  # Position in final_message where code exec content starts
-            code_exec_last_block = ""  # Tracks current formatted code block for content-preserving replace
-            code_exec_current_code = ""  # Accumulated code for live streaming inside details
-            code_exec_current_lang = "python"  # Language for live streaming
-            code_exec_start_time = 0.0  # time.time() when code execution started
-            last_code_language = (
-                "bash"  # Track language of last code block for output association
-            )
-            last_code_content = ""  # Buffer code content for combining with output
-
-            # Dynamic filtering detection:
-            # If code_execution was NOT explicitly added to tools (no code_execution_20250825 or
-            # code_execution_20260120 in payload), then any code_execution in the stream is from
-            # dynamic filtering auto-injection → suppress UI.
-            # If code_execution WAS explicitly added, code_exec blocks could be real code → show UI.
-            payload_tools = payload.get("tools", [])
-            has_explicit_code_execution = any(
-                t.get("name") == "code_execution" for t in payload_tools
-            )
-            code_exec_has_user_tools = False  # Tracks if user tools were called in current code_exec
-            code_exec_had_web_tools = False  # Tracks if web_search/web_fetch happened inside code_exec
-
-            # Web search citation state
-            current_search_query = ""  # Track the current web search query
-            citation_counter = 0  # Track citation numbers for inline citations
-            pending_citation_markers = []  # Deferred markers (web_search citations arrive before text)
-            citations_list = []  # Store citations for reference list
-
-            # Loop control state
-            conversation_ended = False
-            retry_attempts = 0
-            current_function_calls = 0
-            first_text_emitted = False  # Track if we've emitted "Responding..." status
-
-            # Response chunk state
-            chunk = ""
-            chunk_count = 0
-
-            await emit_event_local(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "Waiting for response...",
-                        "done": False,
-                        "hidden": False,
-                    },
-                }
-            )
-
-            # =========================================================================
-            # PHASE 4: MAIN STREAMING LOOP
-            # Continues until conversation ends or max tool calls reached
-            # =========================================================================
-            tool_loop_iteration = 0
-            while (
-                current_function_calls < max_function_calls
-                and not conversation_ended
-                and retry_attempts <= self.valves.MAX_RETRIES
-            ):
-                tool_loop_iteration += 1
-                # Reset per-iteration state
-                stream_output_tokens = 0
-
-                try:
-                    stream_event_counts = {}  # Track event types for diagnostics#
-                    # Apply cache breakpoints right before sending to API
-                    self._apply_cache_control(payload_for_stream, is_tool_loop=(tool_loop_iteration > 1))
-                    # Log message-hash diff vs previous request on same chat_id
-                    # to pinpoint byte-drift that breaks the prompt cache prefix.
-                    _diff_chat_id = __metadata__.get("chat_id") if __metadata__ else None
-                    self._log_message_hash_diff(_diff_chat_id, payload_for_stream)
-                    # Dump the full (stripped) outgoing payload so we can audit
-                    # cache_control placement, tool list, message order and byte
-                    # drift across turns without logging megabytes of base64.
-                    try:
-                        logger.debug(
-                            "[PAYLOAD] iter=%d %s",
-                            tool_loop_iteration,
-                            json.dumps(
-                                self._strip_payload(payload_for_stream),
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                                default=str,
-                            ),
-                        )
-                    except Exception as _pl_err:
-                        logger.debug(f"[PAYLOAD] strip/log failed: {_pl_err}")
-                    async with client.beta.messages.stream(
-                        **payload_for_stream
-                    ) as stream:
-                        async for event in stream:
-                            event_type = getattr(event, "type", None)
-                            stream_event_counts[event_type] = stream_event_counts.get(event_type, 0) + 1
-                            logger.debug(f"Received stream event: {event_type} | counts: {stream_event_counts} | payload: {event}")
-                            if event_type == "message_start":
-                                # Note: Container ID is not in message_start for streaming;
-                                # it arrives in message_delta.
-                                stream_output_tokens = self._handle_message_start_usage(
-                                    event,
-                                    include_usage=include_usage,
-                                    total_usage=total_usage if include_usage else None,
-                                    stream_output_tokens=stream_output_tokens,
-                                )
-
-                            # ---------------------------------------------------------
-                            # EVENT: content_block_start
-                            # Handles start of: text, thinking, tool_use, server_tool_use,
-                            # bash_code_execution_tool_result, text_editor_code_execution_tool_result,
-                            # web_search_tool_result, tool_search_tool_result, context_cleared
-                            # ---------------------------------------------------------
-                            elif event_type == "content_block_start":
-                                content_block = getattr(event, "content_block", None)
-                                content_type = getattr(content_block, "type", None)
-                                current_block_type = content_type
-                                if not content_block:
-                                    continue
-                                if content_type == "text":
-                                    chunk += content_block.text or ""
-                                elif content_type == "thinking":
-                                    is_model_thinking = True
-                                    thinking_start_time = time.time()
-                                    thinking_message = ""
-                                    thinking_signature = ""
-                                    thinking_stream_start_idx = len(final_message)
-                                elif content_type == "redacted_thinking":
-                                    is_model_thinking = True
-                                elif content_type == "tool_use":
-                                    tool_name = getattr(
-                                        content_block, "name", "unknown"
-                                    )
-                                    logger.debug(
-                                        f"🔧 Tool use block started: {tool_name}"
-                                    )
-                                    if in_code_execution and code_exec_is_web_filtering:
-                                        # User tool called from within code_execution → NOT just web filtering
-                                        code_exec_is_web_filtering = False
-                                        code_exec_has_user_tools = True
-
-                                    # For programmatic tool calls, the API may provide
-                                    # the full input at content_block_start (no input_json_delta events)
-                                    initial_input = getattr(content_block, "input", None) or {}
-                                    tool_id_at_start = getattr(content_block, "id", "")
-                                    if initial_input:
-                                        # Input is pre-populated (programmatic call) - include it directly
-                                        logger.debug(f"🔧 Tool input pre-populated at start: {json.dumps(initial_input)[:200]}")
-                                        tools_buffer = json.dumps({
-                                            "type": content_block.type,
-                                            "id": content_block.id,
-                                            "name": content_block.name,
-                                            "input": initial_input,
-                                        })
-                                    else:
-                                        # Standard streaming: input arrives via input_json_delta
-                                        tools_buffer = (
-                                            "{"
-                                            f'"type": "{content_block.type}", '
-                                            f'"id": "{content_block.id}", '
-                                            f'"name": "{content_block.name}", '
-                                            f'"input": '
-                                        )
-
-                                    # Show in-progress tool call block immediately (not for programmatic/code_exec)
-                                    if not in_code_execution:
-                                        in_progress_block = self._format_tool_result_block(
-                                            tool_id_at_start, tool_name, initial_input or {}, "", done=False
-                                        )
-                                        tool_progress_blocks[tool_id_at_start] = in_progress_block
-                                        final_message.append(in_progress_block)
-                                        await emit_message_replace(final_text())
-                                    # Reset input buffer for streaming tool arguments
-                                    tool_input_buffer = ""
-                                elif content_type == "server_tool_use":
-                                    # Track active server tool (web_search, code_execution)
-                                    # No need for tools_buffer - server handles execution
-                                    active_server_tool_name = getattr(
-                                        content_block, "name", ""
-                                    )
-                                    active_server_tool_id = getattr(
-                                        content_block, "id", ""
-                                    )
-                                    server_tool_input_buffer = (
-                                        ""  # Reset buffer for new tool
-                                    )
-                                    # Note: server_tool_use blocks are preserved by SDK accumulated message
-
-                                    logger.debug(
-                                        f"Server tool started: {active_server_tool_name} (ID: {active_server_tool_id})"
-                                    )
-
-                                    if active_server_tool_name in ("web_search", "web_fetch"):
-                                        # Track that web tools were used inside code_execution
-                                        # (confirms it's dynamic filtering, not programmatic code)
-                                        if in_code_execution:
-                                            code_exec_had_web_tools = True
-
-                                    elif active_server_tool_name == "code_execution":
-                                        # Finalize any previous live-streamed block before starting new one
-                                        if code_exec_current_code:
-                                            duration = time.time() - code_exec_start_time if code_exec_start_time else None
-                                            block = self._format_code_execution_block(
-                                                code_exec_current_code, code_exec_current_lang,
-                                                done=True, duration=duration,
-                                            )
-                                            await update_content_block(code_exec_last_block, block)
-                                            code_exec_last_block = ""
-
-                                        in_code_execution = True
-                                        # Start assuming web filtering — confirmed when web_search/web_fetch appears inside
-                                        # Flipped to False if user tools (tool_use blocks) are called
-                                        code_exec_is_web_filtering = True
-                                        code_exec_has_user_tools = False
-                                        code_exec_had_web_tools = False
-                                        code_exec_tool_calls_info = []
-                                        code_exec_stream_start_idx = len(final_message)
-                                        code_exec_current_code = ""
-                                        code_exec_current_lang = "python"
-                                        code_exec_start_time = time.time()
-                                        # Don't emit "Running code" yet — defer until we know it's not web filtering
-                                    elif active_server_tool_name in ("bash_code_execution", "text_editor_code_execution"):
-                                        # Finalize any previous live-streamed block before starting new one
-                                        if code_exec_current_code:
-                                            duration = time.time() - code_exec_start_time if code_exec_start_time else None
-                                            block = self._format_code_execution_block(
-                                                code_exec_current_code, code_exec_current_lang,
-                                                done=True, duration=duration,
-                                            )
-                                            await update_content_block(code_exec_last_block, block)
-                                            code_exec_last_block = ""
-
-                                        code_exec_current_code = ""
-                                        code_exec_current_lang = "bash" if active_server_tool_name == "bash_code_execution" else "python"
-                                        code_exec_start_time = time.time()
-                                elif content_type == "bash_code_execution_tool_result":
-                                    logger.debug(
-                                        f"Processing bash_code_execution_tool_result: {content_block}"
-                                    )
-                                    # Persist hidden payload for API replay (display block is stripped on reload).
-                                    await self._persist_server_tool_result(
-                                        content_block,
-                                        "bash_code_execution_tool_result",
-                                        emit_message_delta,
-                                        summary_text="🖥️ bash result",
-                                    )
-                                    result_block = getattr(
-                                        content_block, "content", None
-                                    )
-                                    if result_block:
-                                        # Check for server tool errors (unavailable, execution_time_exceeded, container_expired, etc.)
-                                        result_block_type = getattr(result_block, "type", "")
-                                        if result_block_type == "bash_code_execution_tool_result_error":
-                                            error_code = getattr(result_block, "error_code", "unknown")
-                                            error_msg = f"⚠️ Code execution error: {error_code}"
-                                            logger.warning(f"bash_code_execution error: {error_code}")
-                                            await emit_message_delta(f"{error_msg}")
-                                            last_code_content = ""
-                                            continue
-
-                                        stdout = getattr(result_block, "stdout", "")
-                                        stderr = getattr(result_block, "stderr", "")
-                                        return_code = getattr(
-                                            result_block, "return_code", None
-                                        )
-
-                                        # Handle file outputs from code execution
-                                        download_links = []
-                                        files_output = getattr(
-                                            result_block, "content", []
-                                        )
-                                        if files_output:
-                                            logger.debug(
-                                                f"Found {len(files_output)} file outputs"
-                                            )
-                                            for file_obj in files_output:
-                                                logger.debug(
-                                                    f" Processing file object: {file_obj}"
-                                                )
-                                                # Files in bash results have file_id
-                                                file_id = getattr(
-                                                    file_obj, "file_id", None
-                                                )
-                                                if file_id:
-                                                    # Generate download link - download file and save to Open-WebUI
-                                                    download_link = await self._generate_file_download_link(
-                                                        file_id=file_id,
-                                                        api_key=api_key,
-                                                        user_id=__user__.get(
-                                                            "id", "unknown"
-                                                        ),
-                                                    )
-                                                    download_links.append(download_link)
-
-                                        if (
-                                            stdout
-                                            or stderr
-                                            or return_code is not None
-                                            or download_links
-                                        ):
-                                            if code_exec_is_web_filtering and code_exec_had_web_tools:
-                                                logger.debug("Suppressed bash code execution block (web filtering)")
-                                            else:
-                                                # Update the live-streamed code block with final result
-                                                duration = time.time() - code_exec_start_time if code_exec_start_time else None
-                                                block = self._format_code_execution_block(
-                                                    last_code_content, "bash",
-                                                    done=True, duration=duration,
-                                                    stdout=stdout, stderr=stderr,
-                                                    return_code=return_code,
-                                                    download_links=download_links,
-                                                )
-                                                await update_content_block(code_exec_last_block, block)
-                                                code_exec_last_block = ""
-                                            last_code_content = ""
-                                elif content_type == "text_editor_code_execution_tool_result":
-                                    logger.debug(
-                                        f"Processing text_editor_code_execution_tool_result: {content_block}"
-                                    )
-                                    # Persist hidden payload for API replay (display block is stripped on reload).
-                                    await self._persist_server_tool_result(
-                                        content_block,
-                                        "text_editor_code_execution_tool_result",
-                                        emit_message_delta,
-                                        summary_text="✏️ text_editor result",
-                                    )
-                                    result_block = getattr(
-                                        content_block, "content", None
-                                    )
-                                    if result_block:
-                                        result_type = getattr(result_block, "type", "")
-                                        logger.debug(
-                                            f"Text editor result type: {result_type}"
-                                        )
-
-                                        # Check for server tool errors (file_not_found, string_not_found, unavailable, etc.)
-                                        if result_type == "text_editor_code_execution_tool_result_error":
-                                            error_code = getattr(result_block, "error_code", "unknown")
-                                            error_msg = f"⚠️ Text editor error: {error_code}"
-                                            logger.warning(f"text_editor_code_execution error: {error_code}")
-                                            await emit_message_delta(f"{error_msg}")
-                                            last_code_content = ""
-                                            continue
-
-                                        if code_exec_is_web_filtering and code_exec_had_web_tools:
-                                            # Dynamic filtering confirmed: suppress text editor UI
-                                            logger.debug("Suppressed text editor block (web filtering)")
-                                            last_code_content = ""
-                                        else:
-                                            # Handle create/update results
-                                            if (
-                                                result_type
-                                                == "text_editor_code_execution_create_result"
-                                            ):
-                                                if last_code_content and last_code_language == "__inline_text__":
-                                                    msg = f"\n\n{last_code_content}\n\n"
-                                                    await emit_message_delta(msg)
-                                                    last_code_content = ""
-                                                    last_code_language = ""
-                                                elif last_code_content:
-                                                    # Replace live-streamed block with final version
-                                                    duration = time.time() - code_exec_start_time if code_exec_start_time else None
-                                                    block = self._format_code_execution_block(
-                                                        last_code_content, last_code_language or "python",
-                                                        done=True, duration=duration,
-                                                    )
-                                                    await update_content_block(code_exec_last_block, block)
-                                                    code_exec_last_block = ""
-                                                    last_code_content = ""
-
-                                            elif (
-                                                result_type
-                                                == "text_editor_code_execution_view_result"
-                                            ):
-                                                content = getattr(
-                                                    result_block, "content", ""
-                                                )
-                                                if content:
-                                                    msg = f"\n<details>\n<summary>📄 File Content</summary>\n\n```\n{content}\n```\n</details>\n"
-                                                    await emit_message_delta(msg)
-                                elif content_type == "code_execution_tool_result":
-                                    logger.debug(
-                                        "Processing code_execution_tool_result"
-                                    )
-                                    # Persist hidden payload for API replay (display block is stripped on reload).
-                                    await self._persist_server_tool_result(
-                                        content_block,
-                                        "code_execution_tool_result",
-                                        emit_message_delta,
-                                        summary_text="🐍 code_execution result",
-                                    )
-                                    result_block = getattr(content_block, "content", None)
-                                    stdout = ""
-                                    stderr = ""
-                                    return_code = None
-                                    if result_block:
-                                        # Check for server tool errors
-                                        result_block_type = (
-                                            result_block.get("type", "") if isinstance(result_block, dict)
-                                            else getattr(result_block, "type", "")
-                                        )
-                                        if result_block_type == "code_execution_tool_result_error":
-                                            error_code = (
-                                                result_block.get("error_code", "unknown") if isinstance(result_block, dict)
-                                                else getattr(result_block, "error_code", "unknown")
-                                            )
-                                            error_msg = f"⚠️ Code execution error: {error_code}"
-                                            logger.warning(f"code_execution error: {error_code}")
-                                            await emit_message_delta(f"{error_msg}")
-                                            last_code_content = ""
-                                            in_code_execution = False
-                                            code_exec_is_web_filtering = False
-                                            continue
-
-                                        # Handle both dict (legacy) and object (new API) formats
-                                        if isinstance(result_block, dict):
-                                            stdout = result_block.get("stdout", "")
-                                            stderr = result_block.get("stderr", "")
-                                            return_code = result_block.get("return_code", None)
-                                        else:
-                                            stdout = getattr(result_block, "stdout", "")
-                                            stderr = getattr(result_block, "stderr", "")
-                                            return_code = getattr(result_block, "return_code", None)
-
-                                    if code_exec_is_web_filtering and code_exec_had_web_tools:
-                                        logger.debug("Suppressed code_execution_tool_result (web filtering)")
-                                        last_code_content = ""
-                                    elif stdout or stderr or return_code is not None or code_exec_tool_calls_info:
-                                        # Update the live-streamed code block with final result
-                                        duration = time.time() - code_exec_start_time if code_exec_start_time else None
-                                        code_to_show = last_code_content or code_exec_current_code
-                                        block = self._format_code_execution_block(
-                                            code_to_show, "python",
-                                            done=True, duration=duration,
-                                            stdout=stdout, stderr=stderr,
-                                            return_code=return_code,
-                                            tool_calls_info=code_exec_tool_calls_info,
-                                        )
-                                        await update_content_block(code_exec_last_block, block)
-                                        code_exec_last_block = ""
-                                        last_code_content = ""
-
-                                    # Emit "complete" status only if it wasn't web filtering
-                                    was_web_filtering = code_exec_is_web_filtering and code_exec_had_web_tools
-
-                                    # Reset code execution state
-                                    in_code_execution = False
-                                    code_exec_is_web_filtering = False
-                                    code_exec_has_user_tools = False
-                                    code_exec_had_web_tools = False
-                                    code_exec_tool_calls_info = []
-                                    code_exec_stream_start_idx = -1
-
-                                    if not was_web_filtering:
-                                        pass  # code_interpreter block handles "Analyzed" state visually
-                                elif content_type == "web_search_tool_result":
-                                    logger.debug(
-                                        f" Processing web search result event: {event}"
-                                    )
-                                    content_items = getattr(
-                                        content_block, "content", None
-                                    )
-                                    wstr_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
-                                    # Check for error: content is a single error object (not a list)
-                                    error_code = None
-                                    if content_items and not isinstance(content_items, list):
-                                        content_inner_type = getattr(content_items, "type", "")
-                                        if content_inner_type == "web_search_tool_result_error":
-                                            error_code = getattr(content_items, "error_code", "unknown")
-                                    if error_code:
-                                        error_msg = f"⚠️ Web search error: {error_code}"
-                                        logger.warning(f"web_search error: {error_code}")
-                                        # Status event removed: error info is shown inside the
-                                        # merged server_tool_use details block (body).
-                                        # Merge error result into the existing server_tool_use
-                                        # carrier so only ONE collapsible is rendered.
-                                        err_payload = {"type": "web_search_tool_result_error", "error_code": error_code}
-                                        carrier_info = server_tool_use_carriers.pop(wstr_tool_use_id, None) if wstr_tool_use_id else None
-                                        if carrier_info:
-                                            merged = self._format_server_tool_use_block(
-                                                tool_name=carrier_info["tool_name"],
-                                                tool_use_id=wstr_tool_use_id,
-                                                tool_input=carrier_info["tool_input"],
-                                                result_payload=err_payload,
-                                                result_block_type="web_search_tool_result",
-                                                result_summary=error_msg,
-                                                result_display_body=f"**{error_msg}** `{error_code}`",
-                                            )
-                                            await update_content_block(carrier_info["block"], merged)
-                                    elif content_items and isinstance(content_items, list) and len(content_items) > 0:
-                                            # Extract first result title for status
-                                            first_result = (
-                                                content_items[0]
-                                                if content_items
-                                                else None
-                                            )
-                                            result_title = (
-                                                getattr(first_result, "title", "")
-                                                if first_result
-                                                else ""
-                                            )
-                                            result_count = len(content_items)
-
-                                            if result_title and result_count > 0:
-                                                status_desc = f"Found {result_count} results - {result_title}"
-                                                if result_count > 1:
-                                                    status_desc += (
-                                                        f" +{result_count-1} more"
-                                                    )
-                                            else:
-                                                status_desc = "Web Search Complete"
-
-                                            # Status event removed: result info is shown inside
-                                            # the merged server_tool_use details block (body).
-                                            # Merge result INTO the existing server_tool_use carrier:
-                                            # summary updates to "Found X results…", body becomes URL
-                                            # list, and the carrier embeds both tool_use + tool_result
-                                            # payloads for API replay. One visible collapsible only.
-                                            if wstr_tool_use_id:
-                                                serialized_items = []
-                                                display_lines = []
-                                                for item in content_items:
-                                                    if hasattr(item, "model_dump"):
-                                                        item_d = item.model_dump(exclude_none=True)
-                                                    elif isinstance(item, dict):
-                                                        item_d = item
-                                                    else:
-                                                        continue
-                                                    serialized_items.append(item_d)
-                                                    t = item_d.get("title") or ""
-                                                    u = item_d.get("url") or ""
-                                                    if u:
-                                                        display_lines.append(f"- [{html.escape(t or u)}]({u})")
-                                                display_body = "\n".join(display_lines[:10])
-                                                # Prepend the status line so it shows in the body
-                                                # when the user expands the collapsible.
-                                                if status_desc:
-                                                    display_body = f"**{status_desc}**\n\n{display_body}" if display_body else f"**{status_desc}**"
-                                                carrier_info = server_tool_use_carriers.pop(wstr_tool_use_id, None)
-                                                if carrier_info:
-                                                    merged = self._format_server_tool_use_block(
-                                                        tool_name=carrier_info["tool_name"],
-                                                        tool_use_id=wstr_tool_use_id,
-                                                        tool_input=carrier_info["tool_input"],
-                                                        result_payload=serialized_items,
-                                                        result_block_type="web_search_tool_result",
-                                                        result_summary=status_desc,
-                                                        result_display_body=display_body,
-                                                    )
-                                                    await update_content_block(carrier_info["block"], merged)
-                                elif content_type == "web_fetch_tool_result":
-                                    logger.debug("Processing web_fetch_tool_result")
-                                    # Check for errors (error is in content.error_code)
-                                    result_content = getattr(content_block, "content", None)
-                                    wftr_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
-                                    error_code = None
-                                    if result_content:
-                                        content_type_inner = getattr(result_content, "type", "")
-                                        if content_type_inner == "web_fetch_tool_error":
-                                            error_code = getattr(result_content, "error_code", "unknown")
-                                    if error_code:
-                                        # Status event removed: error info shown inside details body.
-                                        if wftr_tool_use_id:
-                                            err_payload = {"type": "web_fetch_tool_error", "error_code": error_code}
-                                            carrier_info = server_tool_use_carriers.pop(wftr_tool_use_id, None)
-                                            if carrier_info:
-                                                merged = self._format_server_tool_use_block(
-                                                    tool_name=carrier_info["tool_name"],
-                                                    tool_use_id=wftr_tool_use_id,
-                                                    tool_input=carrier_info["tool_input"],
-                                                    result_payload=err_payload,
-                                                    result_block_type="web_fetch_tool_result",
-                                                    result_summary=f"🌐 Fetch failed: {error_code}",
-                                                    result_display_body=f"**🌐 Fetch failed:** `{error_code}`",
-                                                )
-                                                await update_content_block(carrier_info["block"], merged)
-                                    else:
-                                        # Status event removed: fetched URL shown inside details body.
-                                        # Merge web_fetch result into existing carrier (single collapsible).
-                                        if wftr_tool_use_id and result_content is not None:
-                                            if hasattr(result_content, "model_dump"):
-                                                serialized = result_content.model_dump(exclude_none=True)
-                                            elif isinstance(result_content, dict):
-                                                serialized = result_content
-                                            else:
-                                                serialized = None
-                                            if serialized is not None:
-                                                fetch_url = ""
-                                                if isinstance(serialized, dict):
-                                                    fetch_url = serialized.get("url") or ""
-                                                status_line = (
-                                                    f"**🌐 URL fetched:** {fetch_url}"
-                                                    if fetch_url
-                                                    else "**🌐 URL fetched**"
-                                                )
-                                                display_body = status_line
-                                                carrier_info = server_tool_use_carriers.pop(wftr_tool_use_id, None)
-                                                if carrier_info:
-                                                    merged = self._format_server_tool_use_block(
-                                                        tool_name=carrier_info["tool_name"],
-                                                        tool_use_id=wftr_tool_use_id,
-                                                        tool_input=carrier_info["tool_input"],
-                                                        result_payload=serialized,
-                                                        result_block_type="web_fetch_tool_result",
-                                                        result_summary=f"🌐 URL fetched: {fetch_url}" if fetch_url else "🌐 URL fetched",
-                                                        result_display_body=display_body,
-                                                    )
-                                                    await update_content_block(carrier_info["block"], merged)
-                                elif content_type == "advisor_tool_result":
-                                    logger.debug(
-                                        f" Processing advisor result event: {event}"
-                                    )
-                                    # advisor_tool_result MUST be replayed verbatim — the
-                                    # server constructs the advisor's view from the full
-                                    # transcript, and subsequent turns depend on byte-exact
-                                    # replay (plaintext advisor_result OR opaque
-                                    # advisor_redacted_result) for cache + context fidelity.
-                                    adv_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
-                                    adv_content = getattr(content_block, "content", None)
-                                    adv_inner_type = (
-                                        getattr(adv_content, "type", "")
-                                        if adv_content is not None and hasattr(adv_content, "type")
-                                        else (adv_content.get("type", "") if isinstance(adv_content, dict) else "")
-                                    )
-                                    # Serialize the full content payload for API replay.
-                                    serialized_content: Any = None
-                                    if adv_content is not None:
-                                        if hasattr(adv_content, "model_dump"):
-                                            try:
-                                                serialized_content = adv_content.model_dump(
-                                                    exclude_none=True, mode="json"
-                                                )
-                                            except Exception:
-                                                try:
-                                                    serialized_content = adv_content.model_dump(
-                                                        exclude_none=True
-                                                    )
-                                                except Exception:
-                                                    serialized_content = None
-                                        elif isinstance(adv_content, dict):
-                                            serialized_content = adv_content
-                                    if serialized_content is None:
-                                        serialized_content = {}
-
-                                    if adv_inner_type == "advisor_tool_result_error":
-                                        error_code = (
-                                            getattr(adv_content, "error_code", "unknown")
-                                            if hasattr(adv_content, "error_code")
-                                            else (adv_content.get("error_code", "unknown") if isinstance(adv_content, dict) else "unknown")
-                                        )
-                                        status_desc = f"🧑‍⚖️ Advisor error: {error_code}"
-                                        display_body = f"**{status_desc}** `{html.escape(error_code)}`"
-                                        logger.warning(f"advisor error: {error_code}")
-                                    elif adv_inner_type == "advisor_redacted_result":
-                                        status_desc = "🧑‍⚖️ Advisor: (redacted)"
-                                        display_body = (
-                                            "**🧑‍⚖️ Advisor consulted** _(encrypted output; "
-                                            "content is decrypted server-side on the next turn)_"
-                                        )
-                                    else:
-                                        # advisor_result (plaintext) or unknown success shape
-                                        advice_text = ""
-                                        if hasattr(adv_content, "text"):
-                                            advice_text = getattr(adv_content, "text", "") or ""
-                                        elif isinstance(adv_content, dict):
-                                            advice_text = adv_content.get("text", "") or ""
-                                        preview = advice_text.strip().splitlines()[0] if advice_text.strip() else ""
-                                        status_desc = (
-                                            f"🧑‍⚖️ Advisor: {preview[:80]}"
-                                            if preview
-                                            else "🧑‍⚖️ Advisor consulted"
-                                        )
-                                        if advice_text.strip():
-                                            display_body = advice_text.strip()
-                                        else:
-                                            display_body = "**🧑‍⚖️ Advisor consulted** _(empty response)_"
-
-                                    if adv_tool_use_id:
-                                        carrier_info = server_tool_use_carriers.pop(
-                                            adv_tool_use_id, None
-                                        )
-                                        if carrier_info:
-                                            merged = self._format_server_tool_use_block(
-                                                tool_name=carrier_info["tool_name"],
-                                                tool_use_id=adv_tool_use_id,
-                                                tool_input=carrier_info["tool_input"],
-                                                result_payload=serialized_content,
-                                                result_block_type="advisor_tool_result",
-                                                result_summary=status_desc,
-                                                result_display_body=display_body,
-                                            )
-                                            await update_content_block(
-                                                carrier_info["block"], merged
-                                            )
-                                        else:
-                                            standalone = self._format_server_tool_result_block(
-                                                block_type="advisor_tool_result",
-                                                tool_use_id=adv_tool_use_id,
-                                                content_payload=serialized_content,
-                                                display_body=display_body,
-                                                summary_text=status_desc,
-                                            )
-                                            await emit_message_delta(standalone)
-                                elif content_type == "tool_search_tool_result":
-                                    logger.debug(
-                                        f" Processing tool search result event: {event}"
-                                    )
-                                    # tool_search_tool_result MUST be persisted verbatim and
-                                    # replayed on the next API turn — otherwise the prompt
-                                    # cache prefix is invalidated (server_tool_use/tool_result
-                                    # positions must match byte-exact). Merge the result INTO
-                                    # the existing server_tool_use carrier so one collapsible
-                                    # carries both the tool call and its result payload.
-                                    tsr_tool_use_id = getattr(content_block, "tool_use_id", "") or ""
-                                    content_obj = getattr(content_block, "content", None)
-                                    # Extract tool_references for display summary
-                                    tool_references = []
-                                    if content_obj:
-                                        if hasattr(content_obj, "tool_references"):
-                                            tool_references = getattr(
-                                                content_obj, "tool_references", []
-                                            ) or []
-                                        elif isinstance(content_obj, dict):
-                                            tool_references = content_obj.get(
-                                                "tool_references", []
-                                            ) or []
-                                    tool_names = []
-                                    for ref in tool_references:
-                                        if hasattr(ref, "tool_name"):
-                                            tool_names.append(getattr(ref, "tool_name", "unknown"))
-                                        elif isinstance(ref, dict):
-                                            tool_names.append(ref.get("tool_name", "unknown"))
-                                    if tool_names:
-                                        status_desc = (
-                                            f"🧰 Found {len(tool_names)} tool(s): "
-                                            f"{', '.join(tool_names[:5])}"
-                                            + (f" +{len(tool_names)-5} more" if len(tool_names) > 5 else "")
-                                        )
-                                    else:
-                                        status_desc = "🧰 Tool search: no matching tools"
-                                    display_body = status_desc
-
-                                    # Serialize the full tool_search_tool_result payload for
-                                    # API replay. Must preserve all tool_references fields.
-                                    serialized_content: Any = None
-                                    if content_obj is not None:
-                                        if hasattr(content_obj, "model_dump"):
-                                            try:
-                                                serialized_content = content_obj.model_dump(
-                                                    exclude_none=True, mode="json"
-                                                )
-                                            except Exception:
-                                                try:
-                                                    serialized_content = content_obj.model_dump(
-                                                        exclude_none=True
-                                                    )
-                                                except Exception:
-                                                    serialized_content = None
-                                        elif isinstance(content_obj, dict):
-                                            serialized_content = content_obj
-                                    if serialized_content is None:
-                                        # Fallback: rebuild from extracted tool_references only.
-                                        serialized_content = {
-                                            "tool_references": [
-                                                {"type": "tool_reference", "tool_name": n}
-                                                for n in tool_names
-                                            ],
-                                        }
-
-                                    if tsr_tool_use_id:
-                                        carrier_info = server_tool_use_carriers.pop(
-                                            tsr_tool_use_id, None
-                                        )
-                                        if carrier_info:
-                                            merged = self._format_server_tool_use_block(
-                                                tool_name=carrier_info["tool_name"],
-                                                tool_use_id=tsr_tool_use_id,
-                                                tool_input=carrier_info["tool_input"],
-                                                result_payload=serialized_content,
-                                                result_block_type="tool_search_tool_result",
-                                                result_summary=status_desc,
-                                                result_display_body=display_body,
-                                            )
-                                            await update_content_block(
-                                                carrier_info["block"], merged
-                                            )
-                                        else:
-                                            # No carrier (legacy / missing server_tool_use stop):
-                                            # emit a standalone server_tool_result carrier so
-                                            # the payload still survives the DB round-trip.
-                                            standalone = self._format_server_tool_result_block(
-                                                block_type="tool_search_tool_result",
-                                                tool_use_id=tsr_tool_use_id,
-                                                content_payload=serialized_content,
-                                                display_body=display_body,
-                                                summary_text=status_desc,
-                                            )
-                                            await emit_message_delta(standalone)
-                                elif content_type == "context_cleared":
-                                    cleared_info = getattr(content_block, "cleared", {})
-                                    cleared_type = (
-                                        getattr(cleared_info, "type", "unknown")
-                                        if hasattr(cleared_info, "type")
-                                        else cleared_info.get("type", "unknown")
-                                    )
-                                    cleared_tokens = (
-                                        getattr(cleared_info, "tokens_cleared", 0)
-                                        if hasattr(cleared_info, "tokens_cleared")
-                                        else cleared_info.get("tokens_cleared", 0)
-                                    )
-
-                                    if cleared_type == "tool_uses":
-                                        status_desc = f"🧹 Cleared tool results: ~{cleared_tokens:,} tokens removed"
-                                    elif cleared_type == "thinking":
-                                        status_desc = f"🧹 Cleared thinking blocks: ~{cleared_tokens:,} tokens removed"
-                                    else:
-                                        status_desc = f"🧹 Context cleared: ~{cleared_tokens:,} tokens removed"
-
-                                    await emit_event_local(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "description": status_desc,
-                                                "done": True,
-                                            },
-                                        }
-                                    )
-                                    logger.debug(
-                                        f"Context cleared: type={cleared_type}, tokens={cleared_tokens}"
-                                    )
-                                elif content_type == "compaction":
-                                    # Compaction started — API is summarizing the conversation
-                                    compaction_content = ""
-                                    compaction_last_block = ""
-                                    await emit_event_local(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "description": "📦 Compacting conversation context...",
-                                                "done": False,
-                                            },
-                                        }
-                                    )
-                                    logger.info("Compaction block started")
-
-                            # ---------------------------------------------------------
-                            # EVENT: content_block_delta
-                            # Handles streaming deltas for: thinking, text, tool_use input,
-                            # server tool input, citations
-                            # ---------------------------------------------------------
-                            elif event_type == "content_block_delta":
-                                delta = getattr(event, "delta", None)
-                                delta_type = getattr(delta, "type", None)
-                                if delta_type == "thinking_delta":
-                                    thinking_text = getattr(delta, "thinking", "")
-                                    thinking_message += thinking_text
-                                    # Stream thinking inside <details> wrapper for native collapsible UI
-                                    if thinking_text:
-                                        formatted = self._format_thinking_block(thinking_message, duration=None)
-                                        await update_content_block(thinking_last_block, formatted)
-                                        thinking_last_block = formatted
-                                elif delta_type == "signature_delta":
-                                    # Accumulate the opaque signature for this thinking block.
-                                    # The signature is required byte-exact when replaying
-                                    # thinking blocks across turns (see Thinking encryption docs).
-                                    thinking_signature += getattr(delta, "signature", "") or ""
-                                elif delta_type == "compaction_delta":
-                                    # Accumulate compaction content progressively (may arrive in multiple deltas)
-                                    compaction_content += getattr(delta, "content", "")
-                                    # Stream progressively via update_content_block (like thinking)
-                                    formatted = self._format_compaction_block(compaction_content)
-                                    await update_content_block(compaction_last_block, formatted)
-                                    compaction_last_block = formatted
-                                elif delta_type == "text_delta":
-                                    text_delta = getattr(delta, "text", "")
-
-                                    # Emit "Responding..." status on first text delta (only once)
-                                    if (
-                                        not first_text_emitted
-                                        and not is_model_thinking
-                                        and not active_server_tool_name
-                                    ):
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": "Responding...",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
-                                        first_text_emitted = True
-
-                                    chunk += text_delta
-                                    chunk_count += 1
-                                elif delta_type == "input_json_delta":
-                                    partial = getattr(delta, "partial_json", "")
-
-                                    # Handle server tool input separately from client tools
-                                    if active_server_tool_name:
-                                        # Server tool (web_search, code_execution) - accumulate and extract query
-                                        server_tool_input_buffer += partial
-
-                                        if active_server_tool_name == "web_search":
-                                            try:
-                                                # Try to parse the accumulated JSON to extract query
-                                                parsed = json.loads(
-                                                    server_tool_input_buffer
-                                                )
-                                                if "query" in parsed:
-                                                    new_query = parsed["query"]
-                                                    logger.debug(
-                                                        f"Web search query complete: '{new_query}'"
-                                                    )
-
-                                                    # Emit status only once when we get the complete query
-                                                    if (
-                                                        new_query
-                                                        and new_query
-                                                        != current_search_query
-                                                    ):
-                                                        current_search_query = (
-                                                            new_query
-                                                        )
-                                                        # Status event removed: search query is shown
-                                                        # inside the merged server_tool_use details
-                                                        # block (summary text + body).
-                                            except Exception as e:
-                                                logger.debug(
-                                                    f"Web search query extraction error: {e}"
-                                                )
-                                        elif active_server_tool_name == "web_fetch":
-                                            try:
-                                                parsed = json.loads(server_tool_input_buffer)
-                                                if "url" in parsed:
-                                                    fetch_url = parsed["url"]
-                                                    # Status event removed: URL is shown inside
-                                                    # the merged server_tool_use details block.
-                                                    _ = fetch_url
-                                            except Exception:
-                                                pass
-                                        elif (
-                                            active_server_tool_name
-                                            == "code_execution"
-                                        ):
-                                            # Code execution (programmatic tool calling) - extract code for display
-                                            try:
-                                                parsed = json.loads(server_tool_input_buffer)
-                                                if "code" in parsed:
-                                                    code_execution_code = parsed["code"]
-                                                    # Live stream code inside details block
-                                                    if not code_exec_is_web_filtering or not code_exec_had_web_tools:
-                                                        code_exec_current_code = code_execution_code
-                                                        code_exec_current_lang = parsed.get("language", "python")
-                                                        block = self._format_code_execution_block(
-                                                            code_exec_current_code, code_exec_current_lang,
-                                                        )
-                                                        await update_content_block(code_exec_last_block, block)
-                                                        code_exec_last_block = block
-                                            except (json.JSONDecodeError, KeyError):
-                                                pass
-                                        elif (
-                                            active_server_tool_name
-                                            == "bash_code_execution"
-                                        ):
-                                            # Bash code execution - extract command (the actual code)
-                                            try:
-                                                parsed = json.loads(
-                                                    server_tool_input_buffer
-                                                )
-                                                if "command" in parsed:
-                                                    bash_execution_command = parsed[
-                                                        "command"
-                                                    ]
-                                                    # Live stream bash code inside details block
-                                                    if not code_exec_is_web_filtering or not code_exec_had_web_tools:
-                                                        code_exec_current_code = bash_execution_command
-                                                        code_exec_current_lang = "bash"
-                                                        block = self._format_code_execution_block(
-                                                            code_exec_current_code, code_exec_current_lang,
-                                                        )
-                                                        await update_content_block(code_exec_last_block, block)
-                                                        code_exec_last_block = block
-                                                    logger.debug(
-                                                        f"Bash execution command: {bash_execution_command[:100]}..."
-                                                    )
-                                            except Exception as e:
-                                                logger.debug(
-                                                    f"Bash execution input extraction error: {e}"
-                                                )
-                                        elif (
-                                            active_server_tool_name
-                                            == "text_editor_code_execution"
-                                        ):
-                                            # Text editor input - extract command and file_text
-                                            try:
-                                                parsed = json.loads(
-                                                    server_tool_input_buffer
-                                                )
-                                                if "command" in parsed:
-                                                    text_editor_command = parsed[
-                                                        "command"
-                                                    ]
-                                                if "path" in parsed:
-                                                    text_editor_file_path = parsed[
-                                                        "path"
-                                                    ]
-                                                if "file_text" in parsed:
-                                                    text_editor_file_content = (
-                                                        parsed["file_text"]
-                                                    )
-                                                    # Live stream file content inside details block
-                                                    if text_editor_command == "create" and text_editor_file_content:
-                                                        TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".rst", ".html", ".htm", ".css"}
-                                                        file_ext = os.path.splitext(text_editor_file_path)[1].lower() if text_editor_file_path else ""
-                                                        if file_ext not in TEXT_EXTENSIONS:
-                                                            EXT_TO_LANG = {".py": "python", ".js": "javascript", ".ts": "typescript", ".sh": "bash", ".sql": "sql"}
-                                                            lang = EXT_TO_LANG.get(file_ext, "python")
-                                                            block = self._format_code_execution_block(text_editor_file_content, lang)
-                                                            await update_content_block(code_exec_last_block, block)
-                                                            code_exec_last_block = block
-                                            except Exception as e:
-                                                logger.debug(
-                                                    f"Text editor input extraction error: {e}"
-                                                )
-                                        elif active_server_tool_name in [
-                                            "tool_search_tool_regex",
-                                            "tool_search_tool_bm25",
-                                        ]:
-                                            # Tool search input - extract and show query
-                                            try:
-                                                parsed = json.loads(
-                                                    server_tool_input_buffer
-                                                )
-                                                if "query" in parsed:
-                                                    search_query = parsed["query"]
-                                                    logger.debug(
-                                                        f"Tool search query: '{search_query}'"
-                                                    )
-                                                    await emit_event_local(
-                                                        {
-                                                            "type": "status",
-                                                            "data": {
-                                                                "description": f"🔍 Searching tools: {search_query}",
-                                                                "done": False,
-                                                            },
-                                                        }
-                                                    )
-                                            except Exception as e:
-                                                logger.debug(
-                                                    f"Tool search query extraction error: {e}"
-                                                )
-                                    else:
-                                        # Client-side tool - accumulate in tools_buffer
-                                        tools_buffer += partial
-                                        tool_input_buffer += partial
-
-                                        # Live stream tool input to UI (like thinking blocks stream text)
-                                        if not in_code_execution and tool_id_at_start in tool_progress_blocks:
-                                            parsed_input = self._try_parse_partial_json(tool_input_buffer)
-                                            if parsed_input is not None:
-                                                old_block = tool_progress_blocks[tool_id_at_start]
-                                                new_block = self._format_tool_result_block(
-                                                    tool_id_at_start, tool_name, parsed_input, "", done=False
-                                                )
-                                                # Replace old in-progress text with updated text
-                                                text = final_text()
-                                                text = text.replace(old_block, new_block, 1)
-                                                tool_progress_blocks[tool_id_at_start] = new_block
-                                                final_message.clear()
-                                                final_message.append(text)
-                                                await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
-                                elif delta_type == "citations_delta":
-                                        # Web search citations arrive BEFORE the text they cite.
-                                        # Emit marker for PREVIOUS citation when a new one arrives
-                                        # (so marker appears AFTER the cited text, not before it).
-                                        if pending_citation_markers:
-                                            citation_str = "".join(f"[{n}]" for n in pending_citation_markers)
-                                            chunk += citation_str
-                                            pending_citation_markers = []
-                                        citation_counter += 1
-                                        pending_citation_markers.append(citation_counter)
-
-                                        # Process and store citation
-                                        await self.handle_citation(
-                                            event, __event_emitter__, citation_counter
-                                        )
-
-                            # ---------------------------------------------------------
-                            # EVENT: content_block_stop
-                            # Finalizes: thinking blocks, tool_use blocks, server tools
-                            # Triggers async tool execution for client-side tools
-                            # ---------------------------------------------------------
-                            elif event_type == "content_block_stop":
-                                content_block = getattr(event, "content_block", None)
-                                content_type = (
-                                    getattr(content_block, "type", None)
-                                    if content_block
-                                    else current_block_type  # Fallback: raw SDK stop events lack content_block
-                                )
-                                event_name = getattr(event, "name", "")
-
-                                if content_type == "text":
-                                    # Flush any remaining deferred citation markers
-                                    if pending_citation_markers:
-                                        chunk += "".join(f"[{n}]" for n in pending_citation_markers)
-                                        pending_citation_markers = []
-                                    if chunk:
-                                        if not chunk.endswith("\n"):
-                                            chunk += "\n"
-                                        await emit_message_delta(chunk)
-                                        chunk = ""
-                                        chunk_count = 0
-                                    elif final_message and not final_text().endswith("\n"):
-                                        # Chunk was already flushed by throttle — ensure \n separator
-                                        await emit_message_delta("\n")
-                                elif content_type == "compaction":
-                                    # Compaction block finished streaming
-                                    logger.info(f"Compaction summary complete: {len(compaction_content)} chars")
-                                    await emit_event_local(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "description": f"📦 Context compacted ({len(compaction_content)} chars summary)",
-                                                "done": True,
-                                            },
-                                        }
-                                    )
-                                elif content_type == "server_tool_use":
-                                    logger.debug(
-                                        f"Server tool block stopped: {active_server_tool_name}"
-                                    )
-
-                                    # Code is now streamed live inside <details> during input_json_delta
-                                    # Just set last_code_content/language for result handlers
-                                    if (
-                                        active_server_tool_name == "bash_code_execution"
-                                        and bash_execution_command
-                                    ):
-                                        last_code_language = "bash"
-                                        last_code_content = bash_execution_command
-                                    elif (
-                                        active_server_tool_name
-                                        == "text_editor_code_execution"
-                                        and text_editor_command == "create"
-                                        and text_editor_file_content
-                                    ):
-                                        TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".rst", ".html", ".htm", ".css"}
-                                        file_ext = os.path.splitext(text_editor_file_path)[1].lower() if text_editor_file_path else ""
-                                        if file_ext in TEXT_EXTENSIONS:
-                                            last_code_content = text_editor_file_content
-                                            last_code_language = "__inline_text__"
-                                        else:
-                                            EXT_TO_LANG = {".py": "python", ".js": "javascript", ".ts": "typescript", ".sh": "bash", ".sql": "sql", ".r": "r", ".rb": "ruby", ".java": "java", ".c": "c", ".cpp": "cpp", ".go": "go", ".rs": "rust"}
-                                            last_code_language = EXT_TO_LANG.get(file_ext, "python")
-                                            last_code_content = text_editor_file_content
-                                    elif (
-                                        active_server_tool_name == "code_execution"
-                                        and code_execution_code
-                                    ):
-                                        last_code_language = "python"
-                                        last_code_content = code_execution_code
-                                    elif active_server_tool_name == "web_fetch":
-                                        pass
-
-                                    # Persist server_tool_use blocks into assistant content so they
-                                    # survive the OpenWebUI DB round-trip. Without this, the next turn
-                                    # replays the assistant message with thinking blocks shifted out
-                                    # of their original positions and the Anthropic API rejects it with:
-                                    #   "thinking blocks cannot be modified"
-                                    # (Also invalidates the prompt cache.) The visible
-                                    # <details type="code_interpreter"> display block is stripped on
-                                    # replay (PATTERN_CODE_INTERPRETER_DETAILS), so the hidden payload
-                                    # block here is the only API-replayable carrier.
-                                    SERVER_TOOLS_TO_PERSIST = (
-                                        "web_search", "web_fetch",
-                                        "code_execution", "bash_code_execution",
-                                        "text_editor_code_execution",
-                                        "tool_search_tool_regex", "tool_search_tool_bm25",
-                                        "advisor",
-                                    )
-                                    if active_server_tool_name in SERVER_TOOLS_TO_PERSIST and active_server_tool_id:
-                                        try:
-                                            tool_input = json.loads(server_tool_input_buffer) if server_tool_input_buffer else {}
-                                        except (json.JSONDecodeError, ValueError):
-                                            tool_input = {}
-                                        persisted_block = self._format_server_tool_use_block(
-                                            tool_name=active_server_tool_name,
-                                            tool_use_id=active_server_tool_id,
-                                            tool_input=tool_input,
-                                        )
-                                        await emit_message_delta(persisted_block)
-                                        # Record for later in-place merge with tool_result
-                                        # (web_search / web_fetch). See web_*_tool_result handlers.
-                                        server_tool_use_carriers[active_server_tool_id] = {
-                                            "block": persisted_block,
-                                            "tool_name": active_server_tool_name,
-                                            "tool_input": tool_input,
-                                        }
-
-                                    active_server_tool_name = None
-                                    active_server_tool_id = None
-                                    server_tool_input_buffer = ""
-                                    text_editor_file_content = ""
-                                    text_editor_file_path = ""
-                                    text_editor_command = ""
-                                    bash_execution_command = ""
-                                    code_execution_code = ""
-                                elif content_type == "tool_use" and tools_buffer:
-                                    # Check if it's valid JSON already, if not close it
-                                    try:
-                                        json.loads(tools_buffer)
-                                        # Already valid JSON, no need to close
-                                        logger.debug(
-                                            f" tools_buffer already valid JSON: {tools_buffer}"
-                                        )
-                                    except json.JSONDecodeError:
-                                        # Check if input is empty (ends with "input": )
-                                        if tools_buffer.rstrip().endswith(
-                                            '"input":'
-                                        ) or tools_buffer.rstrip().endswith(
-                                            '"input": '
-                                        ):
-                                            # Add empty object for input
-                                            tools_buffer += " {}"
-                                            logger.debug(
-                                                f" Added empty input object: {tools_buffer}"
-                                            )
-                                        # Invalid JSON, need to close the main object
-                                        tools_buffer += "}"
-                                        logger.debug(
-                                            f" Closed tools_buffer in content_block_stop: {tools_buffer}"
-                                        )
-
-                                    # Parse and store this tool_use block
-                                    logger.debug(f"Parsed tool call: {tools_buffer}")
-
-                                    # Parse and start tool execution immediately!
-                                    try:
-                                        tool_call_data = json.loads(tools_buffer)
-                                        tool_name = tool_call_data.get("name", "")
-                                        tool_input = tool_call_data.get("input", {})
-                                        tool_id = tool_call_data.get("id", "")
-
-                                        # Store tool_use block for assistant message
-                                        # Note: tool_use block with caller field is preserved
-                                        # by SDK accumulated message automatically
-
-                                        # Look up tool in __tools__ first (user tools with callable)
-                                        tool = (
-                                            __tools__.get(tool_name)
-                                            if __tools__
-                                            else None
-                                        )
-                                        if tool_name == "bash" and self.valves.ENABLE_BASH_TOOL and __tools__ and "run_command" in __tools__:
-                                            # Native bash tool → bridge to run_command
-                                            tool_call_data_list.append(tool_call_data)
-                                            args = tool_input if isinstance(tool_input, dict) else {}
-                                            task = asyncio.create_task(
-                                                self._dispatch_bash_tool(args, __tools__)
-                                            )
-                                            running_tool_tasks.append(task)
-                                            logger.debug(
-                                                f"🚀 Started bash bridge → run_command (task #{len(running_tool_tasks)})"
-                                            )
-                                        elif (
-                                            tool_name == "str_replace_based_edit_tool"
-                                            and self.valves.ENABLE_TEXT_EDITOR_TOOL
-                                            and __tools__
-                                            and "write_file" in __tools__
-                                            and "replace_file_content" in __tools__
-                                        ):
-                                            # Native text_editor tool → bridge to Open Terminal callables
-                                            tool_call_data_list.append(tool_call_data)
-                                            args = tool_input if isinstance(tool_input, dict) else {}
-                                            task = asyncio.create_task(
-                                                self._dispatch_text_editor_tool(args, __tools__)
-                                            )
-                                            running_tool_tasks.append(task)
-                                            logger.debug(
-                                                f"🚀 Started text_editor bridge (cmd={args.get('command', '?')}, "
-                                                f"task #{len(running_tool_tasks)})"
-                                            )
-                                        elif tool and tool.get("callable"):
-                                            # User tool with callable - execute directly
-                                            tool_call_data_list.append(tool_call_data)
-
-                                            # Note: We only emit status events here, NOT done=false details blocks.
-                                            # done=false blocks would pile up in the message since we use delta streaming,
-                                            # not full message replacement like OpenWebUI's native pipes.
-
-                                            # Start execution immediately as async task
-                                            args = (
-                                                tool_input
-                                                if isinstance(tool_input, dict)
-                                                else {}
-                                            )
-                                            task = asyncio.create_task(
-                                                tool["callable"](**args)
-                                            )
-                                            running_tool_tasks.append(task)
-
-                                            logger.debug(
-                                                f"🚀 Started immediate execution for user tool '%s' (task #%d)",
-                                                tool_name,
-                                                len(running_tool_tasks),
-                                            )
-                                        elif tool_name in builtin_tools and builtin_tools[tool_name].get("callable"):
-                                            # Builtin tool from OpenWebUI - execute with proper context
-                                            tool_call_data_list.append(tool_call_data)
-
-                                            args = (
-                                                tool_input
-                                                if isinstance(tool_input, dict)
-                                                else {}
-                                            )
-                                            task = asyncio.create_task(
-                                                builtin_tools[tool_name]["callable"](
-                                                    **args
-                                                )
-                                            )
-                                            running_tool_tasks.append(task)
-
-                                            logger.debug(
-                                                f"🚀 Started immediate execution for builtin tool '%s' (task #%d)",
-                                                tool_name,
-                                                len(running_tool_tasks),
-                                            )
-                                        elif tool_name in api_tool_names:
-                                            # API-provided tool (no callable) — passthrough mode
-                                            # Return the tool input as JSON in the response content
-                                            logger.info(
-                                                f"🔄 API tool passthrough for '{tool_name}': returning tool input as response"
-                                            )
-                                            passthrough_json = json.dumps(
-                                                tool_input, ensure_ascii=False
-                                            )
-                                            await emit_message_delta(passthrough_json)
-                                            api_tool_passthrough = True
-                                        else:
-                                            # Unknown tool - add error result
-                                            logger.warning(
-                                                f"Tool '{tool_name}' not found in __tools__ or builtin_tools"
-                                            )
-                                            tool_call_data_list.append(tool_call_data)
-
-                                            # Capture tool_name in default arg to avoid closure issue
-                                            async def error_result(tn=tool_name):
-                                                return json.dumps(
-                                                    {
-                                                        "error": f"Tool '{tn}' is not available. "
-                                                        f"It may require server context or is not configured."
-                                                    },
-                                                    ensure_ascii=False,
-                                                )
-
-                                            task = asyncio.create_task(error_result())
-                                            running_tool_tasks.append(task)
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Failed to start tool execution: {e}"
-                                        )
-
-                                    # Reset buffer for next tool
-                                    tools_buffer = ""
-                                elif is_model_thinking and content_type in ("thinking", "redacted_thinking"):
-                                    if content_type == "thinking" and thinking_message:
-                                        duration = time.time() - (thinking_start_time or time.time())
-                                        formatted = self._format_thinking_block(
-                                            thinking_message, duration, signature=thinking_signature
-                                        )
-                                        await update_content_block(thinking_last_block, formatted)
-                                        thinking_last_block = ""
-                                        logger.debug(
-                                            f"Finalized thinking block ({len(thinking_message)} chars, "
-                                            f"{duration:.1f}s, sig={len(thinking_signature)}c)"
-                                        )
-                                    elif content_type == "redacted_thinking":
-                                        logger.debug("Redacted thinking block completed (preserved by SDK)")
-                                    is_model_thinking = False
-                                    thinking_message = ""
-                                    thinking_signature = ""
-                                    thinking_stream_start_idx = -1
-                                # Reset tracked type
-                                current_block_type = None
-
-                            # ---------------------------------------------------------
-                            # EVENT: message_delta
-                            # Updates output token counts, handles stop_reason
-                            # Flushes buffered chunks
-                            # ---------------------------------------------------------
-                            elif event_type == "message_delta":
-                                if include_usage:
-                                    usage = getattr(event, "usage", None)
-                                    if usage:
-                                        current_output_tokens = getattr(
-                                            usage, "output_tokens", 0
-                                        )
-                                        diff = (
-                                            current_output_tokens - stream_output_tokens
-                                        )
-                                        total_usage["output_tokens"] += diff
-                                        stream_output_tokens = current_output_tokens
-                                delta = getattr(event, "delta", None)
-                                code_execution_container_id = getattr(delta, "container", None)
-                                if code_execution_container_id:
-                                    delta_container_id = getattr(code_execution_container_id, "id", None) if hasattr(code_execution_container_id, "id") else (code_execution_container_id.get("id") if isinstance(code_execution_container_id, dict) else str(code_execution_container_id))
-                                    if delta_container_id:
-                                        current_container_id = payload_for_stream.get("container")
-                                        if current_container_id != delta_container_id:
-                                            chunk += self._create_metadata_marker(
-                                                "container_id",
-                                                delta_container_id,
-                                                messagenum=len(
-                                                    payload_for_stream.get("messages", [])
-                                                ),
-                                            )
-                                            logger.debug(
-                                                f"📦 Container ID from message_delta: {delta_container_id}"
-                                            )
-                                        payload_for_stream["container"] = delta_container_id
-
-                                stop_reason = getattr(delta, "stop_reason", None)
-                                if stop_reason:
-                                    logger.debug(f"📍 stop_reason received: {stop_reason}")
-                                if stop_reason == "tool_use":
-                                    # Emit any remaining text chunk before tool results
-                                    if chunk:
-                                        if not chunk.endswith("\n"):
-                                            chunk += "\n"
-                                        await emit_message_delta(chunk)
-                                        chunk = ""
-                                        chunk_count = 0
-
-                                    # API tool passthrough — skip tool loop, return directly
-                                    if api_tool_passthrough and not running_tool_tasks:
-                                        logger.info(
-                                            "🔄 API tool passthrough complete — skipping tool loop"
-                                        )
-                                        conversation_ended = True
-                                        break
-
-                                    # Wait for all running tool tasks to complete
-                                    if running_tool_tasks:
-                                        logger.debug(
-                                            f"⏳ Waiting for %d tool tasks to complete...",
-                                            len(running_tool_tasks),
-                                        )
-
-                                        try:
-                                            results = await asyncio.gather(
-                                                *running_tool_tasks
-                                            )
-                                            logger.debug(
-                                                f"✅ All %d tool tasks completed",
-                                                len(results),
-                                            )
-
-                                            # Build tool_result messages and emit to UI
-                                            for tool_call_data, tool_result in zip(
-                                                tool_call_data_list, results
-                                            ):
-                                                tool_use_id = tool_call_data.get(
-                                                    "id", ""
-                                                )
-                                                tool_name = tool_call_data.get(
-                                                    "name", ""
-                                                )
-                                                tool_input = tool_call_data.get(
-                                                    "input", {}
-                                                )
-
-                                                # Process tool result through OpenWebUI's handler
-                                                # for Rich UI (HTMLResponse, embeds, files)
-                                                tool_result_embeds = []
-                                                tool_result_files = []
-                                                if PROCESS_TOOL_RESULT_AVAILABLE and __request__:
-                                                    try:
-                                                        tool_result, tool_result_files, tool_result_embeds = (
-                                                            await process_tool_result(
-                                                                __request__,
-                                                                tool_name,
-                                                                tool_result,
-                                                                "pipe",
-                                                                metadata=__metadata__,
-                                                                user=__user__,
-                                                            )
-                                                        )
-                                                    except Exception as e:
-                                                        logger.warning(f"process_tool_result failed for '{tool_name}': {e}")
-
-                                                # Emit files event if tool produced files
-                                                if tool_result_files and __event_emitter__:
-                                                    await __event_emitter__(
-                                                        {
-                                                            "type": "files",
-                                                            "data": {"files": tool_result_files},
-                                                        }
-                                                    )
-
-                                                # Determine if error
-                                                is_error = isinstance(
-                                                    tool_result, str
-                                                ) and (
-                                                    tool_result.startswith("Error:")
-                                                    or tool_result.startswith("Error executing tool")
-                                                )
-
-                                                # Build result block for API
-                                                # Ensure result is valid JSON string (not Python repr with single quotes)
-                                                if isinstance(tool_result, str):
-                                                    result_str = tool_result
-                                                else:
-                                                    try:
-                                                        result_str = json.dumps(tool_result, ensure_ascii=False)
-                                                    except (TypeError, ValueError):
-                                                        result_str = str(tool_result)
-                                                result_block = {
-                                                    "type": "tool_result",
-                                                    "tool_use_id": tool_use_id,
-                                                    "content": result_str,
-                                                }
-                                                if is_error:
-                                                    result_block["is_error"] = True
-                                                tool_calls.append(result_block)
-
-                                                if in_code_execution:
-                                                    # Accumulate for unified code execution display
-                                                    code_exec_tool_calls_info.append({
-                                                        "name": tool_name,
-                                                        "input": tool_input,
-                                                        "result": result_str,
-                                                        "is_error": is_error,
-                                                    })
-                                                else:
-                                                    # Replace the in-progress block with completed version
-                                                    completed = self._format_tool_result_block(
-                                                        tool_use_id, tool_name, tool_input,
-                                                        str(tool_result), is_error=is_error, done=True,
-                                                        embeds=tool_result_embeds, files=tool_result_files,
-                                                    )
-                                                    old_block = tool_progress_blocks.pop(tool_use_id, None)
-                                                    if old_block:
-                                                        text = final_text()
-                                                        text = text.replace(old_block, completed, 1)
-                                                        final_message.clear()
-                                                        final_message.append(text)
-                                                        await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
-                                                    else:
-                                                        # Fallback: append if placeholder not found
-                                                        final_message.append(completed)
-                                                        await emit_message_replace(final_text())
-
-                                            logger.debug(
-                                                f"Emitted {len(results)} tool result(s)"
-                                            )
-                                        except Exception as ex:
-                                            logger.error(
-                                                f"❌ Tool execution failed: %s", ex
-                                            )
-                                            # Create error results and update in-progress blocks
-                                            for (
-                                                tool_call_data
-                                            ) in tool_call_data_list:
-                                                tool_use_id = tool_call_data.get(
-                                                    "id", ""
-                                                )
-                                                tool_name = tool_call_data.get(
-                                                    "name", "unknown"
-                                                )
-                                                error_result = f"Error executing tool '{tool_name}': {str(ex)}"
-                                                tool_calls.append(
-                                                    {
-                                                        "type": "tool_result",
-                                                        "tool_use_id": tool_use_id,
-                                                        "content": error_result,
-                                                        "is_error": True,
-                                                    }
-                                                )
-                                                # Replace in-progress block with error block
-                                                tool_input = tool_call_data.get("input", {})
-                                                completed = self._format_tool_result_block(
-                                                    tool_use_id, tool_name, tool_input,
-                                                    error_result, is_error=True, done=True
-                                                )
-                                                old_block = tool_progress_blocks.pop(tool_use_id, None)
-                                                if old_block:
-                                                    text = final_text()
-                                                    text = text.replace(old_block, completed, 1)
-                                                    final_message.clear()
-                                                    final_message.append(text)
-                                                    await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
-
-                                    logger.debug(
-                                        f" Tool use detected, collected {len(tool_calls)} tool results:\nTool_Call JSON: {tool_calls}"
-                                    )
-
-                                    # Reset for next iteration
-                                    running_tool_tasks = []
-                                    tool_call_data_list = []
-                                    tool_progress_blocks = {}
-                                    api_tool_passthrough = False
-                                    has_pending_tool_calls = True
-                                elif stop_reason == "max_tokens":
-                                    chunk += "Claude has Reached the maximum token limit!"
-                                elif stop_reason == "end_turn":
-                                    conversation_ended = True
-                                elif stop_reason == "pause_turn":
-                                    # API paused a long-running turn — auto-continue
-                                    has_pending_tool_calls = True  # reuses tool loop mechanism
-                                    # tool_calls stays empty → PHASE 5 detects pause_turn
-                                    await emit_event_local(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "description": "⏳ Long-running turn paused, continuing...",
-                                                "done": False,
-                                            },
-                                        }
-                                    )
-                                elif stop_reason == "refusal":
-                                    chunk += "Claude has refused to answer based on its content policies."
-                                    conversation_ended = True
-                                elif stop_reason == "stop_sequence":
-                                    chunk += "Claude stopped generating based on stop sequence."
-                                    conversation_ended = True
-                                elif stop_reason == "model_context_window_exceeded":
-                                    chunk += "Claude has reached the maximum context window for this model."
-                                    conversation_ended = True
-                                elif stop_reason == "compaction":
-                                    # Compaction triggered — response contains only the compaction block.
-                                    # We need to continue the conversation with the compacted context.
-                                    # Reuse tool loop mechanism to auto-continue.
-                                    has_pending_tool_calls = True
-                                    logger.info("Compaction stop_reason — will auto-continue")
-
-                            # ---------------------------------------------------------
-                            # EVENT: message_stop
-                            # Stream complete for this turn
-                            # ---------------------------------------------------------
-                            elif event_type == "message_stop":
-                                pass  # No deferred blocks to flush
-
-                            # ---------------------------------------------------------
-                            # EVENT: message_error
-                            # Handle stream-level errors
-                            # ---------------------------------------------------------
-                            elif event_type == "message_error":
-                                error = getattr(event, "error", None)
-                                if error:
-                                    # Handle stream errors through handle_errors method
-                                    error_details = f"Stream Error: {getattr(error, 'message', str(error))}"
-                                    if hasattr(error, "type"):
-                                        error_details = f"Stream Error ({error.type}): {getattr(error, 'message', str(error))}"
-
-                                    # Create a mock exception for consistent error handling
-                                    stream_error = Exception(error_details)
-                                    await self.handle_errors(
-                                        stream_error, __event_emitter__
-                                    )
-                                    return (
-                                        final_text()
-                                        + f"\n\nAn error occurred: {error_details}"
-                                    )
-
-                            if chunk_count > token_buffer_size:
-                                if chunk:
-                                    await emit_message_delta(chunk)
-                                    chunk = ""
-                                    chunk_count = 0
-
-                        # Capture SDK accumulated message after stream is fully consumed
-                        # This replaces manual api_assistant_blocks/thinking_blocks accumulation
-                        sdk_final_message = stream.current_message_snapshot
-
-                    # Log stream event diagnostics
-                    logger.debug(f"📊 Stream events: {stream_event_counts}")
-
-                    conversation_ended, has_pending_tool_calls, tool_calls = await self._apply_sdk_stop_reason_fallback(
-                        sdk_final_message=sdk_final_message,
-                        conversation_ended=conversation_ended,
-                        has_pending_tool_calls=has_pending_tool_calls,
-                        tool_calls=tool_calls,
-                        tool_loop_iteration=tool_loop_iteration,
-                        payload_for_stream=payload_for_stream,
-                        stream_event_counts=stream_event_counts,
-                        request_ctx=request_ctx,
-                    )
-
-                    if chunk:
-                        await emit_message_delta(chunk)
-                        chunk = ""
-                        chunk_count = 0
-
-                    # ---------------------------------------------------------
-                    # PHASE 5: TOOL EXECUTION LOOP
-                    # After stream ends, if tools were called:
-                    # 1. Check max tool call limit
-                    # 2. Build assistant message with thinking + text + tool_use blocks
-                    # 3. Execute tools and collect results
-                    # 4. Add tool_result blocks as user message
-                    # 5. Loop back to API for continuation
-                    # ---------------------------------------------------------
-                    if has_pending_tool_calls and tool_calls:
-                        # Log tool call details
-                        tool_names = [tc.get("name", tc.get("tool_use_id", "?")) for tc in tool_calls]
-                        sdk_block_types = [getattr(b, "type", "?") for b in sdk_final_message.content] if sdk_final_message else []
-                        logger.info(
-                            f"🔧 Tool loop iter {tool_loop_iteration} complete | "
-                            f"{len(tool_calls)} tool results: {tool_names} | "
-                            f"SDK blocks: {sdk_block_types}"
-                        )
-                        # Check if we've reached the max tool call limit
-                        # Count actual tool results (not loop iterations) for accurate tracking
-                        num_tool_results = sum(1 for tc in tool_calls if tc.get("type") == "tool_result")
-                        current_function_calls += num_tool_results
-                        if current_function_calls >= max_function_calls:
-                            await emit_event_local(
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "description": f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Stopping tool execution.",
-                                        "done": True,
-                                    },
-                                }
-                            )
-                            await emit_event_local(
-                                {
-                                    "type": "notification",
-                                    "data": {
-                                        "type": "warning",
-                                        "content": f"Tool call limit ({max_function_calls}) reached. Increase MAX_TOOL_CALLS in valves if needed.",
-                                    },
-                                }
-                            )
-                            await emit_message_delta(
-                                f"\n\n⚠️ **Tool call limit reached** ({current_function_calls}/{max_function_calls}). Some tool results may not have been processed. You can increase the limit in the model's valve settings."
-                            )
-                            break
-
-                        # Tools were already executed during stream (in message_delta)
-                        # tool_calls now contains tool_result blocks ready for API
-                        # UI output was already emitted during message_delta
-
-                        # Build assistant message from SDK accumulated message
-                        # SDK correctly handles: signature accumulation, block ordering,
-                        # caller field preservation, input JSON assembly
-                        if sdk_final_message:
-                            assistant_content = self._convert_sdk_message_to_api_blocks(sdk_final_message)
-                            logger.debug(
-                                f"Built assistant_content from SDK message: "
-                                f"{[b.get('type') for b in assistant_content]}"
-                            )
-                        else:
-                            # Fallback: build from final_message text
-                            assistant_content = []
-                            final_message_snapshot = final_text()
-                            if final_message_snapshot.strip():
-                                assistant_content.append({"type": "text", "text": final_message_snapshot})
-                            logger.warning("No SDK message available, using text fallback")
-
-                        if assistant_content:
-                            # Log detailed block analysis for debugging
-                            for i, block in enumerate(assistant_content):
-                                btype = block.get("type", "?")
-                                if btype == "thinking":
-                                    logger.debug(
-                                        f"  assistant_content[{i}]: thinking "
-                                        f"({len(block.get('thinking', ''))}c, "
-                                        f"sig={len(block.get('signature', ''))}c)"
-                                    )
-                                elif btype == "redacted_thinking":
-                                    logger.debug(
-                                        f"  assistant_content[{i}]: redacted_thinking "
-                                        f"(data={len(block.get('data', ''))}c)"
-                                    )
-                                elif btype == "tool_use":
-                                    logger.debug(
-                                        f"  assistant_content[{i}]: tool_use "
-                                        f"name={block.get('name')}, id={block.get('id')}"
-                                    )
-                                elif btype == "text":
-                                    logger.debug(
-                                        f"  assistant_content[{i}]: text ({len(block.get('text', ''))}c)"
-                                    )
-                                else:
-                                    logger.debug(f"  assistant_content[{i}]: {btype}")
-
-                            payload_for_stream["messages"].append(
-                                {"role": "assistant", "content": assistant_content}
-                            )
-
-                        # Safety: ensure every tool_use in assistant has a tool_result
-                        tool_use_ids_in_assistant = {
-                            b.get("id") for b in assistant_content
-                            if b.get("type") == "tool_use"
-                        }
-                        tool_result_ids = {
-                            b.get("tool_use_id") for b in tool_calls
-                            if b.get("type") == "tool_result"
-                        }
-                        missing_ids = tool_use_ids_in_assistant - tool_result_ids
-                        for missing_id in missing_ids:
-                            logger.warning(f"⚠️ Missing tool_result for tool_use {missing_id}, adding error result")
-                            tool_calls.append({
-                                "type": "tool_result",
-                                "tool_use_id": missing_id,
-                                "content": "Error: tool execution failed - no result was produced",
-                                "is_error": True,
-                            })
-
-                        # Add user message with tool results (tool_calls already contains tool_result blocks)
-                        user_content = tool_calls.copy()
-                        if user_content:
-                            # Optimization: Move cache_control to the end for multi-step tool loops
-                            # This ensures we cache the tool results for the next iteration
-                            # IMPORTANT: Skip when programmatic tool calling is active - Anthropic rejects
-                            payload_for_stream["messages"].append(
-                                {"role": "user", "content": user_content}
-                            )
-                            # Debug log tool results with content sizes
-                            if logger.isEnabledFor(logging.DEBUG):
-                                for b in user_content:
-                                    if b.get("type") == "tool_result":
-                                        _content = b.get("content", "")
-                                        _clen = len(_content) if isinstance(_content, str) else len(json.dumps(_content, default=str))
-                                        logger.debug(
-                                            f"📤 tool_result: id={b.get('tool_use_id', '?')[:25]} | "
-                                            f"is_error={b.get('is_error', False)} | "
-                                            f"content_size={_clen}c"
-                                        )
-
-                        # Ensure we added at least one message, otherwise break the loop
-                        if not assistant_content and not user_content:
-                            logger.debug(
-                                f"🔧 No valid content to add, ending conversation"
-                            )
-                            break
-
-                        # Check if we're approaching the limit BEFORE next iteration
-                        # (current_function_calls already updated above with actual tool result count)
-                        remaining = max_function_calls - current_function_calls
-                        if remaining <= 0:
-                            # Hard limit reached - this shouldn't happen as we check above, but safety first
-                            break
-                        elif remaining == 1:
-                            # Only 1 call left - warn Claude this is the final chance
-                            await emit_event_local(
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "description": f"⚠️ Final tool call available ({current_function_calls}/{max_function_calls} used)",
-                                        "done": False,
-                                    },
-                                }
-                            )
-                            await asyncio.sleep(0.05)
-
-                            # Add system message to warn Claude
-                            # Skip when programmatic tool calling is active - only tool_result blocks allowed
-                            if not self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
-                                payload_for_stream["messages"].append(
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {
-                                                "type": "text",
-                                                "text": f"⚠️ SYSTEM WARNING: Tool call limit nearly reached ({current_function_calls}/{max_function_calls} used). You have 1 tool call remaining. After the next tool use, the conversation will be automatically terminated. Please provide a comprehensive text response instead of calling more tools, and suggest the user continue manually if needed.",
-                                            }
-                                        ],
-                                    }
-                                )
-                        elif remaining <= 5:
-                            # Approaching limit - inform both user and Claude
-                            await emit_event_local(
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "description": f"⚠️ {remaining} tool call(s) remaining ({current_function_calls}/{max_function_calls} used)",
-                                        "done": False,
-                                    },
-                                }
-                            )
-                            await asyncio.sleep(0.05)
-
-                            # Notify Claude about remaining calls so it can plan accordingly
-                            if not self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
-                                payload_for_stream["messages"].append(
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {
-                                                "type": "text",
-                                                "text": f"[SYSTEM: {remaining} tool call(s) remaining out of {max_function_calls}. Plan your remaining tool calls carefully.]",
-                                            }
-                                        ],
-                                    }
-                                )
-
-                        has_pending_tool_calls = False
-                        tool_calls = []
-                        sdk_final_message = None  # Reset for next iteration
-                        chunk = ""
-                        chunk_count = 0
-                        current_search_query = (
-                            ""  # Reset search query for next iteration
-                        )
-                        citation_counter = (
-                            0  # Reset citation counter for next iteration
-                        )
-                        pending_citation_markers = []  # Reset pending citations
-                        continue
-
-                    # pause_turn continuation: API paused a long-running turn,
-                    # send the response back as-is to let Claude continue
-                    elif has_pending_tool_calls and not tool_calls:
-                        logger.info(
-                            f"⏸️ pause_turn continuation (iter {tool_loop_iteration})"
-                        )
-                        if sdk_final_message:
-                            assistant_content = self._convert_sdk_message_to_api_blocks(sdk_final_message)
-                            if assistant_content:
-                                payload_for_stream["messages"].append(
-                                    {"role": "assistant", "content": assistant_content}
-                                )
-                        has_pending_tool_calls = False
-                        sdk_final_message = None
-                        chunk = ""
-                        chunk_count = 0
-                        current_search_query = ""
-                        citation_counter = 0
-                        pending_citation_markers = []
-                        continue
-
-                    # SAFETY / TRUNCATED STREAM RETRY:
-                    # If we reach here, the stream completed but no tool loop
-                    # continuation was triggered and conversation_ended is False.
-                    # This typically means a truncated stream (200 OK but no stop_reason).
-                    # Auto-retry with the same payload instead of silently breaking.
-                    if not conversation_ended:
-                        retry_attempts += 1
-                        if retry_attempts <= self.valves.MAX_RETRIES:
-                            # Determine what happened for logging
-                            sdk_block_types = (
-                                [getattr(b, "type", "?") for b in getattr(sdk_final_message, "content", [])]
-                                if sdk_final_message else []
-                            )
-                            logger.warning(
-                                f"⚠️ Truncated stream (no stop_reason, no tool handling). "
-                                f"SDK blocks: {sdk_block_types}. "
-                                f"Auto-retrying ({retry_attempts}/{self.valves.MAX_RETRIES})..."
-                            )
-                            await request_ctx.emit_event(
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "description": f"⚠️ Stream abgebrochen, Retry ({retry_attempts}/{self.valves.MAX_RETRIES})...",
-                                        "done": False,
-                                    },
-                                }
-                            )
-                            # Reset streaming state for retry — clear any partial content
-                            # from this truncated iteration so we get a clean response
-                            final_message.clear()
-                            sdk_final_message = None
-                            chunk = ""
-                            chunk_count = 0
-                            current_search_query = ""
-                            citation_counter = 0
-                            pending_citation_markers = []
-                            citations_list = []
-                            first_text_emitted = False
-                            # Reset thinking state
-                            thinking_message = ""
-                            thinking_signature = ""
-                            thinking_start_time = None
-                            thinking_stream_start_idx = -1
-                            thinking_last_block = ""
-                            # Reset server tool state
-                            active_server_tool_name = None
-                            active_server_tool_id = None
-                            server_tool_input_buffer = ""
-                            in_code_execution = False
-                            code_exec_current_code = ""
-                            code_exec_last_block = ""
-                            current_block_type = None
-                            # payload_for_stream stays unchanged → same messages, same tools
-                            # Cache from previous messages is preserved server-side
-                            continue
-                        else:
-                            logger.error(
-                                f"❌ Truncated stream: max retries ({self.valves.MAX_RETRIES}) exhausted. "
-                                f"Returning error to user."
-                            )
-                            await request_ctx.emit_delta(
-                                "\n\n⚠️ Die Anthropic API hat den Stream mehrfach abgebrochen "
-                                f"({self.valves.MAX_RETRIES} Versuche). Bitte versuche es erneut."
-                            )
-                    break
-
-                # ---------------------------------------------------------
-                # PHASE 6: ERROR HANDLING
-                # Catches and handles Anthropic API errors with retry logic:
-                # - RateLimitError (429): Retryable, backoff
-                # - AuthenticationError (401): API key issues
-                # - InternalServerError (500, 529): Retryable
-                # - APIConnectionError: Network issues, retryable
-                # ---------------------------------------------------------
-                except Exception as e:
-                    # Finalize any open live code_exec block before handling error
-                    if code_exec_current_code:
-                        duration = time.time() - code_exec_start_time if code_exec_start_time else None
-                        block = self._format_code_execution_block(
-                            code_exec_current_code, code_exec_current_lang,
-                            done=True, duration=duration,
-                        )
-                        await update_content_block(code_exec_last_block, block)
-                        code_exec_last_block = ""
-                        code_exec_current_code = ""
-                    should_retry, retry_attempts, response_suffix = await self._handle_stream_exception(
-                        e,
-                        retry_attempts=retry_attempts,
-                        request_ctx=request_ctx,
-                    )
-                    if should_retry:
-                        continue
-                    if response_suffix:
-                        return final_text() + response_suffix
-                    return final_text()
-        except Exception as e:
-            await self.handle_errors(e, __event_emitter__)
-            return final_text()
-
-        # ---------------------------------------------------------
-        # PHASE 7: FINALIZATION
-        # After successful completion:
-        # - Build final status with token count display
-        # - Emit completion status event
-        # - Emit chat:completion event with usage stats
-        # - Return final message text
-        # ---------------------------------------------------------
-
-        final_status = "✅ Response Complete"
-        # ============ Token Count Display ============
-        show_token_setting = __user__["valves"].SHOW_TOKEN_COUNT
-        if include_usage and show_token_setting != "Off" and total_usage:
-            def format_num(n: int) -> str:
-                if n >= 1_000_000:
-                    return f"{n/1_000_000:.1f}M"
-                if n >= 1_000:
-                    return f"{n/1_000:.1f}K"
-                return str(n)
-
-            # Context window progress bar
-            total_tokens = total_usage.get("total_tokens", 0)
-            model_info = self.get_model_info(body["model"].split("/")[-1])
-            context_window = model_info.get("context_length", 200_000)
-            context_label = f"{context_window // 1000}k" if context_window < 1_000_000 else f"{context_window / 1_000_000:.0f}M"
-            percentage = min((total_tokens / context_window) * 100, 100)
-            filled = int(percentage / 10)
-            bar = "█" * filled + "░" * (10 - filled)
-
-            final_status += (
-                f" [{bar}] {format_num(total_tokens)}/{context_label} ({percentage:.1f}%)"
-            )
-
-            # Cache status display (only in "With Cache" mode)
-            if (
-                show_token_setting == "With Cache"
-                and self.valves.CACHE_CONTROL != "cache disabled"
-            ):
-                ttl_label = "1hr" if self.valves.CACHE_TTL == "1 hour" else "5min"
-                cache_write = total_usage.get("cache_creation_input_tokens", 0)
-                cache_read = total_usage.get("cache_read_input_tokens", 0)
-                final_status += (
-                    f" | 📝 {format_num(cache_write)} ({ttl_label})"
-                    f" | 📖 {format_num(cache_read)}"
-                )
-
-        # Consolidate: emit a final replace with the complete message so OpenWebUI
-        # has the authoritative content (replaces any partial delta/replace state).
-        consolidated = final_text()
-        if consolidated:
-            await emit_event_local(
-                {"type": "replace", "data": {"content": consolidated}}
-            )
-
-        await emit_event_local(
-            {
-                "type": "status",
-                "data": {
-                    "description": final_status,
-                },
-            }
-        )
-        
-        # Emit chat:completion done event so frontend knows streaming finished
-        # (triggers TTS finish, usage display, etc.)
-        done_data: dict = {"choices": [{"finish_reason": "stop", "delta": {"content": ""}}], "done": True}
-        if include_usage and total_usage:
-            done_data["usage"] = total_usage
-        await emit_event_local({"type": "chat:completion", "data": done_data})
-
-        # Persist usage to chat_message.usage column for the 0.9.0+ analytics page.
-        # chat:completion events are NOT persisted by the socket event emitter
-        # (only status|message|replace|embeds|files|source are), so without this
-        # direct DB write the analytics tab never sees our token counts.
-        if include_usage and total_usage and CHATS_AVAILABLE and __metadata__:
-            chat_id = __metadata__.get("chat_id")
-            message_id = __metadata__.get("message_id")
-            if chat_id and message_id and not str(chat_id).startswith("local:"):
-                try:
-                    await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        chat_id, message_id, {"usage": dict(total_usage)}
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to persist usage to chat_message: {e}")
-
-        if __user__["valves"].DEBUG_MODE:
-            # DEBUG: content already streamed via emit_event_local; skipping duplicate
-            pass
-
-        return final_text()
-
-    # =========================================================================
-    # TASK MODEL (TITLE, TAGS, FOLLOW-UPS)
-    # =========================================================================
-
-    async def _run_task_model_request(
-        self,
-        body: dict[str, Any],
-    ) -> str:
-        """
-        Handle task model requests (title generation, tags, follow-ups etc.) by making a
-        non-streaming request to Anthropic API and returning only the text response.
-
-        Task models should return plain text without any JSON formatting or status updates
-        mixed into the response.
-        """
-        try:
-            # Extract model and messages from body
-            actual_model_name = body["model"].split("/")[-1]
-            messages = body.get("messages", [])
-
-            # Build simple payload for task request (non-streaming)
-            task_payload = {
-                "model": actual_model_name,
-                "max_tokens": body.get("max_tokens", 4096),
-                "messages": self._process_messages_for_task(messages),
-                "stream": False,
-            }
-
-            logger.debug(f"Task payload: {json.dumps(task_payload, indent=2)}")
-            try:
-                logger.debug(
-                    "[PAYLOAD] task %s",
-                    json.dumps(
-                        self._strip_payload(task_payload),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        default=str,
-                    ),
-                )
-            except Exception as _pl_err:
-                logger.debug(f"[PAYLOAD] task strip/log failed: {_pl_err}")
-
-            # Make synchronous request to Anthropic API
-            # For task requests, we don't have __user__ context, so use default key
-            api_key = self.valves.ANTHROPIC_API_KEY
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
-
-            response = await client.messages.create(**task_payload)
-
-            # Extract text from response
-            text_parts = []
-            for content_block in response.content:
-                if content_block.type == "text":
-                    text_parts.append(content_block.text)
-
-            # Join without adding line breaks - preserve original formatting
-            result = "".join(text_parts).strip()
-
-            logger.debug(f"Task response: {result}")
-
-            return result
-
-        except Exception as e:
-            logger.debug(f"Task model error: {e}")
-            return ""
-
-    def _process_messages_for_task(self, messages: List[dict]) -> List[dict]:
-        """
-        Process messages for task requests - convert to simple Anthropic format.
-        Task requests don't need complex content processing.
-        """
-        processed = []
-        for msg in messages:
-            role = msg.get("role")
-            if role == "system":
-                continue  # System messages handled separately
-
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                processed.append({"role": role, "content": content})
-            elif isinstance(content, list):
-                # Extract text from content blocks
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                if text_parts:
-                    processed.append({"role": role, "content": " ".join(text_parts)})
-
-        return processed
-
-    # =========================================================================
-    # ERROR HANDLING
-    # =========================================================================
-
-    async def handle_errors(
-        self,
-        exception,
-        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-    ):
-        # Determine specific error message based on exception type
-        if isinstance(exception, RateLimitError):
-            error_msg = "Rate limit exceeded. Please wait before making more requests."
-            user_msg = "⚠️ Rate limit reached. Please try again in a moment."
-        elif isinstance(exception, AuthenticationError):
-            error_msg = "Authentication failed. Please check your API key."
-            user_msg = (
-                "🔑 Invalid API key. Please verify your Anthropic API key is correct."
-            )
-        elif isinstance(exception, PermissionDeniedError):
-            error_msg = (
-                "Permission denied. Your API key may not have access to this resource."
-            )
-            user_msg = "🚫 Access denied. Your API key doesn't have permission for this request."
-        elif isinstance(exception, NotFoundError):
-            error_msg = (
-                "Resource not found. The requested model or endpoint may not exist."
-            )
-            user_msg = "❓ Resource not found. Please check if the model is available."
-        elif isinstance(exception, BadRequestError):
-            error_msg = f"Bad request: {str(exception)}"
-            user_msg = (
-                "📝 Invalid request format. Please check your input and try again."
-            )
-        elif isinstance(exception, UnprocessableEntityError):
-            error_msg = f"Unprocessable entity: {str(exception)}"
-            user_msg = "📄 Request format issue. Please check your message structure and try again."
-        elif isinstance(exception, InternalServerError):
-            error_msg = "Anthropic server error. Please try again later."
-            user_msg = (
-                "🔧 Server temporarily unavailable. Please try again in a few moments."
-            )
-        elif isinstance(exception, APIConnectionError):
-            error_msg = (
-                "Network connection error. Please check your internet connection."
-            )
-            user_msg = "🌐 Connection error. Please check your network and try again."
-        elif isinstance(exception, APIStatusError):
-            status_code = getattr(exception, "status_code", "Unknown")
-            error_msg = f"API Error ({status_code}): {str(exception)}"
-            user_msg = (
-                f"⚡ API Error ({status_code}). Please try again or contact support."
-            )
-        else:
-            error_msg = f"Unexpected error: {str(exception)}"
-            user_msg = "💥 An unexpected error occurred. Please try again."
-
-        logger.error(f"Exception: {error_msg}")
-        # Add request ID if available for debugging
-        if isinstance(exception, APIStatusError) and hasattr(exception, "response"):
-            try:
-                request_id = exception.response.headers.get("request-id")
-                if request_id:
-                    logger.info(f"Request ID: %s", request_id)
-            except Exception:
-                pass  # Ignore if we can't get request ID
-
-        await self.emit_event(
-            {
-                "type": "notification",
-                "data": {
-                    "type": "error",
-                    "content": user_msg,
-                },
-            },
-            __event_emitter__,
-        )
-
-        tb = traceback.format_exc()
-
-        await self.emit_event(
-            {
-                "type": "source",
-                "data": {
-                    "source": {"name": "Anthropic Error", "url": None},
-                    "document": [tb],
-                    "metadata": [
-                        {
-                            "source": "anthropic api",
-                            "type": "error",
-                            "date_accessed": datetime.utcnow().isoformat(),
-                        }
-                    ],
-                },
-            },
-            __event_emitter__,
-        )
-        await self.emit_event(
-            {
-                "type": "status",
-                "data": {
-                    "description": "❌ Response with Errors",
-                    "done": True,
-                },
-            },
-            __event_emitter__,
-        )
-
-    # =========================================================================
-    # TEXT PROCESSING & MEMORY EXTRACTION
-    # =========================================================================
-
     def _extract_and_remove_memories(self, text: str) -> tuple[str, Optional[str]]:
         """
         Extract User Context from Openwebui Memory System from system prompt and remove it.
@@ -6208,181 +4601,447 @@ class Pipe:
         # No User Context found
         return text.strip(), None
 
-    # =========================================================================
-    # CITATIONS & EVENT EMISSION
-    # =========================================================================
+    def _create_metadata_marker(self, id: str, value: str, messagenum: int = 0) -> str:
+        # URL-encode to handle special characters
+        encoded_value = quote(value, safe="")
+        return f" [](anthropic:{messagenum}:{id}:{encoded_value}) "
 
-    async def handle_citation(self, event, __event_emitter__, citation_counter=None):
+    def _extract_metadata_marker_from_message(self, message) -> List[str]:
         """
-        Handle web search citation events from Anthropic API and emit appropriate source events to OpenWebUI.
+        Extract Anthropic metadata from the LAST assistant message in conversation.
+        """
+        metadata: List[str] = []
+        if not isinstance(message, dict):
+            return metadata
+        if message.get("role") == "assistant":
+            text = None
+            content = message.get("content")
+            if isinstance(content, list):
+                # Join all text blocks for searching, but also update blocks in-place
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        block_text = block.get("text", "")
+                        matches = self.METADATA_PATTERN.findall(block_text)
+                        for match in matches:
+                            metadata.append(match)
+                        # Remove all metadata markers from this block
+                        cleaned_text = self.METADATA_PATTERN.sub("", block_text)
+                        block["text"] = cleaned_text
+            elif isinstance(content, str):
+                matches = self.METADATA_PATTERN.findall(content)
+                for match in matches:
+                    metadata.append(match)
+                # Remove all metadata markers from the string
+                message["content"] = self.METADATA_PATTERN.sub("", content)
+        return metadata
+
+    async def _generate_file_download_link(
+        self,
+        file_id: str,
+        api_key: str,
+        user_id: str,
+    ) -> str:
+        """Download file from Anthropic Files API, save to OpenWebUI, return markdown link."""
+        try:
+            from anthropic import AsyncAnthropic
+            import hashlib
+            import uuid
+
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+
+            # Get file metadata first
+            file_meta = await client.beta.files.retrieve_metadata(file_id=file_id)
+            filename = getattr(file_meta, "filename", file_id) or file_id
+
+            # Download file content
+            response = await client.beta.files.download(file_id=file_id)
+            content = response.read()
+
+            # Save to OpenWebUI storage
+            owui_file_id = str(uuid.uuid4())
+            storage_filename = f"code_exec_{owui_file_id}_{filename}"
+            file_path = Storage.upload_file(content, storage_filename)
+
+            # Create OpenWebUI file record
+            file_hash = hashlib.sha256(content).hexdigest()
+            await Files.insert_new_file(
+                user_id=user_id,
+                form_data=type("FileForm", (), {
+                    "model_dump": lambda self_: {
+                        "id": owui_file_id,
+                        "hash": file_hash,
+                        "filename": filename,
+                        "path": file_path,
+                        "data": {},
+                        "meta": {
+                            "content_type": getattr(file_meta, "mime_type", "application/octet-stream"),
+                            "size": len(content),
+                            "source": "anthropic_code_execution",
+                            "anthropic_file_id": file_id,
+                        },
+                    }
+                })(),
+            )
+
+            # Return markdown download link
+            base_url = os.environ.get("WEBUI_URL", "")
+            download_url = f"{base_url}/api/v1/files/{owui_file_id}/content"
+            return f"[📥 {filename}]({download_url})"
+
+        except Exception as e:
+            logger.error(f"Failed to download file {file_id}: {e}")
+            return f"⚠️ Failed to download file {file_id}"
+
+    async def _process_files_api_data(
+        self,
+        __files__: Optional[List[Dict[str, Any]]],
+        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
+        processed_messages: List[Dict[str, Any]],
+    ) -> tuple[Dict[int, List[Dict[str, Any]]], List[str]]:
+        """
+        Process files for Anthropic Files API using container_upload.
+
+        Uploads files to Anthropic and caches the file_id in OpenWebUI file metadata.
+        Tracks which user message each file belongs to for correct positioning.
+
+        Returns:
+            tuple: (
+                Dict mapping user_msg_number → list of container_upload blocks,
+                List of filenames that were processed (for RAG source removal)
+            )
+        """
+        blocks_by_user_msg: Dict[int, List[Dict[str, Any]]] = {}
+        processed_filenames: List[str] = []
+        status_cls = globals().get("StatusEmitter")
+        status = status_cls(__event_emitter__) if status_cls else None
+
+        async def emit_status(description: str, *, done: bool = False) -> None:
+            if status:
+                if done:
+                    await status.complete(description)
+                else:
+                    await status.activity(description)
+                return
+            await self.emit_event(
+                {"type": "status", "data": {"description": description, "done": done}},
+                __event_emitter__,
+            )
+
+        async def emit_notification(content: str, *, type: str = "warning") -> None:
+            if status and hasattr(status, "notification"):
+                await status.notification(content, type=type)
+                return
+            await self.emit_event(
+                {"type": "notification", "data": {"type": type, "content": content}},
+                __event_emitter__,
+            )
+
+        if not __files__:
+            return blocks_by_user_msg, processed_filenames
+        if not FILES_AVAILABLE:
+            await emit_status("Files API unavailable", done=True)
+            await emit_notification(
+                "Anthropic Files API mode was requested, but OpenWebUI Files/Storage support is unavailable in this runtime."
+            )
+            return blocks_by_user_msg, processed_filenames
+
+        import io
+
+        # Count user messages to determine "current" position for new files
+        user_msg_count = sum(1 for m in processed_messages if m["role"] == "user")
+        current_user_msg_num = max(0, user_msg_count - 1)  # 0-based
+
+        client = None
+        try:
+            from anthropic import AsyncAnthropic
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY, **({"base_url": base_url} if base_url else {}))
+        except ImportError:
+            logger.warning("Anthropic SDK not available for file upload")
+            return blocks_by_user_msg, processed_filenames
+
+        for file in __files__:
+            # Skip non-file entries (RAG chunks, knowledge base refs, etc.)
+            if (
+                file.get("type") != "file"
+                or file.get("context") != "full"
+                or file.get("collection_name")
+                or file.get("docs")
+            ):
+                continue
+
+            file_id_owui = file.get("id")
+            file_name = file.get("name", "unknown")
+            if not file_id_owui:
+                continue
+
+            # Skip images — they use Vision (base64/URL), not Files API
+            content_type = file.get("content_type", "")
+            if not content_type:
+                # Fallback: check OpenWebUI file meta for content_type
+                file_record_check = await Files.get_file_by_id(file_id_owui)
+                if file_record_check and file_record_check.meta:
+                    content_type = file_record_check.meta.get("content_type", "")
+            if content_type and content_type.startswith("image/"):
+                logger.debug(f"Skipping image file for Files API: {file_name} ({content_type})")
+                continue
+
+            # Look up OpenWebUI file record for cached anthropic_file_id
+            file_record = await Files.get_file_by_id(file_id_owui)
+            if not file_record:
+                logger.warning(f"File not found in DB: {file_id_owui}")
+                continue
+
+            meta = file_record.meta or {}
+            anthropic_file_id = meta.get("anthropic_file_id")
+            msg_num = meta.get("anthropic_file_msg_idx")
+
+            if anthropic_file_id:
+                # Cached — reuse without re-uploading
+                if msg_num is None:
+                    msg_num = current_user_msg_num
+                logger.debug(f"♻️ Reusing cached file {file_name} → {anthropic_file_id} (msg {msg_num})")
+            else:
+                # New file — upload to Anthropic
+                try:
+                    file_path = Storage.get_file(file_record.path)
+                    if not file_path or not Path(file_path).is_file():
+                        logger.warning(f"File not on disk: {file_id_owui}")
+                        continue
+
+                    with open(file_path, "rb") as f:
+                        file_content = f.read()
+
+                    await emit_status(f"☁️ Uploading {file_name}...")
+
+                    upload_result = await client.beta.files.upload(
+                        file=(file_name, io.BytesIO(file_content)),
+                    )
+                    anthropic_file_id = upload_result.id
+                    msg_num = current_user_msg_num
+
+                    # Cache in OpenWebUI file metadata
+                    await Files.update_file_metadata_by_id(file_id_owui, {
+                        "anthropic_file_id": anthropic_file_id,
+                        "anthropic_file_msg_idx": msg_num,
+                    })
+
+                    logger.info(f"☁️ Uploaded {file_name} → {anthropic_file_id} (msg {msg_num})")
+
+                    await emit_status(f"☁️ Uploaded {file_name}", done=True)
+                except Exception as e:
+                    logger.error(f"Failed to upload {file_name}: {e}")
+                    await emit_notification(f"Failed to upload {file_name}: {str(e)[:100]}")
+                    continue
+
+            # Group container_upload block by user message number
+            if msg_num not in blocks_by_user_msg:
+                blocks_by_user_msg[msg_num] = []
+            blocks_by_user_msg[msg_num].append({
+                "type": "container_upload",
+                "file_id": anthropic_file_id,
+            })
+            processed_filenames.append(file_name)
+
+        return blocks_by_user_msg, processed_filenames
+
+    async def _validate_and_get_skills(
+        self,
+        skill_names: List[str],
+        api_key: str,
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Validate user-specified skill names against the Anthropic List Skills API.
+
+        Skills can be specified as:
+        - Anthropic skills: Short names like "pptx", "xlsx", "docx", "pdf"
+        - Custom skills: Full IDs like "skill_01AbCdEfGhIjKlMnOpQrStUv"
+
+        Validation results are cached per API key to avoid repeated API calls.
 
         Args:
-            event: The citation event from Anthropic (content_block_delta with citations_delta)
-            __event_emitter__: OpenWebUI event emitter function
-            citation_counter: Optional citation number for inline citations
+            skill_names: List of skill names/IDs from user's SKILLS valve
+            api_key: Anthropic API key
+            __event_emitter__: Optional event emitter for status updates
+
+        Returns:
+            List of validated skill configurations for the container parameter
         """
-        try:
-            logger.debug(
-                f" Processing citation event type: {getattr(event, 'type', 'unknown')}"
-            )
+        if not skill_names:
+            return []
 
-            # Extract citation from delta within content_block_delta event
-            delta = getattr(event, "delta", None)
-            citation = None
+        status = None
+        if __event_emitter__:
+            status_cls = globals().get("StatusEmitter")
+            status = status_cls(__event_emitter__) if status_cls else None
 
-            if delta and hasattr(delta, "citation"):
-                citation = delta.citation
-            elif hasattr(event, "citation"):
-                # Fallback: direct citation in event
-                citation = event.citation
-
-            if not citation:
-                logger.debug(f"No citation data found in event")
+        async def emit_status(description: str, *, done: bool = False, hidden: bool | None = None) -> None:
+            if not __event_emitter__:
                 return
-
-            logger.debug(f" Citation data found: {citation}")
-
-            # Only handle web search result citations
-            citation_type = getattr(citation, "type", "")
-            if citation_type != "web_search_result_location":
-                logger.debug(f" Skipping non-web-search citation type: {citation_type}")
+            if status:
+                await status.emit(description, done=done, hidden=hidden)
                 return
+            data: dict[str, Any] = {"description": description, "done": done}
+            if hidden is not None:
+                data["hidden"] = hidden
+            await self.emit_event({"type": "status", "data": data}, __event_emitter__)
 
-            # Extract web search citation information
-            url = getattr(citation, "url", "")
-            title = getattr(citation, "title", "Unknown Source")
-            cited_text = getattr(citation, "cited_text", "")
-
-            # CRITICAL: metadata.source is used by OpenWebUI as the grouping ID
-            # Must be unique for each citation to prevent Citation merging
-            metadata = {
-                "source": f"{url}#{citation_counter}",
-                "date_accessed": datetime.now().isoformat(),
-                "name": f"[{citation_counter}]",
-            }
-
-            source_data = {
-                "source": {
-                    "name": title,
-                    "url": url,
-                    "id": f"{citation_counter}",  # Unique source ID
-                },
-                "document": [cited_text],
-                "metadata": [metadata],
-            }
-
-            # Emit the source event
+        async def emit_notification(content: str, *, type: str = "warning") -> None:
+            if not __event_emitter__:
+                return
+            if status and hasattr(status, "notification"):
+                await status.notification(content, type=type)
+                return
             await self.emit_event(
-                {"type": "source", "data": source_data}, __event_emitter__
+                {"type": "notification", "data": {"type": type, "content": content}},
+                __event_emitter__,
             )
 
-        except Exception as e:
-            logger.error(f"Error handling citation: {str(e)}")
-            await self.handle_errors(e, __event_emitter__)
+        # Initialize cache for this API key if needed
+        if api_key not in self._validated_skills_cache:
+            self._validated_skills_cache[api_key] = {}
 
-    async def emit_event(
-        self,
-        event: Dict[str, Any],
-        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-    ) -> None:
-        """
-        Safely emit an event, handling None __event_emitter__ (e.g., in Channel contexts).
+        cache = self._validated_skills_cache[api_key]
 
-        In OpenWebUI Channels, when models are mentioned, __event_emitter__ is None
-        because the channel context doesn't provide a socket connection for status updates.
-        This helper prevents 'NoneType' object is not callable errors.
-        """
-        if __event_emitter__ is None:
-            return
-        try:
-            await __event_emitter__(event)
-        except Exception as e:
-            logger.warning(f"Event emitter failed: {e}")
+        # Check which skills need validation
+        skills_to_validate = [s for s in skill_names if s not in cache]
 
-    # =========================================================================
-    # SDK MESSAGE CONVERSION HELPER
-    # Converts SDK BetaMessage content blocks to API-compatible dicts
-    # =========================================================================
-    # CRITICAL: All blocks must be preserved to maintain thinking block positions.
-    # The SDK (and Anthropic's tool runner) keeps ALL blocks as-is when sending
-    # assistant content back during tool loops. Stripping server_tool_use or
-    # *_tool_result shifts thinking block indices, causing:
-    #   "thinking blocks cannot be modified"
-    # Only strip truly structural meta-events (context_cleared).
-    # Compaction blocks MUST be preserved — the API uses them to drop prior context.
-    #
-    # Thinking + redacted_thinking get strict key sanitization to prevent
-    # cache_control or other extra fields from causing API errors.
+        # If we have skills to validate, fetch from API
+        if skills_to_validate:
+            logger.debug(
+                f"🔧 Validating {len(skills_to_validate)} skills via API: {skills_to_validate}"
+            )
 
-    # Block types that must be strictly sanitized (extra keys cause API errors)
-    _SANITIZE_BLOCK_KEYS = {
-        "thinking": {"type", "thinking", "signature"},  # signature MUST be preserved exactly
-        "redacted_thinking": {"type", "data"},           # opaque data, pass through unchanged
-    }
+            await emit_status("🔧 Validating Skills...", hidden=True)
 
-    # Block types to skip entirely (structural meta-events)
-    _SKIP_BLOCK_TYPES = frozenset({"context_cleared"})
+            try:
+                from anthropic import AsyncAnthropic
 
-    def _convert_sdk_message_to_api_blocks(self, message) -> list:
-        """Convert SDK accumulated BetaMessage content to API-compatible block dicts.
+                base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+                client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
 
-        Mirrors the SDK's own tool runner behavior: keeps ALL content blocks
-        (including server_tool_use, *_tool_result, compaction) to preserve
-        thinking block positions and compaction boundaries. Skips structural
-        meta-events (context_cleared).
+                # Fetch all available skills
+                available_skills = {}
 
-        Strict key sanitization is applied ONLY to thinking/redacted_thinking
-        blocks (to prevent cache_control from being sent). All other blocks
-        are passed through with minimal processing.
-        """
-        blocks = []
-        for block in message.content:
-            block_dict = block.model_dump(exclude_none=True)
-            block_type = block_dict.get("type", "")
+                def index_skill(info: dict[str, Any]) -> None:
+                    skill_id = info.get("id", "")
+                    display_title = info.get("display_title", "") or skill_id
+                    for key in (skill_id, skill_id.lower(), display_title.lower()):
+                        if key:
+                            available_skills[key] = info
+                    haystack = f"{skill_id} {display_title}".lower()
+                    if "xlsx" in haystack or "excel" in haystack or "spreadsheet" in haystack:
+                        available_skills.setdefault("xlsx", info)
+                    if "pptx" in haystack or "powerpoint" in haystack or "presentation" in haystack:
+                        available_skills.setdefault("pptx", info)
+                    if "docx" in haystack or "word" in haystack or "document" in haystack:
+                        available_skills.setdefault("docx", info)
+                    if "pdf" in haystack:
+                        available_skills.setdefault("pdf", info)
 
-            # Skip structural meta-events (not real content blocks)
-            if block_type in self._SKIP_BLOCK_TYPES:
-                continue
+                # Fetch Anthropic skills
+                try:
+                    anthropic_skills = await client.beta.skills.list(
+                        source="anthropic", betas=["skills-2025-10-02"]
+                    )
+                    for skill in anthropic_skills.data:
+                        # Store by both id and display_title for flexible matching
+                        info = {
+                            "id": skill.id,
+                            "type": "anthropic",
+                            "source": "anthropic",
+                            "display_title": getattr(skill, "display_title", skill.id),
+                            "latest_version": getattr(
+                                skill, "latest_version", "latest"
+                            ),
+                        }
+                        index_skill(info)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch Anthropic skills: {e}")
 
-            # Compaction: preserve as {type: "compaction"} so the API
-            # recognises the boundary and drops all prior content blocks.
-            if block_type == "compaction":
-                content = block_dict.get("content", "")
-                if content:
-                    blocks.append({"type": "compaction", "content": content})
-                continue
+                # Fetch custom skills
+                try:
+                    custom_skills = await client.beta.skills.list(
+                        source="custom", betas=["skills-2025-10-02"]
+                    )
+                    for skill in custom_skills.data:
+                        info = {
+                            "id": skill.id,
+                            "type": "custom",
+                            "source": "custom",
+                            "display_title": getattr(skill, "display_title", skill.id),
+                            "latest_version": getattr(
+                                skill, "latest_version", "latest"
+                            ),
+                        }
+                        index_skill(info)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch custom skills: {e}")
 
-            # Thinking/redacted_thinking: strict key sanitization
-            sanitize_keys = self._SANITIZE_BLOCK_KEYS.get(block_type)
-            if sanitize_keys is not None:
-                blocks.append({k: v for k, v in block_dict.items() if k in sanitize_keys})
-                continue
+                logger.debug(f"🔧 Found {len(available_skills)} available skills")
 
-            # Text blocks: strip citations (response-only presentation data)
-            if block_type == "text":
-                block_dict.pop("citations", None)
-                blocks.append(block_dict)
-                continue
+                # Validate each skill
+                for skill_name in skills_to_validate:
+                    skill_lower = skill_name.lower().strip()
 
-            # tool_use blocks: strip "direct" caller (API rejects it),
-            # but preserve programmatic caller (needed for code_execution routing)
-            if block_type == "tool_use":
-                caller = block_dict.get("caller")
-                if caller and caller.get("type") == "direct":
-                    block_dict.pop("caller", None)
-                blocks.append(block_dict)
-                continue
+                    # Try exact match first
+                    if skill_name in available_skills:
+                        cache[skill_name] = available_skills[skill_name]
+                        logger.debug(f"✓ Validated skill '{skill_name}' (exact match)")
+                    # Try lowercase match
+                    elif skill_lower in available_skills:
+                        cache[skill_name] = available_skills[skill_lower]
+                        logger.debug(
+                            f"✓ Validated skill '{skill_name}' (case-insensitive match)"
+                        )
+                    else:
+                        # Mark as invalid
+                        cache[skill_name] = None
+                        logger.warning(
+                            f"✗ Invalid skill '{skill_name}' - not found in available skills"
+                        )
 
-            # All other blocks (server_tool_use, *_tool_result, etc.):
-            # pass through as-is to preserve thinking block positions
-            blocks.append(block_dict)
+            except Exception as e:
+                logger.error(f"Failed to validate skills: {e}")
+                # Mark all as failed validation
+                for skill_name in skills_to_validate:
+                    cache[skill_name] = None
 
-        return blocks
+        # Build the validated skills list
+        validated_skills = []
+        invalid_skills = []
 
-    # =========================================================================
-    # IMMEDIATE BLOCK FORMATTING HELPERS
-    # These format individual blocks immediately when they finish streaming
-    # =========================================================================
+        for skill_name in skill_names:
+            skill_info = cache.get(skill_name)
+            if skill_info:
+                requested_short_id = skill_name.lower().strip()
+                skill_id = (
+                    requested_short_id
+                    if skill_info.get("type") == "anthropic"
+                    and requested_short_id in {"pptx", "xlsx", "docx", "pdf"}
+                    else skill_info["id"]
+                )
+                validated_skills.append(
+                    {
+                        "type": skill_info["type"],
+                        "skill_id": skill_id,
+                        "version": "latest",
+                    }
+                )
+            else:
+                invalid_skills.append(skill_name)
+
+        if invalid_skills:
+            await emit_notification(
+                f"⚠️ Invalid Anthropic API Skills ignored: {', '.join(invalid_skills)}. "
+                "These are Anthropic API Skills, not OpenWebUI Skills."
+            )
+
+        logger.debug(f"🔧 Returning {len(validated_skills)} validated skills")
+        return validated_skills
+
     @staticmethod
     def _encode_block_payload(payload: Any) -> str:
         """Base64-encode a server-tool block payload (JSON) for byte-exact
@@ -6496,6 +5155,23 @@ class Pipe:
         except Exception as e:
             logger.exception("bash dispatch failed")
             return f"Error executing bash command: {e}"
+
+    async def _await_tool_task_result(
+        self,
+        tool_call_data: dict,
+        awaitable: Awaitable[Any],
+    ) -> tuple[dict, Any, Optional[Exception]]:
+        """Await a tool coroutine and keep its tool_use metadata attached."""
+        timeout_s = getattr(self.valves, "TOOL_CALL_TIMEOUT", self.TOOL_CALL_TIMEOUT)
+        try:
+            result = await asyncio.wait_for(awaitable, timeout=max(1, float(timeout_s)))
+            return tool_call_data, result, None
+        except asyncio.TimeoutError:
+            return tool_call_data, None, TimeoutError(
+                f"tool call timed out after {timeout_s}s"
+            )
+        except Exception as e:
+            return tool_call_data, None, e
 
     @staticmethod
     def _parse_terminal_payload(raw: Any) -> Any:
@@ -6831,6 +5507,17 @@ class Pipe:
             "</details>\n\n"
         )
 
+    @staticmethod
+    def _append_block_to_text(text: str, block: str) -> str:
+        """Append a rendered block with a safe markdown/html separator."""
+        if not text:
+            return block
+        if not block:
+            return text
+        if text.endswith(("\n", "\r")) or block.startswith(("\n", "\r")):
+            return text + block
+        return f"{text}\n{block}"
+
     def _format_thinking_block(
         self, content: str, duration: Optional[float] = None,
         signature: Optional[str] = None,
@@ -6902,24 +5589,6 @@ class Pipe:
         result += "</details>\n"
         return result
 
-    @staticmethod
-    def _try_parse_partial_json(buffer: str):
-        """Try to parse partial JSON by attempting various closing strategies.
-
-        During input_json_delta streaming, the input JSON arrives incrementally.
-        This attempts to close the partial JSON to extract a parseable value
-        for live UI updates. Returns parsed dict/list/value on success, None on failure.
-        """
-        if not buffer or not buffer.strip():
-            return None
-        # Try as-is first (might already be complete)
-        for suffix in ("", "}", '"}', '"}}', "]}"):
-            try:
-                return json.loads(buffer + suffix)
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return None
-
     def _format_tool_result_block(
         self,
         tool_call_id: str,
@@ -6974,11 +5643,17 @@ class Pipe:
                     json.dumps(str(tool_output), ensure_ascii=False)
                 )
 
+            escaped_embeds = (
+                html.escape(json.dumps(embeds, ensure_ascii=False))
+                if embeds
+                else ""
+            )
+
             return (
                 f'<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
                 f'arguments="{escaped_args}" result="{escaped_result}" '
                 f'files="{html.escape(json.dumps(files)) if files else ""}" '
-                f'embeds="{html.escape(json.dumps(embeds)) if embeds else ""}"{error_attr}>\n'
+                f'embeds="{escaped_embeds}"{error_attr}>\n'
                 f"<summary>{summary}</summary>\n"
                 f"</details>\n"
             )
@@ -6990,69 +5665,6 @@ class Pipe:
                 f"<summary>{summary}</summary>\n"
                 f"</details>\n"
             )
-
-    def _format_code_execution_block(
-        self,
-        code: str,
-        language: str = "bash",
-        stdout: str = "",
-        stderr: str = "",
-        return_code: int = None,
-        download_links: list = None,
-        tool_calls_info: list = None,
-    ) -> str:
-        """Format a code execution block with output as a collapsible <details> block.
-        
-        Args:
-            tool_calls_info: List of dicts with {name, input, result, is_error} for programmatic tool calls
-        """
-        # Build summary with tool call count
-        tool_count = len(tool_calls_info) if tool_calls_info else 0
-        summary_suffix = f" — {tool_count} tool call{'s' if tool_count != 1 else ''}" if tool_count else ""
-        
-        parts = []
-        parts.append(f"\n<details>\n<summary>💻 Code Execution ({language}){summary_suffix}</summary>\n")
-        if code:
-            parts.append(f"\n```{language}\n{code}\n```\n")
-        if tool_calls_info:
-            parts.append("\n🔧 **Tool Calls:**\n")
-            parts.append("| Tool | Arguments | Result |\n")
-            parts.append("|------|-----------|--------|\n")
-            for tc in tool_calls_info:
-                name = tc.get("name", "?")
-                # Format input as compact string
-                inp = tc.get("input", {})
-                if isinstance(inp, dict):
-                    inp_str = ", ".join(f"{k}={v}" for k, v in inp.items())
-                else:
-                    inp_str = str(inp)
-                # Format result - truncate if too long
-                result = tc.get("result", "")
-                try:
-                    parsed_result = json.loads(result) if isinstance(result, str) else result
-                    if isinstance(parsed_result, dict) and "result" in parsed_result:
-                        result_str = str(parsed_result["result"])
-                    else:
-                        result_str = str(parsed_result)
-                except (json.JSONDecodeError, ValueError):
-                    result_str = str(result)
-                if len(result_str) > 100:
-                    result_str = result_str[:97] + "..."
-                error_marker = " ❌" if tc.get("is_error") else ""
-                parts.append(f"| {name} | {inp_str} | {result_str}{error_marker} |\n")
-            parts.append("\n")
-        if stdout:
-            parts.append(f"**Output:**\n```\n{stdout}\n```\n")
-        if stderr:
-            parts.append(f"\n**Errors:**\n```\n{stderr}\n```\n")
-        if return_code is not None and return_code != 0:
-            parts.append(f"\n**Return code:** {return_code}\n")
-        if download_links:
-            parts.append("\n**Files:**\n")
-            for link in download_links:
-                parts.append(f"- {link}\n")
-        parts.append("</details>\n")
-        return "".join(parts)
 
     def _format_code_execution_block(
         self,
@@ -7152,172 +5764,2498 @@ class Pipe:
 
         await emit_event_local({"type": "source", "data": source_data})
 
+    @staticmethod
+    def _try_parse_partial_json(buffer: str):
+        """Try to parse partial JSON by attempting various closing strategies.
+
+        During input_json_delta streaming, the input JSON arrives incrementally.
+        This attempts to close the partial JSON to extract a parseable value
+        for live UI updates. Returns parsed dict/list/value on success, None on failure.
+        """
+        if not buffer or not buffer.strip():
+            return None
+        # Try as-is first (might already be complete)
+        for suffix in ("", "}", '"}', '"}}', "]}"):
+            try:
+                return json.loads(buffer + suffix)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def _parse_api_capabilities(cls, model) -> dict:
+        """Parse capabilities from an Anthropic API ModelInfo object into our internal format."""
+        caps = getattr(model, "capabilities", None)
+        _sup = lambda obj, attr="supported": getattr(obj, attr, False) if obj else False
+
+        thinking = getattr(caps, "thinking", None) if caps else None
+        thinking_types = getattr(thinking, "types", None) if thinking else None
+        effort = getattr(caps, "effort", None) if caps else None
+        ctx_mgmt = getattr(caps, "context_management", None) if caps else None
+
+        max_tokens = getattr(model, "max_tokens", 0) or 0
+        max_input = getattr(model, "max_input_tokens", 0) or 0
+
+        info = {
+            "max_tokens": max_tokens if max_tokens > 0 else 4096,
+            "context_length": max_input if max_input > 0 else 200000,
+            "supports_thinking": _sup(thinking),
+            "supports_adaptive_thinking": _sup(getattr(thinking_types, "adaptive", None)) if thinking_types else False,
+            "supports_effort": _sup(effort),
+            "supports_effort_max": _sup(getattr(effort, "max", None)) if effort else False,
+            "supports_effort_xhigh": _sup(getattr(effort, "xhigh", None)) if effort else False,
+            "supports_vision": _sup(getattr(caps, "image_input", None)) if caps else True,
+            "supports_programmatic_calling": _sup(getattr(caps, "code_execution", None)) if caps else False,
+            "supports_compaction": _sup(getattr(ctx_mgmt, "compact_20260112", None)) if ctx_mgmt else False,
+            # All Claude 4+ models support memory
+            "supports_memory": True,
+            # Defaults for fields not in API — overridden by MODEL_CAPABILITY_OVERRIDES
+            "supports_dynamic_filtering": False,
+            "supports_fast_mode": False,
+        }
+
+        # Apply model-specific overrides for fields not available from API
+        model_id = model.id if hasattr(model, "id") else ""
+        overrides = cls.MODEL_CAPABILITY_OVERRIDES.get(model_id, {})
+        info.update(overrides)
+
+        return info
+
+    @classmethod
+    def get_model_info(cls, model_name: str) -> dict:
+        """
+        Get model capabilities by name. Reads from API cache first,
+        falls back to safe defaults for unknown models.
+        """
+        if model_name in cls._api_capabilities_cache:
+            return cls._api_capabilities_cache[model_name]
+
+        # Return conservative defaults for unknown models, then apply identity
+        # overrides for beta features whose API capability metadata can lag.
+        info = {
+            "max_tokens": 4096,
+            "context_length": 200000,
+            "supports_thinking": True,
+            "supports_memory": False,
+            "supports_vision": True,
+            "supports_effort": False,
+            "supports_programmatic_calling": False,
+            "supports_compaction": False,
+            "supports_dynamic_filtering": False,
+            "supports_adaptive_thinking": False,
+            "supports_effort_max": False,
+            "supports_effort_xhigh": False,
+            "supports_fast_mode": False,
+        }
+        info.update(cls.MODEL_CAPABILITY_OVERRIDES.get(model_name, {}))
+        return info
+
+    async def get_anthropic_models(self) -> List[dict]:
+        """
+        Fetches the current list of Anthropic models using the official Anthropic Python SDK.
+        Parses capabilities from the API response and caches them.
+        Returns OpenWebUI model dicts.
+        """
+        # Return cached result if still fresh
+        if (
+            self._api_capabilities_cache
+            and time.time() - self._api_capabilities_cache_ts < self._API_CACHE_TTL
+        ):
+            models = []
+            for name, info in self._api_capabilities_cache.items():
+                models.append(self._build_openwebui_model_entry(name, info))
+            return models
+
+        from anthropic import AsyncAnthropic
+
+        models = []
+        new_cache: Dict[str, dict] = {}
+        try:
+            api_key = self.valves.ANTHROPIC_API_KEY
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+            async for m in client.models.list():
+                name = m.id
+                display_name = getattr(m, "display_name", name)
+
+                # Parse capabilities directly from API response
+                info = self._parse_api_capabilities(m)
+                info["_display_name"] = display_name
+                new_cache[name] = info
+
+                entry = self._build_openwebui_model_entry(name, info, display_name)
+                models.append(entry)
+
+            # Update class-level cache
+            Pipe._api_capabilities_cache = new_cache
+            Pipe._api_capabilities_cache_ts = time.time()
+            logger.info(f"Cached capabilities for {len(new_cache)} models from API")
+            return models
+        except Exception as e:
+            logging.warning(
+                f"Could not fetch models from SDK/API: {e}"
+            )
+            # If we have stale cache, use it
+            if self._api_capabilities_cache:
+                logging.info("Using stale capability cache as fallback")
+                for name, info in self._api_capabilities_cache.items():
+                    models.append(self._build_openwebui_model_entry(name, info))
+                return models
+            # No cache available — return empty (API key likely invalid)
+            return models
+
+    @staticmethod
+    def _build_openwebui_model_entry(
+        name: str, info: dict, display_name: str = ""
+    ) -> dict:
+        return {
+            "id": f"anthropic/{name}",
+            "name": display_name or name,
+            "context_length": info["context_length"],
+            "supports_vision": info["supports_vision"],
+            "supports_thinking": info["supports_thinking"],
+            "is_hybrid_model": info["supports_thinking"],
+            "max_output_tokens": info["max_tokens"],
+            "info": {
+                "meta": {
+                    "capabilities": {
+                        "status_updates": True
+                    }
+                }
+            },
+        }
+
+    async def pipes(self) -> List[dict]:
+        return await self.get_anthropic_models()
+
+    async def _run_task_model_request(
+        self,
+        body: dict[str, Any],
+    ) -> str:
+        """
+        Handle task model requests (title generation, tags, follow-ups etc.) by making a
+        non-streaming request to Anthropic API and returning only the text response.
+
+        Task models should return plain text without any JSON formatting or status updates
+        mixed into the response.
+        """
+        try:
+            # Extract model and messages from body
+            actual_model_name = body["model"].split("/")[-1]
+            messages = body.get("messages", [])
+
+            # Build simple payload for task request (non-streaming)
+            task_payload = {
+                "model": actual_model_name,
+                "max_tokens": body.get("max_tokens", 4096),
+                "messages": self._process_messages_for_task(messages),
+                "stream": False,
+            }
+
+            logger.debug(f"Task payload: {json.dumps(task_payload, indent=2)}")
+            try:
+                logger.debug(
+                    "[PAYLOAD] task %s",
+                    json.dumps(
+                        self._strip_payload(task_payload),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                )
+            except Exception as _pl_err:
+                logger.debug(f"[PAYLOAD] task strip/log failed: {_pl_err}")
+
+            # Make synchronous request to Anthropic API
+            # For task requests, we don't have __user__ context, so use default key
+            api_key = self.valves.ANTHROPIC_API_KEY
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+
+            response = await client.messages.create(**task_payload)
+
+            # Extract text from response
+            text_parts = []
+            for content_block in response.content:
+                if content_block.type == "text":
+                    text_parts.append(content_block.text)
+
+            # Join without adding line breaks - preserve original formatting
+            result = "".join(text_parts).strip()
+
+            logger.debug(f"Task response: {result}")
+
+            return result
+
+        except Exception as e:
+            logger.debug(f"Task model error: {e}")
+            return ""
+
+    def _process_messages_for_task(self, messages: List[dict]) -> List[dict]:
+        """
+        Process messages for task requests - convert to simple Anthropic format.
+        Task requests don't need complex content processing.
+        """
+        processed = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                continue  # System messages handled separately
+
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                processed.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                # Extract text from content blocks
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                if text_parts:
+                    processed.append({"role": role, "content": " ".join(text_parts)})
+
+        return processed
+
+    def _handle_message_start_usage(
+        self,
+        event: Any,
+        *,
+        include_usage: bool,
+        total_usage: Optional[dict[str, int]],
+        stream_output_tokens: int,
+    ) -> int:
+        """Handle message_start usage accounting and return updated stream output tokens."""
+
+        message = getattr(event, "message", None)
+        if not message:
+            return stream_output_tokens
+
+        request_id = getattr(message, "id", None)
+        logger.debug(f" Message started with ID: {request_id}")
+
+        if not include_usage or total_usage is None:
+            return stream_output_tokens
+
+        usage = getattr(message, "usage", {})
+        if not usage:
+            return stream_output_tokens
+
+        input_tokens = getattr(usage, "input_tokens", 0)
+        current_output_tokens = getattr(usage, "output_tokens", 0)
+
+        total_usage["input_tokens"] += input_tokens
+        diff = current_output_tokens - stream_output_tokens
+        total_usage["output_tokens"] += diff
+        stream_output_tokens = current_output_tokens
+
+        if self.valves.CACHE_CONTROL != "cache disabled":
+            cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+            # Use LAST call's values (not cumulative) so the display reflects
+            # what is currently cached, not a sum across tool-loop iterations.
+            total_usage["cache_creation_input_tokens"] = cache_creation_input_tokens
+            total_usage["cache_read_input_tokens"] = cache_read_input_tokens
+            logger.debug(
+                f" Usage stats: input={input_tokens}, output={current_output_tokens}, "
+                f"cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
+            )
+        else:
+            cache_creation_input_tokens = 0
+            cache_read_input_tokens = 0
+            logger.debug(f" Usage stats: input={input_tokens}, output={current_output_tokens}")
+
+        # _ctx_input = this call's FULL input (new + cached read + cached creation).
+        # Used for total_tokens (actual context window usage) and updated each call
+        # so the progress bar always reflects the current context size.
+        total_usage["_ctx_input"] = (
+            input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+        )
+        # total_tokens = full context window usage = last call's input total + accumulated output.
+        total_usage["total_tokens"] = (
+            total_usage["_ctx_input"]
+            + total_usage.get("output_tokens", 0)
+        )
+        logger.debug(f" Accumulated usage: {total_usage}")
+
+        return stream_output_tokens
+
+    async def _handle_stream_exception(
+        self,
+        exc: Exception,
+        *,
+        retry_attempts: int,
+        request_ctx: PipeRequestContext,
+    ) -> tuple[bool, int, str]:
+        """Central stream exception policy.
+
+        Returns: (should_retry, updated_retry_attempts, response_suffix)
+        """
+
+        max_retries = self.valves.MAX_RETRIES
+        status = StatusEmitter(request_ctx.emit_event)
+
+        non_retry_map: dict[type[Exception], str] = {
+            RateLimitError: f"\n\n⚠️ Rate limit exceeded - maximum retries ({max_retries}) reached. Please try again later.",
+            AuthenticationError: f"\n\nError: API key issues. Reason: {getattr(exc, 'message', str(exc))}",
+            PermissionDeniedError: f"\n\nError: Permission denied. Reason: {getattr(exc, 'message', str(exc))}",
+            NotFoundError: f"\n\nError: Resource not found. Reason: {getattr(exc, 'message', str(exc))}",
+            BadRequestError: f"\n\nError: Invalid request format. Reason: {getattr(exc, 'message', str(exc))}",
+            UnprocessableEntityError: f"\n\nError: Unprocessable entity. Reason: {getattr(exc, 'message', str(exc))}",
+        }
+
+        for error_type, suffix in non_retry_map.items():
+            if isinstance(exc, error_type):
+                await self.handle_errors(exc, request_ctx.event_emitter)
+                return (False, retry_attempts, suffix)
+
+        retryable_with_status: list[tuple[type[Exception], str, str]] = [
+            (OverloadedError, "⏳ API overloaded, retrying...", "🔧 API overloaded"),
+            (InternalServerError, "⏳ Server error, retrying...", "🔧 Server error"),
+            (APIConnectionError, "🌐 Connection error, retrying...", "🌐 Network connection failed"),
+        ]
+
+        for error_type, status_label, fail_label in retryable_with_status:
+            if isinstance(exc, error_type):
+                retry_attempts += 1
+                if retry_attempts <= max_retries:
+                    await status.activity(f"{status_label} ({retry_attempts}/{max_retries})")
+                    return (True, retry_attempts, "")
+
+                await self.handle_errors(exc, request_ctx.event_emitter)
+                if isinstance(exc, APIConnectionError):
+                    return (
+                        False,
+                        retry_attempts,
+                        f"\n\n{fail_label} after {max_retries} attempts. Please check your connection.",
+                    )
+                return (
+                    False,
+                    retry_attempts,
+                    f"\n\n{fail_label} - maximum retries ({max_retries}) reached. Please try again later.",
+                )
+
+        if isinstance(exc, APIStatusError):
+            error_body = getattr(exc, "body", None) or {}
+            error_info = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+            is_overloaded = error_info.get("type") == "overloaded_error"
+
+            if is_overloaded and retry_attempts < max_retries:
+                retry_attempts += 1
+                await status.activity(
+                    f"⏳ API overloaded (streaming), retrying... ({retry_attempts}/{max_retries})"
+                )
+                return (True, retry_attempts, "")
+
+            await self.handle_errors(exc, request_ctx.event_emitter)
+            if is_overloaded:
+                return (
+                    False,
+                    retry_attempts,
+                    f"\n\n🔧 API overloaded (streaming) - maximum retries ({max_retries}) reached. Please try again later.",
+                )
+            return (
+                False,
+                retry_attempts,
+                f"\n\nError: Anthropic API error. Reason: {getattr(exc, 'message', str(exc))}",
+            )
+
+        await self.handle_errors(exc, request_ctx.event_emitter)
+        return (
+            False,
+            retry_attempts,
+            f"\n\nError: {type(exc).__name__} occurred. Reason: {exc}",
+        )
+
+    async def _apply_sdk_stop_reason_fallback(
+        self,
+        *,
+        sdk_final_message: Any,
+        conversation_ended: bool,
+        has_pending_tool_calls: bool,
+        tool_calls: list[dict[str, Any]],
+        tool_loop_iteration: int,
+        payload_for_stream: dict[str, Any],
+        stream_event_counts: dict[str, int],
+        request_ctx: PipeRequestContext,
+    ) -> tuple[bool, bool, list[dict[str, Any]]]:
+        """Apply fallback stop-reason logic when message_delta was missing."""
+
+        if not sdk_final_message or conversation_ended or has_pending_tool_calls:
+            return conversation_ended, has_pending_tool_calls, tool_calls
+
+        status = StatusEmitter(request_ctx.emit_event)
+
+        sdk_stop = getattr(sdk_final_message, "stop_reason", None)
+        sdk_content = getattr(sdk_final_message, "content", [])
+
+        if sdk_stop:
+            logger.info(f"📍 Fallback stop_reason from SDK message: {sdk_stop}")
+            if sdk_stop == "end_turn":
+                conversation_ended = True
+            elif sdk_stop == "tool_use":
+                has_pending_tool_calls = True
+                if not tool_calls:
+                    for block in sdk_content:
+                        if getattr(block, "type", None) == "tool_use":
+                            logger.warning(
+                                f"📍 Rebuilding tool_call from SDK: {getattr(block, 'name', '?')}"
+                            )
+                            tool_calls.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": getattr(block, "id", ""),
+                                    "content": "Error: tool call was not processed during streaming",
+                                    "is_error": True,
+                                }
+                            )
+            elif sdk_stop == "pause_turn":
+                has_pending_tool_calls = True
+                await status.activity("⏳ Long-running turn paused, continuing...")
+            elif sdk_stop in (
+                "max_tokens",
+                "refusal",
+                "stop_sequence",
+                "model_context_window_exceeded",
+            ):
+                conversation_ended = True
+                if sdk_stop == "max_tokens":
+                    await request_ctx.emit_delta("\n\n⚠️ Maximum token limit reached.")
+                elif sdk_stop == "model_context_window_exceeded":
+                    await request_ctx.emit_delta("\n\n⚠️ Context window exceeded.")
+        elif not sdk_content:
+            logger.warning(
+                f"⚠️ Empty API response (no stop_reason, no content). "
+                f"Container: {payload_for_stream.get('container', 'NONE')}. "
+                f"Events: {stream_event_counts}. Treating as end_turn."
+            )
+            conversation_ended = True
+            if tool_loop_iteration > 1:
+                await request_ctx.emit_delta(
+                    "\n\n⚠️ Code execution continuation returned empty response. "
+                    "The container may have timed out."
+                )
+        else:
+            # stop_reason is None but content exists (e.g. thinking + server_tool blocks
+            # without any text). This typically happens when the API is overloaded and
+            # returns a truncated stream after 200 OK. Anthropic warns:
+            # "When receiving a streaming response via SSE, it's possible that an error
+            # can occur after returning a 200 response."
+            # We leave conversation_ended=False here so the main loop's safety-break
+            # section can detect this and trigger an auto-retry.
+            block_types = [getattr(b, "type", "?") for b in sdk_content]
+            has_text = any(
+                getattr(b, "type", None) == "text"
+                and len(getattr(b, "text", "") or "") > 0
+                for b in sdk_content
+            )
+            logger.warning(
+                f"⚠️ Truncated stream: no stop_reason but content present. "
+                f"Blocks: {block_types}. has_text={has_text}. "
+                f"Container: {payload_for_stream.get('container', 'NONE')}. "
+                f"Events: {stream_event_counts}."
+            )
+            # Don't set conversation_ended — let the safety-break handle retry logic
+
+        return conversation_ended, has_pending_tool_calls, tool_calls
+
+    async def handle_errors(
+        self,
+        exception,
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ):
+        # Determine specific error message based on exception type
+        if isinstance(exception, RateLimitError):
+            error_msg = "Rate limit exceeded. Please wait before making more requests."
+            user_msg = "⚠️ Rate limit reached. Please try again in a moment."
+        elif isinstance(exception, AuthenticationError):
+            error_msg = "Authentication failed. Please check your API key."
+            user_msg = (
+                "🔑 Invalid API key. Please verify your Anthropic API key is correct."
+            )
+        elif isinstance(exception, PermissionDeniedError):
+            error_msg = (
+                "Permission denied. Your API key may not have access to this resource."
+            )
+            user_msg = "🚫 Access denied. Your API key doesn't have permission for this request."
+        elif isinstance(exception, NotFoundError):
+            error_msg = (
+                "Resource not found. The requested model or endpoint may not exist."
+            )
+            user_msg = "❓ Resource not found. Please check if the model is available."
+        elif isinstance(exception, BadRequestError):
+            error_msg = f"Bad request: {str(exception)}"
+            user_msg = (
+                "📝 Invalid request format. Please check your input and try again."
+            )
+        elif isinstance(exception, UnprocessableEntityError):
+            error_msg = f"Unprocessable entity: {str(exception)}"
+            user_msg = "📄 Request format issue. Please check your message structure and try again."
+        elif isinstance(exception, InternalServerError):
+            error_msg = "Anthropic server error. Please try again later."
+            user_msg = (
+                "🔧 Server temporarily unavailable. Please try again in a few moments."
+            )
+        elif isinstance(exception, APIConnectionError):
+            error_msg = (
+                "Network connection error. Please check your internet connection."
+            )
+            user_msg = "🌐 Connection error. Please check your network and try again."
+        elif isinstance(exception, APIStatusError):
+            status_code = getattr(exception, "status_code", "Unknown")
+            error_msg = f"API Error ({status_code}): {str(exception)}"
+            user_msg = (
+                f"⚡ API Error ({status_code}). Please try again or contact support."
+            )
+        else:
+            error_msg = f"Unexpected error: {str(exception)}"
+            user_msg = "💥 An unexpected error occurred. Please try again."
+
+        logger.error(f"Exception: {error_msg}")
+        # Add request ID if available for debugging
+        if isinstance(exception, APIStatusError) and hasattr(exception, "response"):
+            try:
+                request_id = exception.response.headers.get("request-id")
+                if request_id:
+                    logger.info(f"Request ID: %s", request_id)
+            except Exception:
+                pass  # Ignore if we can't get request ID
+
+        await self.emit_event(
+            {
+                "type": "notification",
+                "data": {
+                    "type": "error",
+                    "content": user_msg,
+                },
+            },
+            __event_emitter__,
+        )
+
+        tb = traceback.format_exc()
+
+        await self.emit_event(
+            {
+                "type": "source",
+                "data": {
+                    "source": {"name": "Anthropic Error", "url": None},
+                    "document": [tb],
+                    "metadata": [
+                        {
+                            "source": "anthropic api",
+                            "type": "error",
+                            "date_accessed": datetime.utcnow().isoformat(),
+                        }
+                    ],
+                },
+            },
+            __event_emitter__,
+        )
+        await self.emit_event(
+            {
+                "type": "status",
+                "data": {
+                    "description": "❌ Response with Errors",
+                    "done": True,
+                },
+            },
+            __event_emitter__,
+        )
+
+    async def handle_citation(self, event, __event_emitter__, citation_counter=None):
+        """
+        Handle web search citation events from Anthropic API and emit appropriate source events to OpenWebUI.
+
+        Args:
+            event: The citation event from Anthropic (content_block_delta with citations_delta)
+            __event_emitter__: OpenWebUI event emitter function
+            citation_counter: Optional citation number for inline citations
+        """
+        try:
+            logger.debug(
+                f" Processing citation event type: {getattr(event, 'type', 'unknown')}"
+            )
+
+            # Extract citation from delta within content_block_delta event
+            delta = getattr(event, "delta", None)
+            citation = None
+
+            if delta and hasattr(delta, "citation"):
+                citation = delta.citation
+            elif hasattr(event, "citation"):
+                # Fallback: direct citation in event
+                citation = event.citation
+
+            if not citation:
+                logger.debug(f"No citation data found in event")
+                return
+
+            logger.debug(f" Citation data found: {citation}")
+
+            # Only handle web search result citations
+            citation_type = getattr(citation, "type", "")
+            if citation_type != "web_search_result_location":
+                logger.debug(f" Skipping non-web-search citation type: {citation_type}")
+                return
+
+            # Extract web search citation information
+            url = getattr(citation, "url", "")
+            title = getattr(citation, "title", "Unknown Source")
+            cited_text = getattr(citation, "cited_text", "")
+
+            # CRITICAL: metadata.source is used by OpenWebUI as the grouping ID
+            # Must be unique for each citation to prevent Citation merging
+            metadata = {
+                "source": f"{url}#{citation_counter}",
+                "date_accessed": datetime.now().isoformat(),
+                "name": f"[{citation_counter}]",
+            }
+
+            source_data = {
+                "source": {
+                    "name": title,
+                    "url": url,
+                    "id": f"{citation_counter}",  # Unique source ID
+                },
+                "document": [cited_text],
+                "metadata": [metadata],
+            }
+
+            # Emit the source event
+            await self.emit_event(
+                {"type": "source", "data": source_data}, __event_emitter__
+            )
+
+        except Exception as e:
+            logger.error(f"Error handling citation: {str(e)}")
+            await self.handle_errors(e, __event_emitter__)
+
+    async def emit_event(
+        self,
+        event: Dict[str, Any],
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> None:
+        """
+        Safely emit an event, handling None __event_emitter__ (e.g., in Channel contexts).
+
+        In OpenWebUI Channels, when models are mentioned, __event_emitter__ is None
+        because the channel context doesn't provide a socket connection for status updates.
+        This helper prevents 'NoneType' object is not callable errors.
+        """
+        if __event_emitter__ is None:
+            return
+        try:
+            await __event_emitter__(event)
+        except Exception as e:
+            logger.warning(f"Event emitter failed: {e}")
+
+    def _convert_sdk_message_to_api_blocks(self, message) -> list:
+        """Convert SDK accumulated BetaMessage content to API-compatible block dicts.
+
+        Mirrors the SDK's own tool runner behavior: keeps ALL content blocks
+        (including server_tool_use, *_tool_result, compaction) to preserve
+        thinking block positions and compaction boundaries. Skips structural
+        meta-events (context_cleared).
+
+        Strict key sanitization is applied ONLY to thinking/redacted_thinking
+        blocks (to prevent cache_control from being sent). All other blocks
+        are passed through with minimal processing.
+        """
+        blocks = []
+        for block in message.content:
+            block_dict = block.model_dump(exclude_none=True)
+            block_type = block_dict.get("type", "")
+
+            # Skip structural meta-events (not real content blocks)
+            if block_type in self._SKIP_BLOCK_TYPES:
+                continue
+
+            # Compaction: preserve as {type: "compaction"} so the API
+            # recognises the boundary and drops all prior content blocks.
+            if block_type == "compaction":
+                content = block_dict.get("content", "")
+                if content:
+                    blocks.append({"type": "compaction", "content": content})
+                continue
+
+            # Thinking/redacted_thinking: strict key sanitization
+            sanitize_keys = self._SANITIZE_BLOCK_KEYS.get(block_type)
+            if sanitize_keys is not None:
+                blocks.append({k: v for k, v in block_dict.items() if k in sanitize_keys})
+                continue
+
+            # Text blocks: strip citations (response-only presentation data)
+            if block_type == "text":
+                block_dict.pop("citations", None)
+                blocks.append(block_dict)
+                continue
+
+            # tool_use blocks: strip "direct" caller (API rejects it),
+            # but preserve programmatic caller (needed for code_execution routing)
+            if block_type == "tool_use":
+                caller = block_dict.get("caller")
+                if caller and caller.get("type") == "direct":
+                    block_dict.pop("caller", None)
+                blocks.append(block_dict)
+                continue
+
+            # All other blocks (server_tool_use, *_tool_result, etc.):
+            # pass through as-is to preserve thinking block positions
+            blocks.append(block_dict)
+
+        return blocks
+
+    def _format_code_execution_block(
+        self,
+        code: str,
+        language: str = "bash",
+        done: bool = False,
+        duration: float = None,
+        stdout: str = "",
+        stderr: str = "",
+        return_code: int = None,
+        download_links: list = None,
+        tool_calls_info: list = None,
+    ) -> str:
+        """Format a code execution block with output as a collapsible <details> block.
+        
+        Args:
+            tool_calls_info: List of dicts with {name, input, result, is_error} for programmatic tool calls
+        """
+        # Build summary with tool call count
+        tool_count = len(tool_calls_info) if tool_calls_info else 0
+        summary_suffix = f" — {tool_count} tool call{'s' if tool_count != 1 else ''}" if tool_count else ""
+        
+        parts = []
+        parts.append(f"\n<details>\n<summary>💻 Code Execution ({language}){summary_suffix}</summary>\n")
+        if code:
+            parts.append(f"\n```{language}\n{code}\n```\n")
+        if tool_calls_info:
+            parts.append("\n🔧 **Tool Calls:**\n")
+            parts.append("| Tool | Arguments | Result |\n")
+            parts.append("|------|-----------|--------|\n")
+            for tc in tool_calls_info:
+                name = tc.get("name", "?")
+                # Format input as compact string
+                inp = tc.get("input", {})
+                if isinstance(inp, dict):
+                    inp_str = ", ".join(f"{k}={v}" for k, v in inp.items())
+                else:
+                    inp_str = str(inp)
+                # Format result - truncate if too long
+                result = tc.get("result", "")
+                try:
+                    parsed_result = json.loads(result) if isinstance(result, str) else result
+                    if isinstance(parsed_result, dict) and "result" in parsed_result:
+                        result_str = str(parsed_result["result"])
+                    else:
+                        result_str = str(parsed_result)
+                except (json.JSONDecodeError, ValueError):
+                    result_str = str(result)
+                if len(result_str) > 100:
+                    result_str = result_str[:97] + "..."
+                error_marker = " ❌" if tc.get("is_error") else ""
+                parts.append(f"| {name} | {inp_str} | {result_str}{error_marker} |\n")
+            parts.append("\n")
+        if stdout:
+            parts.append(f"**Output:**\n```\n{stdout}\n```\n")
+        if stderr:
+            parts.append(f"\n**Errors:**\n```\n{stderr}\n```\n")
+        if return_code is not None and return_code != 0:
+            parts.append(f"\n**Return code:** {return_code}\n")
+        if download_links:
+            parts.append("\n**Files:**\n")
+            for link in download_links:
+                parts.append(f"- {link}\n")
+        parts.append("</details>\n")
+        return "".join(parts)
+
+    async def pipe(
+        self,
+        body: dict[str, Any],
+        __user__: Dict[str, Any],
+        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
+        __metadata__: dict[str, Any] = {},
+        __tools__: Optional[Dict[str, Dict[str, Any]]] = None,
+        __files__: Optional[Dict[str, Any]] = None,
+        __task__: Optional[dict[str, Any]] = None,
+        __task_body__: Optional[dict[str, Any]] = None,
+        __request__: Optional[Any] = None,
+    ):
+        """
+        OpenWebUI Claude streaming pipe with integrated streaming logic.
+        """
+        # =========================================================================
+        # PHASE 1: RESPONSE ACCUMULATION STATE
+        # =========================================================================
+        request_ctx = PipeRequestContext(pipe=self, event_emitter=__event_emitter__)
+        final_message = request_ctx.final_message
+        emit_event_local = request_ctx.emit_event
+        emit_message_delta = request_ctx.emit_delta
+        emit_message_replace = request_ctx.emit_replace
+        update_content_block = request_ctx.update_content_block
+        final_text = request_ctx.text
+        status = StatusEmitter(emit_event_local)
+
+
+        try:
+            # =========================================================================
+            # PHASE 2: VALIDATION & SETUP
+            # =========================================================================
+
+            # Debug: Log all Valves and UserValves settings
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Valves: {self.valves.model_dump()}")
+                user_valves = __user__.get("valves")
+                if user_valves and hasattr(user_valves, "model_dump"):
+                    logger.debug(f"UserValves: {user_valves.model_dump()}")
+                elif user_valves:
+                    logger.debug(f"UserValves: {user_valves}")
+
+            # Get API key - check UserValves first, then fall back to admin valve
+            user_valves = __user__.get("valves")
+            user_api_key = getattr(user_valves, "ANTHROPIC_API_KEY", "") if user_valves else ""
+            api_key = user_api_key.strip() if user_api_key and user_api_key.strip() else self.valves.ANTHROPIC_API_KEY
+            if not api_key or api_key == "Your API Key Here":
+                error_msg = "Error: No API key configured. Set it in admin Valves or your personal UserValves."
+                logger.error(f"{error_msg}")
+                await status.complete("No API Key Set!")
+                return error_msg
+
+            # STEP 1: Detect if task model (generate title, tags, follow-ups etc.), handle it separately
+            if __task__:
+                return await self._run_task_model_request(body)
+
+            # STEP 2: Await tools if needed
+            if inspect.isawaitable(__tools__):
+                __tools__ = await __tools__
+
+            # STEP 2.5: Get builtin tools from OpenWebUI (for tools from body.tools)
+            builtin_tools = {}
+            if BUILTIN_TOOLS_AVAILABLE and __request__:
+                try:
+                    # Determine if memory feature is enabled
+                    memory_enabled = (
+                        __user__.get("settings", {}).get("ui", {}).get("memory", False)
+                        if __user__
+                        else False
+                    )
+                    # Resolve skill IDs for view_skill builtin tool
+                    skill_ids = []
+                    try:
+                        openwebui_model_id = __metadata__.get("model_id") or body.get("model", "")
+                        if openwebui_model_id and MODELS_AVAILABLE:
+                            owui_model = await Models.get_model_by_id(openwebui_model_id)
+                            if owui_model:
+                                # ModelModel has .meta (ModelMeta pydantic model), not .info
+                                meta = owui_model.meta
+                                if meta:
+                                    meta_dict = meta.model_dump() if hasattr(meta, "model_dump") else (meta if isinstance(meta, dict) else {})
+                                    model_skill_ids = set(meta_dict.get("skillIds", []))
+                                else:
+                                    model_skill_ids = set()
+                                logger.debug(f"Model {openwebui_model_id} skill IDs: {model_skill_ids}")
+                                if model_skill_ids:
+                                    from open_webui.models.skills import Skills as SkillsModel
+
+                                    user_id = __user__.get("id", "") if __user__ else ""
+                                    accessible_skills = await SkillsModel.get_skills_by_user_id(user_id, "read")
+                                    accessible = {s.id for s in accessible_skills}
+                                    logger.debug(f"Accessible skills for user: {accessible}")
+                                    skill_ids = []
+                                    for sid in model_skill_ids:
+                                        if sid not in accessible:
+                                            continue
+                                        s = await SkillsModel.get_skill_by_id(sid)
+                                        if s and s.is_active:
+                                            skill_ids.append(sid)
+                                    logger.debug(f"Resolved skill_ids: {skill_ids}")
+                    except Exception as e:
+                        logger.debug(f"Could not resolve skill IDs: {e}")
+
+                    builtin_tools = get_builtin_tools(
+                        __request__,
+                        {
+                            "__user__": __user__,
+                            "__event_emitter__": __event_emitter__,
+                            "__chat_id__": (
+                                __metadata__.get("chat_id") if __metadata__ else None
+                            ),
+                            "__message_id__": (
+                                __metadata__.get("message_id") if __metadata__ else None
+                            ),
+                            "__skill_ids__": skill_ids,
+                        },
+                        features={"memory": memory_enabled},
+                        model={},
+                    )
+                    if inspect.isawaitable(builtin_tools):
+                        builtin_tools = await builtin_tools
+                    logger.debug(
+                        f"Loaded {len(builtin_tools)} builtin tools: {list(builtin_tools.keys())}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not load builtin tools: {e}")
+                    builtin_tools = {}
+
+            # Merge external tools from metadata (Open Terminal, external tool servers)
+            # These have callables for execution but are not in __tools__ or builtin_tools
+            metadata_tools = __metadata__.get("tools", {}) if __metadata__ else {}
+            if metadata_tools:
+                for t_name, t_data in metadata_tools.items():
+                    if t_name not in builtin_tools and (not __tools__ or t_name not in __tools__):
+                        if isinstance(t_data, dict) and t_data.get("callable"):
+                            builtin_tools[t_name] = t_data
+                if builtin_tools:
+                    logger.debug(
+                        f"After metadata merge, builtin_tools: {list(builtin_tools.keys())}"
+                    )
+
+            # STEP 3: Auto-enable native function calling if tools are present
+            # This prevents OpenWebUI's function_calling task system from being triggered
+            if __tools__ and MODELS_AVAILABLE:
+                try:
+                    # Get the OpenWebUI model ID from metadata
+                    openwebui_model_id = (
+                        __metadata__.get("model_id") if __metadata__ else None
+                    )
+                    if not openwebui_model_id and body and "model" in body:
+                        openwebui_model_id = body["model"]
+
+                    if openwebui_model_id:
+                        model = await Models.get_model_by_id(openwebui_model_id)
+                        if model:
+                            params = dict(model.params or {})
+                            if params.get("function_calling") != "native":
+                                logger.debug(
+                                    f"Auto-enabling native function calling for model: {openwebui_model_id}"
+                                )
+
+                                # Notify user
+                                await emit_event_local(
+                                    {
+                                        "type": "notification",
+                                        "data": {
+                                            "type": "info",
+                                            "content": f"Enabling native function calling for model: {openwebui_model_id}. Please re-run your query.",
+                                        },
+                                    }
+                                )
+
+                                params["function_calling"] = "native"
+                                form_data = model.model_dump()
+                                form_data["params"] = params
+                                await Models.update_model_by_id(
+                                    openwebui_model_id, ModelForm(**form_data)
+                                )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not auto-enable native function calling: {e}"
+                    )
+
+            # Tell middleware to skip reasoning tag detection — the pipe renders
+            # its own <details type="reasoning"> blocks which must not be re-parsed.
+            if __metadata__ is not None:
+                __metadata__.setdefault("params", {})["reasoning_tags"] = False
+
+            payload, headers, new_marker_metadata, api_tool_names = await self._create_payload(
+                body, __metadata__, __user__, __tools__, __event_emitter__, __files__
+            )
+
+            # =========================================================================
+            # PHASE 3: STREAMING STATE INITIALIZATION
+            # =========================================================================
+            api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
+            # Use UserValves API key if available (override header-level key too)
+            if user_api_key and user_api_key.strip():
+                api_key = user_api_key.strip()
+                logger.debug("Using user-provided API key from UserValves")
+            request_timeout = self.valves.REQUEST_TIMEOUT
+            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+            client = AsyncAnthropic(api_key=api_key, default_headers=headers, timeout=request_timeout, **({"base_url": base_url} if base_url else {}))
+            payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
+            include_usage = (
+                __user__["valves"].SHOW_TOKEN_COUNT != "Off"
+                or body.get("stream_options", {}).get("include_usage", False)
+            )
+            total_usage: Optional[dict[str, int]] = None
+            if include_usage:
+                total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "_ctx_input": 0}
+                if self.valves.CACHE_CONTROL != "cache disabled":
+                    total_usage["cache_creation_input_tokens"] = 0
+                    total_usage["cache_read_input_tokens"] = 0
+            # Per-turn capture of Anthropic cache diagnostics (beta cache-diagnosis-2026-04-07).
+            # First entry that has a non-null cache_miss_reason wins for display.
+            cache_diagnostics_records: list[dict[str, Any]] = []
+            cache_diagnostics_chat_id: Optional[str] = (
+                __metadata__.get("chat_id") if __metadata__ else None
+            )
+
+            # Stream configuration from valves
+            token_buffer_size = getattr(self.valves, "TOKEN_BUFFER_SIZE", 1)
+            max_function_calls = self.valves.MAX_TOOL_CALLS
+
+            # Thinking mode state
+            is_model_thinking = False
+            thinking_message = ""
+            thinking_signature = ""  # Accumulates signature_delta events (required for replay)
+            thinking_start_time = None  # Track when thinking started for duration calc
+            thinking_stream_start_idx = -1  # Position in final_message where thinking content starts
+            thinking_last_block = ""  # Tracks current formatted thinking block for content-preserving replace
+
+            # Compaction state
+            compaction_content = ""
+            compaction_last_block = ""  # Tracks current formatted compaction block for content-preserving replace
+
+            # SDK-accumulated message: captured after each stream completes
+            # Replaces manual api_assistant_blocks/thinking_blocks accumulation
+            sdk_final_message = None
+
+            # Tool execution state
+            current_block_type = None  # Track current block type for stop events
+            has_pending_tool_calls = False
+            tools_buffer = ""
+            tool_input_buffer = ""  # Accumulate just the input JSON for live streaming
+            tool_calls = []
+            running_tool_tasks = []  # Wrapped async tasks that yield (tool_call_data, result, error)
+            api_tool_passthrough = False  # Flag for API tool passthrough mode
+            tool_progress_blocks = {}  # Map tool_id → current in-progress block text for replacement
+            # Note: tool_use_blocks and current_tool_caller removed - SDK preserves these in accumulated message
+
+            # Server tool state (web_search, code_execution)
+            active_server_tool_name = None
+            active_server_tool_id = None
+            server_tool_input_buffer = ""  # Accumulate server tool input JSON
+            # Tracks emitted server_tool_use carrier blocks by tool_use_id so
+            # web_search / web_fetch result handlers can update_content_block()
+            # to merge the result display INTO the same collapsible instead of
+            # emitting a second adjacent <details>. Value also stores the
+            # original tool_input so we can rebuild the merged carrier with
+            # both payloads (tool_use + tool_result).
+            server_tool_use_carriers: dict[str, dict] = {}
+            text_editor_file_content = ""  # Accumulate file_text for text_editor
+            text_editor_file_path = ""  # Track file path for text_editor
+            text_editor_command = ""  # Track text_editor command (create/view/edit)
+            bash_execution_command = ""  # Track bash command for code execution
+            code_execution_code = ""  # Track code from programmatic code_execution
+            in_code_execution = False  # Whether we're currently in a code_execution flow
+            code_exec_is_web_filtering = False  # True when code_execution is just dynamic filtering for web tools
+            code_exec_tool_calls_info = []  # Accumulate tool call info for unified display
+            code_exec_stream_start_idx = -1  # Position in final_message where code exec content starts
+            code_exec_last_block = ""  # Tracks current formatted code block for content-preserving replace
+            code_exec_current_code = ""  # Accumulated code for live streaming inside details
+            code_exec_current_lang = "python"  # Language for live streaming
+            code_exec_start_time = 0.0  # time.time() when code execution started
+            last_code_language = (
+                "bash"  # Track language of last code block for output association
+            )
+            last_code_content = ""  # Buffer code content for combining with output
+
+            # Dynamic filtering detection:
+            # If code_execution was NOT explicitly added to tools (no code_execution_20250825 or
+            # code_execution_20260120 in payload), then any code_execution in the stream is from
+            # dynamic filtering auto-injection → suppress UI.
+            # If code_execution WAS explicitly added, code_exec blocks could be real code → show UI.
+            payload_tools = payload.get("tools", [])
+            has_explicit_code_execution = any(
+                t.get("name") == "code_execution" for t in payload_tools
+            )
+            code_exec_has_user_tools = False  # Tracks if user tools were called in current code_exec
+            code_exec_had_web_tools = False  # Tracks if web_search/web_fetch happened inside code_exec
+
+            # Web search citation state
+            current_search_query = ""  # Track the current web search query
+            citation_counter = 0  # Track citation numbers for inline citations
+            pending_citation_markers = []  # Deferred markers (web_search citations arrive before text)
+            citations_list = []  # Store citations for reference list
+
+            # Loop control state
+            conversation_ended = False
+            retry_attempts = 0
+            current_function_calls = 0
+
+            # Response chunk state
+            chunk = ""
+            chunk_count = 0
+
+            await status.waiting()
+
+            # =========================================================================
+            # PHASE 4: MAIN STREAMING LOOP
+            # Continues until conversation ends or max tool calls reached
+            # =========================================================================
+            tool_loop_iteration = 0
+            while (
+                current_function_calls < max_function_calls
+                and not conversation_ended
+                and retry_attempts <= self.valves.MAX_RETRIES
+            ):
+                tool_loop_iteration += 1
+                # Reset per-iteration state
+                stream_output_tokens = 0
+
+                try:
+                    stream_event_counts = {}  # Track event types for diagnostics#
+                    # Apply cache breakpoints right before sending to API
+                    self._apply_cache_control(payload_for_stream, is_tool_loop=(tool_loop_iteration > 1))
+                    # Log message-hash diff vs previous request on same chat_id
+                    # to pinpoint byte-drift that breaks the prompt cache prefix.
+                    _diff_chat_id = __metadata__.get("chat_id") if __metadata__ else None
+                    self._log_message_hash_diff(_diff_chat_id, payload_for_stream)
+                    # Dump the full (stripped) outgoing payload so we can audit
+                    # cache_control placement, tool list, message order and byte
+                    # drift across turns without logging megabytes of base64.
+                    try:
+                        logger.debug(
+                            "[PAYLOAD] iter=%d %s",
+                            tool_loop_iteration,
+                            json.dumps(
+                                self._strip_payload(payload_for_stream),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                        )
+                    except Exception as _pl_err:
+                        logger.debug(f"[PAYLOAD] strip/log failed: {_pl_err}")
+                    async with client.beta.messages.stream(
+                        **payload_for_stream
+                    ) as stream:
+                        async for event in stream:
+                            event_type = getattr(event, "type", None)
+                            stream_event_counts[event_type] = stream_event_counts.get(event_type, 0) + 1
+                            logger.debug(f"Received stream event: {event_type} | counts: {stream_event_counts} | payload: {event}")
+                            if event_type == "message_start":
+                                # Note: Container ID is not in message_start for streaming;
+                                # it arrives in message_delta.
+                                stream_output_tokens = self._handle_message_start_usage(
+                                    event,
+                                    include_usage=include_usage,
+                                    total_usage=total_usage if include_usage else None,
+                                    stream_output_tokens=stream_output_tokens,
+                                )
+                                if getattr(self.valves, "ENABLE_CACHE_DIAGNOSTICS", False):
+                                    msg = getattr(event, "message", None)
+                                    msg_id = getattr(msg, "id", None) if msg else None
+                                    # Capture HTTP request-id from response headers for
+                                    # matching against the Anthropic Console / dashboard.
+                                    http_request_id = None
+                                    try:
+                                        http_request_id = stream.response.headers.get("request-id")
+                                    except Exception:
+                                        pass
+                                    # `diagnostics` is attached to the response Message when
+                                    # the cache-diagnosis beta is active. SDK exposes it as
+                                    # an attribute; fall back to dict-style for resilience.
+                                    diag_obj = getattr(msg, "diagnostics", None) if msg else None
+                                    if diag_obj is None and isinstance(msg, dict):
+                                        diag_obj = msg.get("diagnostics")
+                                    diag_dump = self._dump_sdk_obj(diag_obj) if diag_obj else None
+                                    # Capture per-call usage (input/output/cache tokens).
+                                    usage_obj = getattr(msg, "usage", None) if msg else None
+                                    usage_dump = self._dump_sdk_obj(usage_obj) if usage_obj else None
+                                    if msg_id or diag_dump or http_request_id or usage_dump:
+                                        cache_diagnostics_records.append(
+                                            {"message_id": msg_id, "request_id": http_request_id, "usage": usage_dump, "diagnostics": diag_dump}
+                                        )
+                                        logger.info(
+                                            f"[CACHE-DIAG] chat_id={cache_diagnostics_chat_id} "
+                                            f"message_id={msg_id} request_id={http_request_id} "
+                                            f"usage={usage_dump} diagnostics={diag_dump}"
+                                        )
+
+                            # ---------------------------------------------------------
+                            # EVENT: content_block_start
+                            # Handles start of: text, thinking, tool_use, server_tool_use,
+                            # bash_code_execution_tool_result, text_editor_code_execution_tool_result,
+                            # web_search_tool_result, tool_search_tool_result, context_cleared
+                            # ---------------------------------------------------------
+                            elif event_type == "content_block_start":
+                                content_block = getattr(event, "content_block", None)
+                                content_type = getattr(content_block, "type", None)
+                                current_block_type = content_type
+                                if not content_block:
+                                    continue
+                                await status.response_started_once()
+                                if content_type == "text":
+                                    chunk = handle_text_block_start(content_block, chunk)
+                                elif content_type == "thinking":
+                                    (
+                                        is_model_thinking,
+                                        thinking_start_time,
+                                        thinking_message,
+                                        thinking_signature,
+                                        thinking_stream_start_idx,
+                                    ) = handle_thinking_block_start(final_message)
+                                elif content_type == "redacted_thinking":
+                                    is_model_thinking = handle_redacted_thinking_block_start()
+                                elif content_type == "tool_use":
+                                    (
+                                        tool_name,
+                                        tool_id_at_start,
+                                        tools_buffer,
+                                        tool_input_buffer,
+                                        code_exec_is_web_filtering,
+                                        code_exec_has_user_tools,
+                                    ) = await handle_tool_use_block_start(
+                                        content_block,
+                                        in_code_execution=in_code_execution,
+                                        code_exec_is_web_filtering=code_exec_is_web_filtering,
+                                        code_exec_has_user_tools=code_exec_has_user_tools,
+                                        tool_progress_blocks=tool_progress_blocks,
+                                        final_text=final_text,
+                                        final_message=final_message,
+                                        append_block_to_text=self._append_block_to_text,
+                                        format_tool_result_block=self._format_tool_result_block,
+                                        emit_replace=emit_message_replace,
+                                    )
+                                elif content_type == "server_tool_use":
+                                    server_tool_start = await handle_server_tool_use_block_start(
+                                        content_block,
+                                        in_code_execution=in_code_execution,
+                                        code_exec_is_web_filtering=code_exec_is_web_filtering,
+                                        code_exec_has_user_tools=code_exec_has_user_tools,
+                                        code_exec_had_web_tools=code_exec_had_web_tools,
+                                        code_exec_tool_calls_info=code_exec_tool_calls_info,
+                                        code_exec_current_code=code_exec_current_code,
+                                        code_exec_current_lang=code_exec_current_lang,
+                                        code_exec_start_time=code_exec_start_time,
+                                        code_exec_last_block=code_exec_last_block,
+                                        final_message=final_message,
+                                        format_code_execution_block=self._format_code_execution_block,
+                                        update_content_block=update_content_block,
+                                        emit_status=status.activity,
+                                    )
+                                    active_server_tool_name = server_tool_start["active_server_tool_name"]
+                                    active_server_tool_id = server_tool_start["active_server_tool_id"]
+                                    server_tool_input_buffer = server_tool_start["server_tool_input_buffer"]
+                                    in_code_execution = server_tool_start["in_code_execution"]
+                                    code_exec_is_web_filtering = server_tool_start["code_exec_is_web_filtering"]
+                                    code_exec_has_user_tools = server_tool_start["code_exec_has_user_tools"]
+                                    code_exec_had_web_tools = server_tool_start["code_exec_had_web_tools"]
+                                    code_exec_tool_calls_info = server_tool_start["code_exec_tool_calls_info"]
+                                    if server_tool_start["code_exec_stream_start_idx"] is not None:
+                                        code_exec_stream_start_idx = server_tool_start["code_exec_stream_start_idx"]
+                                    code_exec_current_code = server_tool_start["code_exec_current_code"]
+                                    code_exec_current_lang = server_tool_start["code_exec_current_lang"]
+                                    if server_tool_start["code_exec_start_time"] is not None:
+                                        code_exec_start_time = server_tool_start["code_exec_start_time"]
+                                    code_exec_last_block = server_tool_start["code_exec_last_block"]
+                                elif content_type in (
+                                    "bash_code_execution_tool_result",
+                                    "text_editor_code_execution_tool_result",
+                                    "code_execution_tool_result",
+                                ):
+                                    code_result = await handle_code_execution_result_block_start(
+                                        content_type,
+                                        content_block,
+                                        pipe=self,
+                                        emit_delta=emit_message_delta,
+                                        update_content_block=update_content_block,
+                                        api_key=api_key,
+                                        user_id=__user__.get("id", "unknown"),
+                                        code_exec_is_web_filtering=code_exec_is_web_filtering,
+                                        code_exec_had_web_tools=code_exec_had_web_tools,
+                                        code_exec_tool_calls_info=code_exec_tool_calls_info,
+                                        code_exec_current_code=code_exec_current_code,
+                                        code_exec_start_time=code_exec_start_time,
+                                        code_exec_last_block=code_exec_last_block,
+                                        last_code_content=last_code_content,
+                                        last_code_language=last_code_language,
+                                        in_code_execution=in_code_execution,
+                                        code_exec_has_user_tools=code_exec_has_user_tools,
+                                        code_exec_stream_start_idx=code_exec_stream_start_idx,
+                                    )
+                                    last_code_content = code_result.get("last_code_content", last_code_content)
+                                    last_code_language = code_result.get("last_code_language", last_code_language)
+                                    code_exec_last_block = code_result.get("code_exec_last_block", code_exec_last_block)
+                                    in_code_execution = code_result.get("in_code_execution", in_code_execution)
+                                    code_exec_is_web_filtering = code_result.get("code_exec_is_web_filtering", code_exec_is_web_filtering)
+                                    code_exec_has_user_tools = code_result.get("code_exec_has_user_tools", code_exec_has_user_tools)
+                                    code_exec_had_web_tools = code_result.get("code_exec_had_web_tools", code_exec_had_web_tools)
+                                    code_exec_tool_calls_info = code_result.get("code_exec_tool_calls_info", code_exec_tool_calls_info)
+                                    code_exec_stream_start_idx = code_result.get("code_exec_stream_start_idx", code_exec_stream_start_idx)
+                                elif content_type in ("web_search_tool_result", "web_fetch_tool_result"):
+                                    await handle_web_tool_result_block_start(
+                                        content_type,
+                                        content_block,
+                                        pipe=self,
+                                        server_tool_use_carriers=server_tool_use_carriers,
+                                        update_content_block=update_content_block,
+                                    )
+                                elif content_type == "advisor_tool_result":
+                                    await handle_advisor_result_block_start(
+                                        content_block,
+                                        pipe=self,
+                                        server_tool_use_carriers=server_tool_use_carriers,
+                                        update_content_block=update_content_block,
+                                        emit_delta=emit_message_delta,
+                                    )
+                                elif content_type == "tool_search_tool_result":
+                                    await handle_tool_search_result_block_start(
+                                        content_block,
+                                        pipe=self,
+                                        server_tool_use_carriers=server_tool_use_carriers,
+                                        update_content_block=update_content_block,
+                                        emit_delta=emit_message_delta,
+                                    )
+                                elif content_type == "context_cleared":
+                                    await handle_context_cleared_block_start(
+                                        content_block,
+                                        emit_status=status.complete,
+                                    )
+                                elif content_type == "compaction":
+                                    compaction_content, compaction_last_block = await handle_compaction_block_start(
+                                        status.activity
+                                    )
+
+                            # ---------------------------------------------------------
+                            # EVENT: content_block_delta
+                            # Handles streaming deltas for: thinking, text, tool_use input,
+                            # server tool input, citations
+                            # ---------------------------------------------------------
+                            elif event_type == "content_block_delta":
+                                delta = getattr(event, "delta", None)
+                                delta_type = getattr(delta, "type", None)
+                                if delta_type == "thinking_delta":
+                                    thinking_message, thinking_last_block = await handle_thinking_delta(
+                                        delta,
+                                        thinking_message=thinking_message,
+                                        thinking_last_block=thinking_last_block,
+                                        format_thinking_block=self._format_thinking_block,
+                                        update_content_block=update_content_block,
+                                    )
+                                elif delta_type == "signature_delta":
+                                    thinking_signature = handle_signature_delta(delta, thinking_signature)
+                                elif delta_type == "compaction_delta":
+                                    compaction_content, compaction_last_block = await handle_compaction_delta(
+                                        delta,
+                                        compaction_content=compaction_content,
+                                        compaction_last_block=compaction_last_block,
+                                        format_compaction_block=self._format_compaction_block,
+                                        update_content_block=update_content_block,
+                                    )
+                                elif delta_type == "text_delta":
+                                    chunk, chunk_count = await handle_text_delta(
+                                        delta,
+                                        chunk=chunk,
+                                        chunk_count=chunk_count,
+                                    )
+                                elif delta_type == "input_json_delta":
+                                    partial = getattr(delta, "partial_json", "")
+
+                                    # Handle server tool input separately from client tools
+                                    if active_server_tool_name:
+                                        server_tool_delta = await handle_server_tool_input_delta(
+                                            partial,
+                                            active_server_tool_name=active_server_tool_name,
+                                            server_tool_input_buffer=server_tool_input_buffer,
+                                            current_search_query=current_search_query,
+                                            code_execution_code=code_execution_code,
+                                            bash_execution_command=bash_execution_command,
+                                            text_editor_command=text_editor_command,
+                                            text_editor_file_path=text_editor_file_path,
+                                            text_editor_file_content=text_editor_file_content,
+                                            code_exec_is_web_filtering=code_exec_is_web_filtering,
+                                            code_exec_had_web_tools=code_exec_had_web_tools,
+                                            code_exec_current_code=code_exec_current_code,
+                                            code_exec_current_lang=code_exec_current_lang,
+                                            code_exec_last_block=code_exec_last_block,
+                                            format_code_execution_block=self._format_code_execution_block,
+                                            update_content_block=update_content_block,
+                                            emit_status=status.activity,
+                                        )
+                                        server_tool_input_buffer = server_tool_delta["server_tool_input_buffer"]
+                                        current_search_query = server_tool_delta["current_search_query"]
+                                        code_execution_code = server_tool_delta["code_execution_code"]
+                                        bash_execution_command = server_tool_delta["bash_execution_command"]
+                                        text_editor_command = server_tool_delta["text_editor_command"]
+                                        text_editor_file_path = server_tool_delta["text_editor_file_path"]
+                                        text_editor_file_content = server_tool_delta["text_editor_file_content"]
+                                        code_exec_current_code = server_tool_delta["code_exec_current_code"]
+                                        code_exec_current_lang = server_tool_delta["code_exec_current_lang"]
+                                        code_exec_last_block = server_tool_delta["code_exec_last_block"]
+                                    else:
+                                        tools_buffer, tool_input_buffer = await handle_client_tool_input_delta(
+                                            partial,
+                                            tools_buffer=tools_buffer,
+                                            tool_input_buffer=tool_input_buffer,
+                                            in_code_execution=in_code_execution,
+                                            tool_id_at_start=tool_id_at_start,
+                                            tool_name=tool_name,
+                                            tool_progress_blocks=tool_progress_blocks,
+                                            try_parse_partial_json=self._try_parse_partial_json,
+                                            format_tool_result_block=self._format_tool_result_block,
+                                            final_text=final_text,
+                                            final_message=final_message,
+                                            emit_event=request_ctx.emit_event,
+                                        )
+                                elif delta_type == "citations_delta":
+                                        # Web search citations arrive BEFORE the text they cite.
+                                        # Emit marker for PREVIOUS citation when a new one arrives
+                                        # (so marker appears AFTER the cited text, not before it).
+                                        if pending_citation_markers:
+                                            citation_str = "".join(f"[{n}]" for n in pending_citation_markers)
+                                            chunk += citation_str
+                                            pending_citation_markers = []
+                                        citation_counter += 1
+                                        pending_citation_markers.append(citation_counter)
+
+                                        # Process and store citation
+                                        await self.handle_citation(
+                                            event, __event_emitter__, citation_counter
+                                        )
+
+                            # ---------------------------------------------------------
+                            # EVENT: content_block_stop
+                            # Finalizes: thinking blocks, tool_use blocks, server tools
+                            # Triggers async tool execution for client-side tools
+                            # ---------------------------------------------------------
+                            elif event_type == "content_block_stop":
+                                content_block = getattr(event, "content_block", None)
+                                content_type = (
+                                    getattr(content_block, "type", None)
+                                    if content_block
+                                    else current_block_type  # Fallback: raw SDK stop events lack content_block
+                                )
+                                event_name = getattr(event, "name", "")
+
+                                if content_type == "text":
+                                    chunk, chunk_count, pending_citation_markers = await handle_text_block_stop(
+                                        chunk=chunk,
+                                        chunk_count=chunk_count,
+                                        pending_citation_markers=pending_citation_markers,
+                                        final_message=final_message,
+                                        final_text=final_text,
+                                        emit_delta=emit_message_delta,
+                                    )
+                                elif content_type == "compaction":
+                                    await handle_compaction_block_stop(
+                                        compaction_content=compaction_content,
+                                        emit_status_done=status.complete,
+                                    )
+                                elif content_type == "server_tool_use":
+                                    server_tool_stop = await handle_server_tool_use_block_stop(
+                                        active_server_tool_name=active_server_tool_name,
+                                        active_server_tool_id=active_server_tool_id,
+                                        server_tool_input_buffer=server_tool_input_buffer,
+                                        server_tool_use_carriers=server_tool_use_carriers,
+                                        bash_execution_command=bash_execution_command,
+                                        text_editor_command=text_editor_command,
+                                        text_editor_file_path=text_editor_file_path,
+                                        text_editor_file_content=text_editor_file_content,
+                                        code_execution_code=code_execution_code,
+                                        format_server_tool_use_block=self._format_server_tool_use_block,
+                                        emit_delta=emit_message_delta,
+                                    )
+                                    if server_tool_stop["last_code_content"]:
+                                        last_code_language = server_tool_stop["last_code_language"]
+                                        last_code_content = server_tool_stop["last_code_content"]
+                                    active_server_tool_name = server_tool_stop["active_server_tool_name"]
+                                    active_server_tool_id = server_tool_stop["active_server_tool_id"]
+                                    server_tool_input_buffer = server_tool_stop["server_tool_input_buffer"]
+                                    text_editor_file_content = server_tool_stop["text_editor_file_content"]
+                                    text_editor_file_path = server_tool_stop["text_editor_file_path"]
+                                    text_editor_command = server_tool_stop["text_editor_command"]
+                                    bash_execution_command = server_tool_stop["bash_execution_command"]
+                                    code_execution_code = server_tool_stop["code_execution_code"]
+                                elif content_type == "tool_use" and tools_buffer:
+                                    tools_buffer, started_api_tool_passthrough = await handle_tool_use_block_stop(
+                                        pipe=self,
+                                        tools_buffer=tools_buffer,
+                                        tools=__tools__,
+                                        builtin_tools=builtin_tools,
+                                        api_tool_names=api_tool_names,
+                                        running_tool_tasks=running_tool_tasks,
+                                        emit_delta=emit_message_delta,
+                                    )
+                                    api_tool_passthrough = api_tool_passthrough or started_api_tool_passthrough
+                                elif is_model_thinking and content_type in ("thinking", "redacted_thinking"):
+                                    (
+                                        is_model_thinking,
+                                        thinking_message,
+                                        thinking_signature,
+                                        thinking_stream_start_idx,
+                                        thinking_last_block,
+                                    ) = await handle_thinking_block_stop(
+                                        content_type=content_type,
+                                        is_model_thinking=is_model_thinking,
+                                        thinking_message=thinking_message,
+                                        thinking_signature=thinking_signature,
+                                        thinking_start_time=thinking_start_time,
+                                        thinking_stream_start_idx=thinking_stream_start_idx,
+                                        thinking_last_block=thinking_last_block,
+                                        format_thinking_block=self._format_thinking_block,
+                                        update_content_block=update_content_block,
+                                    )
+                                # Reset tracked type
+                                current_block_type = None
+
+                            # ---------------------------------------------------------
+                            # EVENT: message_delta
+                            # Updates output token counts, handles stop_reason
+                            # Flushes buffered chunks
+                            # ---------------------------------------------------------
+                            elif event_type == "message_delta":
+                                if include_usage:
+                                    usage = getattr(event, "usage", None)
+                                    if usage:
+                                        current_output_tokens = getattr(
+                                            usage, "output_tokens", 0
+                                        )
+                                        diff = (
+                                            current_output_tokens - stream_output_tokens
+                                        )
+                                        total_usage["output_tokens"] += diff
+                                        stream_output_tokens = current_output_tokens
+                                        # Claude-Code-style total — see _handle_message_start_usage for rationale.
+                                        total_usage["total_tokens"] = (
+                                            total_usage.get("_ctx_input", 0)
+                                            + total_usage.get("output_tokens", 0)
+                                        )
+                                delta = getattr(event, "delta", None)
+                                code_execution_container_id = getattr(delta, "container", None)
+                                if code_execution_container_id:
+                                    delta_container_id = getattr(code_execution_container_id, "id", None) if hasattr(code_execution_container_id, "id") else (code_execution_container_id.get("id") if isinstance(code_execution_container_id, dict) else str(code_execution_container_id))
+                                    if delta_container_id:
+                                        current_container_id = payload_for_stream.get("container")
+                                        if current_container_id != delta_container_id:
+                                            chunk += self._create_metadata_marker(
+                                                "container_id",
+                                                delta_container_id,
+                                                messagenum=len(
+                                                    payload_for_stream.get("messages", [])
+                                                ),
+                                            )
+                                            logger.debug(
+                                                f"📦 Container ID from message_delta: {delta_container_id}"
+                                            )
+                                        payload_for_stream["container"] = delta_container_id
+
+                                stop_reason = getattr(delta, "stop_reason", None)
+                                if stop_reason:
+                                    logger.debug(f"📍 stop_reason received: {stop_reason}")
+                                if stop_reason == "tool_use":
+                                    # Emit any remaining text chunk before tool results
+                                    if chunk:
+                                        if not chunk.endswith("\n"):
+                                            chunk += "\n"
+                                        await emit_message_delta(chunk)
+                                        chunk = ""
+                                        chunk_count = 0
+
+                                    # API tool passthrough — skip tool loop, return directly
+                                    if api_tool_passthrough and not running_tool_tasks:
+                                        logger.info(
+                                            "🔄 API tool passthrough complete — skipping tool loop"
+                                        )
+                                        conversation_ended = True
+                                        break
+
+                                    # Wait for all running tool tasks to complete
+                                    if running_tool_tasks:
+                                        logger.debug(
+                                            f"⏳ Waiting for %d tool tasks to complete...",
+                                            len(running_tool_tasks),
+                                        )
+
+                                        try:
+                                            completed_results = 0
+
+                                            # Build tool_result messages and emit to UI as each task completes.
+                                            for completed_task in asyncio.as_completed(
+                                                running_tool_tasks
+                                            ):
+                                                (
+                                                    tool_call_data,
+                                                    tool_result,
+                                                    task_error,
+                                                ) = await completed_task
+                                                completed_results += 1
+                                                tool_use_id = tool_call_data.get(
+                                                    "id", ""
+                                                )
+                                                tool_name = tool_call_data.get(
+                                                    "name", ""
+                                                )
+                                                tool_input = tool_call_data.get(
+                                                    "input", {}
+                                                )
+
+                                                if task_error is not None:
+                                                    tool_result = f"Error executing tool '{tool_name}': {task_error}"
+
+                                                # Process tool result through OpenWebUI's handler
+                                                # for Rich UI (HTMLResponse, embeds, files)
+                                                tool_result_embeds = []
+                                                tool_result_files = []
+                                                if PROCESS_TOOL_RESULT_AVAILABLE and __request__:
+                                                    try:
+                                                        tool_result, tool_result_files, tool_result_embeds = (
+                                                            await process_tool_result(
+                                                                __request__,
+                                                                tool_name,
+                                                                tool_result,
+                                                                "pipe",
+                                                                metadata=__metadata__,
+                                                                user=__user__,
+                                                            )
+                                                        )
+                                                    except Exception as e:
+                                                        logger.warning(f"process_tool_result failed for '{tool_name}': {e}")
+
+                                                # Emit files event if tool produced files
+                                                if tool_result_files and __event_emitter__:
+                                                    await __event_emitter__(
+                                                        {
+                                                            "type": "files",
+                                                            "data": {"files": tool_result_files},
+                                                        }
+                                                    )
+
+                                                # OpenWebUI renders Tool Rich UI inline only when
+                                                # embeds are attached to the matching tool_calls
+                                                # details block. Message-level `embeds` events render
+                                                # above the response text, so we deliberately avoid
+                                                # emitting them here and persist the embed with the
+                                                # completed tool block below.
+
+                                                # Determine if error
+                                                is_error = isinstance(
+                                                    tool_result, str
+                                                ) and (
+                                                    tool_result.startswith("Error:")
+                                                    or tool_result.startswith("Error executing tool")
+                                                )
+
+                                                # Build result block for API
+                                                # Ensure result is valid JSON string (not Python repr with single quotes)
+                                                if isinstance(tool_result, str):
+                                                    result_str = tool_result
+                                                else:
+                                                    try:
+                                                        result_str = json.dumps(tool_result, ensure_ascii=False)
+                                                    except (TypeError, ValueError):
+                                                        result_str = str(tool_result)
+                                                result_block = {
+                                                    "type": "tool_result",
+                                                    "tool_use_id": tool_use_id,
+                                                    "content": result_str,
+                                                }
+                                                if is_error:
+                                                    result_block["is_error"] = True
+                                                tool_calls.append(result_block)
+
+                                                if in_code_execution:
+                                                    # Accumulate for unified code execution display
+                                                    code_exec_tool_calls_info.append({
+                                                        "name": tool_name,
+                                                        "input": tool_input,
+                                                        "result": result_str,
+                                                        "is_error": is_error,
+                                                    })
+                                                else:
+                                                    # Replace the in-progress block with completed version.
+                                                    # Tool Rich UI HTML belongs to the tool_calls block:
+                                                    # OpenWebUI renders message.embeds above the text, but
+                                                    # tool-call embeds inline at the tool call indicator.
+                                                    completed = self._format_tool_result_block(
+                                                        tool_use_id, tool_name, tool_input,
+                                                        str(tool_result), is_error=is_error, done=True,
+                                                        files=tool_result_files,
+                                                        embeds=tool_result_embeds,
+                                                    )
+                                                    old_block = tool_progress_blocks.pop(tool_use_id, None)
+                                                    if old_block:
+                                                        text = final_text()
+                                                        text = text.replace(old_block, completed, 1)
+                                                        final_message.clear()
+                                                        final_message.append(text)
+                                                        await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
+                                                    else:
+                                                        # Fallback: append if placeholder not found
+                                                        text = self._append_block_to_text(final_text(), completed)
+                                                        final_message.clear()
+                                                        final_message.append(text)
+                                                        await emit_message_replace(text)
+
+                                            logger.debug(
+                                                f"✅ All %d tool tasks completed",
+                                                completed_results,
+                                            )
+                                        except Exception as ex:
+                                            logger.error(
+                                                f"❌ Tool execution failed: %s", ex
+                                            )
+                                            for task in running_tool_tasks:
+                                                if not task.done():
+                                                    task.cancel()
+
+                                            # Create error results and update in-progress blocks
+                                            for tool_use_id, old_block in list(tool_progress_blocks.items()):
+                                                error_result = f"Error executing tool: {str(ex)}"
+                                                tool_calls.append(
+                                                    {
+                                                        "type": "tool_result",
+                                                        "tool_use_id": tool_use_id,
+                                                        "content": error_result,
+                                                        "is_error": True,
+                                                    }
+                                                )
+                                                completed = self._format_tool_result_block(
+                                                    tool_use_id,
+                                                    "unknown",
+                                                    {},
+                                                    error_result,
+                                                    is_error=True,
+                                                    done=True,
+                                                )
+                                                if old_block:
+                                                    text = final_text()
+                                                    text = text.replace(old_block, completed, 1)
+                                                    final_message.clear()
+                                                    final_message.append(text)
+                                                    await request_ctx.emit_event({"type": "replace", "data": {"content": text}})
+
+                                            tool_progress_blocks = {}
+
+                                    logger.debug(
+                                        f" Tool use detected, collected {len(tool_calls)} tool results:\nTool_Call JSON: {tool_calls}"
+                                    )
+
+                                    # Reset for next iteration
+                                    running_tool_tasks = []
+                                    tool_progress_blocks = {}
+                                    api_tool_passthrough = False
+                                    has_pending_tool_calls = True
+                                elif stop_reason == "max_tokens":
+                                    chunk += "Claude has Reached the maximum token limit!"
+                                elif stop_reason == "end_turn":
+                                    conversation_ended = True
+                                elif stop_reason == "pause_turn":
+                                    # API paused a long-running turn — auto-continue
+                                    has_pending_tool_calls = True  # reuses tool loop mechanism
+                                    # tool_calls stays empty → PHASE 5 detects pause_turn
+                                    await status.activity("⏳ Long-running turn paused, continuing...")
+                                elif stop_reason == "refusal":
+                                    chunk += "Claude has refused to answer based on its content policies."
+                                    conversation_ended = True
+                                elif stop_reason == "stop_sequence":
+                                    chunk += "Claude stopped generating based on stop sequence."
+                                    conversation_ended = True
+                                elif stop_reason == "model_context_window_exceeded":
+                                    chunk += "Claude has reached the maximum context window for this model."
+                                    conversation_ended = True
+                                elif stop_reason == "compaction":
+                                    # Compaction triggered — response contains only the compaction block.
+                                    # We need to continue the conversation with the compacted context.
+                                    # Reuse tool loop mechanism to auto-continue.
+                                    has_pending_tool_calls = True
+                                    logger.info("Compaction stop_reason — will auto-continue")
+
+                            # ---------------------------------------------------------
+                            # EVENT: message_stop
+                            # Stream complete for this turn
+                            # ---------------------------------------------------------
+                            elif event_type == "message_stop":
+                                pass  # No deferred blocks to flush
+
+                            # ---------------------------------------------------------
+                            # EVENT: message_error
+                            # Handle stream-level errors
+                            # ---------------------------------------------------------
+                            elif event_type == "message_error":
+                                error = getattr(event, "error", None)
+                                if error:
+                                    # Handle stream errors through handle_errors method
+                                    error_details = f"Stream Error: {getattr(error, 'message', str(error))}"
+                                    if hasattr(error, "type"):
+                                        error_details = f"Stream Error ({error.type}): {getattr(error, 'message', str(error))}"
+
+                                    # Create a mock exception for consistent error handling
+                                    stream_error = Exception(error_details)
+                                    await self.handle_errors(
+                                        stream_error, __event_emitter__
+                                    )
+                                    return (
+                                        final_text()
+                                        + f"\n\nAn error occurred: {error_details}"
+                                    )
+
+                            if chunk_count > token_buffer_size:
+                                if chunk:
+                                    await emit_message_delta(chunk)
+                                    chunk = ""
+                                    chunk_count = 0
+
+                        # Capture SDK accumulated message after stream is fully consumed
+                        # This replaces manual api_assistant_blocks/thinking_blocks accumulation
+                        sdk_final_message = stream.current_message_snapshot
+                    # Log stream event diagnostics
+                    logger.debug(f"📊 Stream events: {stream_event_counts}")
+
+                    # Cache diagnostics: the `cache_miss_reason` inside `diagnostics`
+                    # is pending/null on the `message_start` event during streaming and
+                    # is only fully populated on the final accumulated message. Refresh
+                    # the record captured at message_start so the rendered details block
+                    # and logs show the authoritative miss reason and final usage.
+                    if (
+                        getattr(self.valves, "ENABLE_CACHE_DIAGNOSTICS", False)
+                        and cache_diagnostics_records
+                    ):
+                        try:
+                            _fmsg = sdk_final_message
+                            _final_diag = getattr(_fmsg, "diagnostics", None) if _fmsg else None
+                            if _final_diag is None and isinstance(_fmsg, dict):
+                                _final_diag = _fmsg.get("diagnostics")
+                            _final_diag_dump = self._dump_sdk_obj(_final_diag) if _final_diag else None
+                            _final_usage = getattr(_fmsg, "usage", None) if _fmsg else None
+                            _final_usage_dump = self._dump_sdk_obj(_final_usage) if _final_usage else None
+                            _rec = cache_diagnostics_records[-1]
+                            if _final_diag_dump:
+                                _rec["diagnostics"] = _final_diag_dump
+                            if _final_usage_dump:
+                                _rec["usage"] = _final_usage_dump
+                            logger.info(
+                                f"[CACHE-DIAG] final-message refresh "
+                                f"chat_id={cache_diagnostics_chat_id} "
+                                f"message_id={_rec.get('message_id')} "
+                                f"diagnostics={_final_diag_dump}"
+                            )
+                        except Exception as _e:
+                            logger.debug(f"[CACHE-DIAG] final-message refresh failed: {_e}")
+
+                    conversation_ended, has_pending_tool_calls, tool_calls = await self._apply_sdk_stop_reason_fallback(
+                        sdk_final_message=sdk_final_message,
+                        conversation_ended=conversation_ended,
+                        has_pending_tool_calls=has_pending_tool_calls,
+                        tool_calls=tool_calls,
+                        tool_loop_iteration=tool_loop_iteration,
+                        payload_for_stream=payload_for_stream,
+                        stream_event_counts=stream_event_counts,
+                        request_ctx=request_ctx,
+                    )
+
+                    if chunk:
+                        await emit_message_delta(chunk)
+                        chunk = ""
+                        chunk_count = 0
+
+                    # ---------------------------------------------------------
+                    # PHASE 5: TOOL EXECUTION LOOP
+                    # After stream ends, if tools were called:
+                    # 1. Check max tool call limit
+                    # 2. Build assistant message with thinking + text + tool_use blocks
+                    # 3. Execute tools and collect results
+                    # 4. Add tool_result blocks as user message
+                    # 5. Loop back to API for continuation
+                    # ---------------------------------------------------------
+                    if has_pending_tool_calls and tool_calls:
+                        # Log tool call details
+                        tool_names = [tc.get("name", tc.get("tool_use_id", "?")) for tc in tool_calls]
+                        sdk_block_types = [getattr(b, "type", "?") for b in sdk_final_message.content] if sdk_final_message else []
+                        logger.info(
+                            f"🔧 Tool loop iter {tool_loop_iteration} complete | "
+                            f"{len(tool_calls)} tool results: {tool_names} | "
+                            f"SDK blocks: {sdk_block_types}"
+                        )
+                        # Check if we've reached the max tool call limit
+                        # Count actual tool results (not loop iterations) for accurate tracking
+                        num_tool_results = sum(1 for tc in tool_calls if tc.get("type") == "tool_result")
+                        current_function_calls += num_tool_results
+                        if current_function_calls >= max_function_calls:
+                            await status.complete(
+                                f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Stopping tool execution."
+                            )
+                            await emit_event_local(
+                                {
+                                    "type": "notification",
+                                    "data": {
+                                        "type": "warning",
+                                        "content": f"Tool call limit ({max_function_calls}) reached. Increase MAX_TOOL_CALLS in valves if needed.",
+                                    },
+                                }
+                            )
+                            await emit_message_delta(
+                                f"\n\n⚠️ **Tool call limit reached** ({current_function_calls}/{max_function_calls}). Some tool results may not have been processed. You can increase the limit in the model's valve settings."
+                            )
+                            break
+
+                        # Tools were already executed during stream (in message_delta)
+                        # tool_calls now contains tool_result blocks ready for API
+                        # UI output was already emitted during message_delta
+
+                        # Build assistant message from SDK accumulated message
+                        # SDK correctly handles: signature accumulation, block ordering,
+                        # caller field preservation, input JSON assembly
+                        if sdk_final_message:
+                            assistant_content = self._convert_sdk_message_to_api_blocks(sdk_final_message)
+                            logger.debug(
+                                f"Built assistant_content from SDK message: "
+                                f"{[b.get('type') for b in assistant_content]}"
+                            )
+                        else:
+                            # Fallback: build from final_message text
+                            assistant_content = []
+                            final_message_snapshot = final_text()
+                            if final_message_snapshot.strip():
+                                assistant_content.append({"type": "text", "text": final_message_snapshot})
+                            logger.warning("No SDK message available, using text fallback")
+
+                        if assistant_content:
+                            # Log detailed block analysis for debugging
+                            for i, block in enumerate(assistant_content):
+                                btype = block.get("type", "?")
+                                if btype == "thinking":
+                                    logger.debug(
+                                        f"  assistant_content[{i}]: thinking "
+                                        f"({len(block.get('thinking', ''))}c, "
+                                        f"sig={len(block.get('signature', ''))}c)"
+                                    )
+                                elif btype == "redacted_thinking":
+                                    logger.debug(
+                                        f"  assistant_content[{i}]: redacted_thinking "
+                                        f"(data={len(block.get('data', ''))}c)"
+                                    )
+                                elif btype == "tool_use":
+                                    logger.debug(
+                                        f"  assistant_content[{i}]: tool_use "
+                                        f"name={block.get('name')}, id={block.get('id')}"
+                                    )
+                                elif btype == "text":
+                                    logger.debug(
+                                        f"  assistant_content[{i}]: text ({len(block.get('text', ''))}c)"
+                                    )
+                                else:
+                                    logger.debug(f"  assistant_content[{i}]: {btype}")
+
+                            payload_for_stream["messages"].append(
+                                {"role": "assistant", "content": assistant_content}
+                            )
+
+                        # Safety: ensure every tool_use in assistant has a tool_result
+                        tool_use_ids_in_assistant = {
+                            b.get("id") for b in assistant_content
+                            if b.get("type") == "tool_use"
+                        }
+                        tool_result_ids = {
+                            b.get("tool_use_id") for b in tool_calls
+                            if b.get("type") == "tool_result"
+                        }
+                        missing_ids = tool_use_ids_in_assistant - tool_result_ids
+                        for missing_id in missing_ids:
+                            logger.warning(f"⚠️ Missing tool_result for tool_use {missing_id}, adding error result")
+                            tool_calls.append({
+                                "type": "tool_result",
+                                "tool_use_id": missing_id,
+                                "content": "Error: tool execution failed - no result was produced",
+                                "is_error": True,
+                            })
+
+                        # Add user message with tool results (tool_calls already contains tool_result blocks)
+                        user_content = tool_calls.copy()
+                        if user_content:
+                            # Optimization: Move cache_control to the end for multi-step tool loops
+                            # This ensures we cache the tool results for the next iteration
+                            # IMPORTANT: Skip when programmatic tool calling is active - Anthropic rejects
+                            payload_for_stream["messages"].append(
+                                {"role": "user", "content": user_content}
+                            )
+                            # Debug log tool results with content sizes
+                            if logger.isEnabledFor(logging.DEBUG):
+                                for b in user_content:
+                                    if b.get("type") == "tool_result":
+                                        _content = b.get("content", "")
+                                        _clen = len(_content) if isinstance(_content, str) else len(json.dumps(_content, default=str))
+                                        logger.debug(
+                                            f"📤 tool_result: id={b.get('tool_use_id', '?')[:25]} | "
+                                            f"is_error={b.get('is_error', False)} | "
+                                            f"content_size={_clen}c"
+                                        )
+
+                        # Ensure we added at least one message, otherwise break the loop
+                        if not assistant_content and not user_content:
+                            logger.debug(
+                                f"🔧 No valid content to add, ending conversation"
+                            )
+                            break
+
+                        # Check if we're approaching the limit BEFORE next iteration
+                        # (current_function_calls already updated above with actual tool result count)
+                        remaining = max_function_calls - current_function_calls
+                        if remaining <= 0:
+                            # Hard limit reached - this shouldn't happen as we check above, but safety first
+                            break
+                        elif remaining == 1:
+                            # Only 1 call left - warn Claude this is the final chance
+                            await status.activity(
+                                f"⚠️ Final tool call available ({current_function_calls}/{max_function_calls} used)"
+                            )
+                            await asyncio.sleep(0.05)
+
+                            # Add system message to warn Claude
+                            # Skip when programmatic tool calling is active - only tool_result blocks allowed
+                            if not self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+                                payload_for_stream["messages"].append(
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": f"⚠️ SYSTEM WARNING: Tool call limit nearly reached ({current_function_calls}/{max_function_calls} used). You have 1 tool call remaining. After the next tool use, the conversation will be automatically terminated. Please provide a comprehensive text response instead of calling more tools, and suggest the user continue manually if needed.",
+                                            }
+                                        ],
+                                    }
+                                )
+                        elif remaining <= 5:
+                            # Approaching limit - inform both user and Claude
+                            await status.activity(
+                                f"⚠️ {remaining} tool call(s) remaining ({current_function_calls}/{max_function_calls} used)"
+                            )
+                            await asyncio.sleep(0.05)
+
+                            # Notify Claude about remaining calls so it can plan accordingly
+                            if not self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
+                                payload_for_stream["messages"].append(
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": f"[SYSTEM: {remaining} tool call(s) remaining out of {max_function_calls}. Plan your remaining tool calls carefully.]",
+                                            }
+                                        ],
+                                    }
+                                )
+
+                        has_pending_tool_calls = False
+                        tool_calls = []
+                        sdk_final_message = None  # Reset for next iteration
+                        current_tool_choice = payload_for_stream.get("tool_choice")
+                        if (
+                            isinstance(current_tool_choice, dict)
+                            and current_tool_choice.get("type") in {"tool", "any"}
+                        ):
+                            payload_for_stream.pop("tool_choice", None)
+                            logger.debug("Cleared forced tool_choice after tool loop iteration")
+                        chunk = ""
+                        chunk_count = 0
+                        current_search_query = (
+                            ""  # Reset search query for next iteration
+                        )
+                        citation_counter = (
+                            0  # Reset citation counter for next iteration
+                        )
+                        pending_citation_markers = []  # Reset pending citations
+                        continue
+
+                    # pause_turn continuation: API paused a long-running turn,
+                    # send the response back as-is to let Claude continue
+                    elif has_pending_tool_calls and not tool_calls:
+                        logger.info(
+                            f"⏸️ pause_turn continuation (iter {tool_loop_iteration})"
+                        )
+                        if sdk_final_message:
+                            assistant_content = self._convert_sdk_message_to_api_blocks(sdk_final_message)
+                            if assistant_content:
+                                payload_for_stream["messages"].append(
+                                    {"role": "assistant", "content": assistant_content}
+                                )
+                        has_pending_tool_calls = False
+                        sdk_final_message = None
+                        chunk = ""
+                        chunk_count = 0
+                        current_search_query = ""
+                        citation_counter = 0
+                        pending_citation_markers = []
+                        continue
+
+                    # SAFETY / TRUNCATED STREAM RETRY:
+                    # If we reach here, the stream completed but no tool loop
+                    # continuation was triggered and conversation_ended is False.
+                    # This typically means a truncated stream (200 OK but no stop_reason).
+                    # Auto-retry with the same payload instead of silently breaking.
+                    if not conversation_ended:
+                        retry_attempts += 1
+                        if retry_attempts <= self.valves.MAX_RETRIES:
+                            # Determine what happened for logging
+                            sdk_block_types = (
+                                [getattr(b, "type", "?") for b in getattr(sdk_final_message, "content", [])]
+                                if sdk_final_message else []
+                            )
+                            logger.warning(
+                                f"⚠️ Truncated stream (no stop_reason, no tool handling). "
+                                f"SDK blocks: {sdk_block_types}. "
+                                f"Auto-retrying ({retry_attempts}/{self.valves.MAX_RETRIES})..."
+                            )
+                            await status.activity(
+                                f"⚠️ Stream abgebrochen, Retry ({retry_attempts}/{self.valves.MAX_RETRIES})..."
+                            )
+                            # Reset streaming state for retry — clear any partial content
+                            # from this truncated iteration so we get a clean response
+                            final_message.clear()
+                            sdk_final_message = None
+                            chunk = ""
+                            chunk_count = 0
+                            current_search_query = ""
+                            citation_counter = 0
+                            pending_citation_markers = []
+                            citations_list = []
+                            # Reset thinking state
+                            thinking_message = ""
+                            thinking_signature = ""
+                            thinking_start_time = None
+                            thinking_stream_start_idx = -1
+                            thinking_last_block = ""
+                            # Reset server tool state
+                            active_server_tool_name = None
+                            active_server_tool_id = None
+                            server_tool_input_buffer = ""
+                            in_code_execution = False
+                            code_exec_current_code = ""
+                            code_exec_last_block = ""
+                            current_block_type = None
+                            # payload_for_stream stays unchanged → same messages, same tools
+                            # Cache from previous messages is preserved server-side
+                            continue
+                        else:
+                            logger.error(
+                                f"❌ Truncated stream: max retries ({self.valves.MAX_RETRIES}) exhausted. "
+                                f"Returning error to user."
+                            )
+                            await request_ctx.emit_delta(
+                                "\n\n⚠️ Die Anthropic API hat den Stream mehrfach abgebrochen "
+                                f"({self.valves.MAX_RETRIES} Versuche). Bitte versuche es erneut."
+                            )
+                    break
+
+                # ---------------------------------------------------------
+                # PHASE 6: ERROR HANDLING
+                # Catches and handles Anthropic API errors with retry logic:
+                # - RateLimitError (429): Retryable, backoff
+                # - AuthenticationError (401): API key issues
+                # - InternalServerError (500, 529): Retryable
+                # - APIConnectionError: Network issues, retryable
+                # ---------------------------------------------------------
+                except Exception as e:
+                    # Finalize any open live code_exec block before handling error
+                    if code_exec_current_code:
+                        duration = time.time() - code_exec_start_time if code_exec_start_time else None
+                        block = self._format_code_execution_block(
+                            code_exec_current_code, code_exec_current_lang,
+                            done=True, duration=duration,
+                        )
+                        await update_content_block(code_exec_last_block, block)
+                        code_exec_last_block = ""
+                        code_exec_current_code = ""
+                    should_retry, retry_attempts, response_suffix = await self._handle_stream_exception(
+                        e,
+                        retry_attempts=retry_attempts,
+                        request_ctx=request_ctx,
+                    )
+                    if should_retry:
+                        continue
+                    if response_suffix:
+                        return final_text() + response_suffix
+                    return final_text()
+        except Exception as e:
+            await self.handle_errors(e, __event_emitter__)
+            return final_text()
+
+        # ---------------------------------------------------------
+        # PHASE 7: FINALIZATION
+        # After successful completion:
+        # - Build final status with token count display
+        # - Emit completion status event
+        # - Emit chat:completion event with usage stats
+        # - Return final message text
+        # ---------------------------------------------------------
+
+        final_status = "✅ Response Complete"
+        # ============ Token Count Display ============
+        show_token_setting = __user__["valves"].SHOW_TOKEN_COUNT
+        if include_usage and show_token_setting != "Off" and total_usage:
+            def format_num(n: int) -> str:
+                if n >= 1_000_000:
+                    return f"{n/1_000_000:.1f}M"
+                if n >= 1_000:
+                    return f"{n/1_000:.1f}K"
+                return str(n)
+
+            # Context window progress bar
+            total_tokens = total_usage.get("total_tokens", 0)
+            model_info = self.get_model_info(body["model"].split("/")[-1])
+            context_window = model_info.get("context_length", 200_000)
+            context_label = f"{context_window // 1000}k" if context_window < 1_000_000 else f"{context_window / 1_000_000:.0f}M"
+            percentage = min((total_tokens / context_window) * 100, 100)
+            filled = int(percentage / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+
+            final_status += (
+                f" [{bar}] {format_num(total_tokens)}/{context_label} ({percentage:.1f}%)"
+            )
+
+            # Cache status display (only in "With Cache" mode)
+            if (
+                show_token_setting == "With Cache"
+                and self.valves.CACHE_CONTROL != "cache disabled"
+            ):
+                ttl_label = "1hr" if self.valves.CACHE_TTL == "1 hour" else "5min"
+                cache_write = total_usage.get("cache_creation_input_tokens", 0)
+                cache_read = total_usage.get("cache_read_input_tokens", 0)
+                final_status += (
+                    f" | 📝 {format_num(cache_write)} ({ttl_label})"
+                    f" | 📖 {format_num(cache_read)}"
+                )
+
+        # Consolidate: emit a final replace with the complete message so OpenWebUI
+        # has the authoritative content (replaces any partial delta/replace state).
+        # Cache diagnostics: persist last response id for next turn and render a
+        # collapsible details block if the API reported any miss reasons.
+        if getattr(self.valves, "ENABLE_CACHE_DIAGNOSTICS", False) and cache_diagnostics_records:
+            try:
+                last_id = next(
+                    (rec.get("message_id") for rec in reversed(cache_diagnostics_records) if rec.get("message_id")),
+                    None,
+                )
+                if cache_diagnostics_chat_id and last_id:
+                    self._cache_diagnostics_state[cache_diagnostics_chat_id] = last_id
+                # Persist the response id as a metadata marker on the saved
+                # assistant message so the next turn can re-inject it as
+                # `diagnostics.previous_message_id`. This survives pipe restarts
+                # and multi-worker setups where the in-memory
+                # `_cache_diagnostics_state` dict is not shared. The marker is an
+                # invisible markdown link, stripped from future prompts by
+                # `_extract_metadata_marker_from_message`.
+                if last_id:
+                    try:
+                        if not isinstance(new_marker_metadata, list):
+                            new_marker_metadata = list(new_marker_metadata or [])
+                        new_marker_metadata.append(
+                            self._create_metadata_marker("cachediag", last_id)
+                        )
+                    except Exception as _e:
+                        logger.debug(f"[CACHE-DIAG] could not persist id marker: {_e}")
+                # Pick the first non-empty diagnostics record for display.
+                # Also show per-call usage even when no diagnostics object is present.
+                visible = next(
+                    (rec for rec in cache_diagnostics_records if rec.get("diagnostics")),
+                    cache_diagnostics_records[0] if cache_diagnostics_records else None,
+                )
+                if visible:
+                    import json as _json
+                    # Build display dict: IDs first (for easy copy-paste into Console), then
+                    # per-call usage array (one entry per API call in this turn), then diagnostics.
+                    all_request_ids = [
+                        rec["request_id"] for rec in cache_diagnostics_records if rec.get("request_id")
+                    ]
+                    all_message_ids = [
+                        rec["message_id"] for rec in cache_diagnostics_records if rec.get("message_id")
+                    ]
+                    all_usages = [
+                        rec["usage"] for rec in cache_diagnostics_records if rec.get("usage")
+                    ]
+                    display_obj = {}
+                    if all_request_ids:
+                        display_obj["request_ids"] = all_request_ids if len(all_request_ids) > 1 else all_request_ids[0]
+                    if all_message_ids:
+                        display_obj["message_ids"] = all_message_ids if len(all_message_ids) > 1 else all_message_ids[0]
+                    if all_usages:
+                        display_obj["usage"] = all_usages if len(all_usages) > 1 else all_usages[0]
+                    if visible.get("diagnostics"):
+                        display_obj["diagnostics"] = visible["diagnostics"]
+                    body_json = _json.dumps(display_obj, indent=2, ensure_ascii=False, default=str)
+                    reason = ""
+                    try:
+                        reason = (
+                            (visible.get("diagnostics") or {})
+                            .get("cache_miss_reason", {})
+                            .get("type", "")
+                        )
+                    except Exception:
+                        reason = ""
+                    summary = f"Cache Diagnostics{(' — ' + reason) if reason else ''}"
+                    diag_block = (
+                        f'\n\n<details type="cache-diagnostics">\n'
+                        f'<summary>{summary}</summary>\n\n'
+                        f'```json\n{body_json}\n```\n'
+                        f'</details>\n'
+                    )
+                    await request_ctx.emit_delta(diag_block)
+            except Exception as e:
+                logger.warning(f"[CACHE-DIAG] failed to emit diagnostics block: {e}")
+
+        # Persist request-side metadata (e.g. native PDF attachment anchors) in
+        # the saved assistant message. The marker is an empty markdown link and
+        # is stripped from future prompts by _extract_metadata_marker_from_message.
+        if new_marker_metadata:
+            marker_text = "".join(new_marker_metadata) if isinstance(new_marker_metadata, list) else str(new_marker_metadata)
+            if marker_text:
+                final_message.append(marker_text)
+                logger.debug("Persisted %d metadata marker char(s)", len(marker_text))
+
+        consolidated = final_text()
+        if consolidated:
+            await emit_event_local(
+                {"type": "replace", "data": {"content": consolidated}}
+            )
+
+        await status.complete(final_status)
+        
+        # Emit chat:completion done event so frontend knows streaming finished
+        # (triggers TTS finish, usage display, etc.)
+        done_data: dict = {"choices": [{"finish_reason": "stop", "delta": {"content": ""}}], "done": True}
+        if include_usage and total_usage:
+            done_data["usage"] = {k: v for k, v in total_usage.items() if not k.startswith("_")}
+        await emit_event_local({"type": "chat:completion", "data": done_data})
+
+        # Persist usage to chat_message.usage column for the 0.9.0+ analytics page.
+        # chat:completion events are NOT persisted by the socket event emitter
+        # (only status|message|replace|embeds|files|source are), so without this
+        # direct DB write the analytics tab never sees our token counts.
+        if include_usage and total_usage and CHATS_AVAILABLE and __metadata__:
+            chat_id = __metadata__.get("chat_id")
+            message_id = __metadata__.get("message_id")
+            if chat_id and message_id and not str(chat_id).startswith("local:"):
+                try:
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, message_id, {"usage": {k: v for k, v in total_usage.items() if not k.startswith("_")}}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to persist usage to chat_message: {e}")
+
+
+        return final_text()
+
+    # END GENERATED SECTION: anthropic_pipe.pipe_method_groups
+
+
+
+
+    # =========================================================================
+    # PDF & FILE HANDLING
+    # =========================================================================
+
+
+
+    # =========================================================================
+    # RAG (RETRIEVAL-AUGMENTED GENERATION) HANDLING
+    # =========================================================================
+
+
+
+
+    # =========================================================================
+    # FILES API (UPLOAD, DOWNLOAD, DEDUPLICATION)
+    # =========================================================================
+
+
+
+    # =========================================================================
+    # CACHE CONTROL
+    # =========================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # =========================================================================
+    # PAYLOAD BUILDING & MESSAGE/TOOL CONVERSION
+    # =========================================================================
+
+    async def _create_payload(
+        self,
+        body: Dict,
+        __metadata__: dict[str, Any],
+        __user__: Dict[str, Any],
+        __tools__: Optional[Dict[str, Dict[str, Any]]],
+        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
+        __files__: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[dict, dict, List[str]]:
+        return await create_request_payload(
+            self, body, __metadata__, __user__, __tools__, __event_emitter__, __files__
+        )
+
+
+
+
+
+
+
+
+
+
+    # =========================================================================
+    # MAIN ENTRY POINT
+    # =========================================================================
+
+
+    # =========================================================================
+    # TASK MODEL (TITLE, TAGS, FOLLOW-UPS)
+    # =========================================================================
+
+
+
+    # =========================================================================
+    # ERROR HANDLING
+    # =========================================================================
+
+
+    # =========================================================================
+    # TEXT PROCESSING & MEMORY EXTRACTION
+    # =========================================================================
+
+
+    # =========================================================================
+    # CITATIONS & EVENT EMISSION
+    # =========================================================================
+
+
+
+    # =========================================================================
+    # SDK MESSAGE CONVERSION HELPER
+    # Converts SDK BetaMessage content blocks to API-compatible dicts
+    # =========================================================================
+    # CRITICAL: All blocks must be preserved to maintain thinking block positions.
+    # The SDK (and Anthropic's tool runner) keeps ALL blocks as-is when sending
+    # assistant content back during tool loops. Stripping server_tool_use or
+    # *_tool_result shifts thinking block indices, causing:
+    #   "thinking blocks cannot be modified"
+    # Only strip truly structural meta-events (context_cleared).
+    # Compaction blocks MUST be preserved — the API uses them to drop prior context.
+    #
+    # Thinking + redacted_thinking get strict key sanitization to prevent
+    # cache_control or other extra fields from causing API errors.
+
+    # Block types that must be strictly sanitized (extra keys cause API errors)
+    _SANITIZE_BLOCK_KEYS = {
+        "thinking": {"type", "thinking", "signature"},  # signature MUST be preserved exactly
+        "redacted_thinking": {"type", "data"},           # opaque data, pass through unchanged
+    }
+
+    # Block types to skip entirely (structural meta-events)
+    _SKIP_BLOCK_TYPES = frozenset({"context_cleared"})
+
+
+    # =========================================================================
+    # IMMEDIATE BLOCK FORMATTING HELPERS
+    # These format individual blocks immediately when they finish streaming
+    # =========================================================================
+
+
+
     # =========================================================================
     # SKILLS VALIDATION AND CONTAINER BUILDING
     # =========================================================================
 
-    async def _validate_and_get_skills(
-        self,
-        skill_names: List[str],
-        api_key: str,
-        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Validate user-specified skill names against the Anthropic List Skills API.
-
-        Skills can be specified as:
-        - Anthropic skills: Short names like "pptx", "xlsx", "docx", "pdf"
-        - Custom skills: Full IDs like "skill_01AbCdEfGhIjKlMnOpQrStUv"
-
-        Validation results are cached per API key to avoid repeated API calls.
-
-        Args:
-            skill_names: List of skill names/IDs from user's SKILLS valve
-            api_key: Anthropic API key
-            __event_emitter__: Optional event emitter for status updates
-
-        Returns:
-            List of validated skill configurations for the container parameter
-        """
-        if not skill_names:
-            return []
-
-        # Initialize cache for this API key if needed
-        if api_key not in self._validated_skills_cache:
-            self._validated_skills_cache[api_key] = {}
-
-        cache = self._validated_skills_cache[api_key]
-
-        # Check which skills need validation
-        skills_to_validate = [s for s in skill_names if s not in cache]
-
-        # If we have skills to validate, fetch from API
-        if skills_to_validate:
-            logger.debug(
-                f"🔧 Validating {len(skills_to_validate)} skills via API: {skills_to_validate}"
-            )
-
-            if __event_emitter__:
-                await self.emit_event(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "🔧 Validating Skills...",
-                            "done": False,
-                            "hidden": True,
-                        },
-                    },
-                    __event_emitter__,
-                )
-
-            try:
-                from anthropic import AsyncAnthropic
-
-                base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-                client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
-
-                # Fetch all available skills
-                available_skills = {}
-
-                # Fetch Anthropic skills
-                try:
-                    anthropic_skills = await client.beta.skills.list(
-                        source="anthropic", betas=["skills-2025-10-02"]
-                    )
-                    for skill in anthropic_skills.data:
-                        # Store by both id and display_title for flexible matching
-                        available_skills[skill.id] = {
-                            "id": skill.id,
-                            "type": "anthropic",
-                            "source": "anthropic",
-                            "display_title": getattr(skill, "display_title", skill.id),
-                            "latest_version": getattr(
-                                skill, "latest_version", "latest"
-                            ),
-                        }
-                        # Also index by lowercase for case-insensitive matching
-                        available_skills[skill.id.lower()] = available_skills[skill.id]
-                except Exception as e:
-                    logger.warning(f"Failed to fetch Anthropic skills: {e}")
-
-                # Fetch custom skills
-                try:
-                    custom_skills = await client.beta.skills.list(
-                        source="custom", betas=["skills-2025-10-02"]
-                    )
-                    for skill in custom_skills.data:
-                        available_skills[skill.id] = {
-                            "id": skill.id,
-                            "type": "custom",
-                            "source": "custom",
-                            "display_title": getattr(skill, "display_title", skill.id),
-                            "latest_version": getattr(
-                                skill, "latest_version", "latest"
-                            ),
-                        }
-                except Exception as e:
-                    logger.warning(f"Failed to fetch custom skills: {e}")
-
-                logger.debug(f"🔧 Found {len(available_skills)} available skills")
-
-                # Validate each skill
-                for skill_name in skills_to_validate:
-                    skill_lower = skill_name.lower().strip()
-
-                    # Try exact match first
-                    if skill_name in available_skills:
-                        cache[skill_name] = available_skills[skill_name]
-                        logger.debug(f"✓ Validated skill '{skill_name}' (exact match)")
-                    # Try lowercase match
-                    elif skill_lower in available_skills:
-                        cache[skill_name] = available_skills[skill_lower]
-                        logger.debug(
-                            f"✓ Validated skill '{skill_name}' (case-insensitive match)"
-                        )
-                    else:
-                        # Mark as invalid
-                        cache[skill_name] = None
-                        logger.warning(
-                            f"✗ Invalid skill '{skill_name}' - not found in available skills"
-                        )
-
-            except Exception as e:
-                logger.error(f"Failed to validate skills: {e}")
-                # Mark all as failed validation
-                for skill_name in skills_to_validate:
-                    cache[skill_name] = None
-
-        # Build the validated skills list
-        validated_skills = []
-        invalid_skills = []
-
-        for skill_name in skill_names:
-            skill_info = cache.get(skill_name)
-            if skill_info:
-                validated_skills.append(
-                    {
-                        "type": skill_info["type"],
-                        "skill_id": skill_info["id"],
-                        "version": "latest",
-                    }
-                )
-            else:
-                invalid_skills.append(skill_name)
-
-        if invalid_skills and __event_emitter__:
-            await self.emit_event(
-                {
-                    "type": "notification",
-                    "data": {
-                        "type": "warning",
-                        "content": f"⚠️ Invalid skills ignored: {', '.join(invalid_skills)}",
-                    },
-                },
-                __event_emitter__,
-            )
-
-        logger.debug(f"🔧 Returning {len(validated_skills)} validated skills")
-        return validated_skills
 
     # =========================================================================
     # METADATA PERSISTENCE SYSTEM
@@ -7337,37 +8275,3 @@ class Pipe:
     # =========================================================================
 
     METADATA_PATTERN = re.compile(r"\[\]\(anthropic:([^)]+)\)")
-
-    def _create_metadata_marker(self, id: str, value: str, messagenum: int = 0) -> str:
-        # URL-encode to handle special characters
-        encoded_value = quote(value, safe="")
-        return f" [](anthropic:{messagenum}:{id}:{encoded_value}) "
-
-    def _extract_metadata_marker_from_message(self, message) -> List[str]:
-        """
-        Extract Anthropic metadata from the LAST assistant message in conversation.
-        """
-        metadata: List[str] = []
-        if not isinstance(message, dict):
-            return metadata
-        if message.get("role") == "assistant":
-            text = None
-            content = message.get("content")
-            if isinstance(content, list):
-                # Join all text blocks for searching, but also update blocks in-place
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        block_text = block.get("text", "")
-                        matches = self.METADATA_PATTERN.findall(block_text)
-                        for match in matches:
-                            metadata.append(match)
-                        # Remove all metadata markers from this block
-                        cleaned_text = self.METADATA_PATTERN.sub("", block_text)
-                        block["text"] = cleaned_text
-            elif isinstance(content, str):
-                matches = self.METADATA_PATTERN.findall(content)
-                for match in matches:
-                    metadata.append(match)
-                # Remove all metadata markers from the string
-                message["content"] = self.METADATA_PATTERN.sub("", content)
-        return metadata
