@@ -3808,6 +3808,39 @@ class Pipe:
             role = msg.get("role")
             raw_content = msg.get("content")
 
+            # OpenAI-style tool result messages (role: "tool") are not valid for
+            # Anthropic's API.  Convert them to role: "user" + type: "tool_result"
+            # blocks.  Batch consecutive tool messages into a single user message
+            # so the API always sees alternating user/assistant turns.
+            if role == "tool":
+                tool_use_id = msg.get("tool_call_id", "")
+                content_str = (
+                    raw_content
+                    if isinstance(raw_content, str)
+                    else (raw_content[0].get("text", "") if isinstance(raw_content, list) and raw_content else "")
+                )
+                tool_result_block: dict = {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": content_str,
+                }
+                # Merge into the preceding user message if it already holds
+                # tool_result blocks (i.e. a previous role: "tool" message was
+                # already converted), otherwise open a new user message.
+                if (
+                    processed_messages
+                    and processed_messages[-1].get("role") == "user"
+                    and isinstance(processed_messages[-1].get("content"), list)
+                    and processed_messages[-1]["content"]
+                    and isinstance(processed_messages[-1]["content"][0], dict)
+                    and processed_messages[-1]["content"][0].get("type") == "tool_result"
+                ):
+                    processed_messages[-1]["content"].append(tool_result_block)
+                else:
+                    processed_messages.append({"role": "user", "content": [tool_result_block]})
+                logger.debug(f"Converted role=tool → tool_result block (id={tool_use_id!r})")
+                continue
+
             # Historical assistant turns may carry tool calls serialized as
             # <details type="tool_calls"> HTML (OpenWebUI stores flat strings
             # only). Parse them back into structured tool_use/tool_result
