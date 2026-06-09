@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.14
+version: 0.9.16
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.103.0
 environment_variables:
@@ -37,6 +37,15 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.16
+- Added Claude Fable and Mythos 5 alongside new stop_reasons and refusals
+
+v0.9.15
+- Fixed Newline after Citations
+- Fixed Tool calling error when tools payload changes while old tool results are still present in previous answers
+- Fixed Stop Handling
+- Fixed Status Emitting for Tool Search and Advisor
+
 v0.9.14
 - Added Claude Opus 4.8
 - Promt caching bugfixes when using native PDF Upload and Images
@@ -848,10 +857,9 @@ async def create_request_payload(
                 f"Using manual thinking with budget_tokens: {thinking_budget}, effort: {effective_effort}"
             )
 
-        # Add display mode if not default
         thinking_display = __user__["valves"].THINKING_DISPLAY
-        if thinking_display == "omitted":
-            thinking_config["display"] = "omitted"
+        if thinking_display in ("omitted", "summarized"):
+            thinking_config["display"] = thinking_display
 
         payload["thinking"] = thinking_config
 
@@ -1300,6 +1308,66 @@ async def create_request_payload(
             payload["tool_choice"] = api_tc
         logger.debug(f"API tool_choice passthrough: {payload['tool_choice']}")
 
+    # Filter stale tool_search references for tools toggled OFF.
+    # History `tool_search_tool_result` blocks list `tool_references` for tools
+    # the search surfaced on an earlier turn.  If such a user tool is no longer
+    # enabled it is absent from `tools`, and replaying the reference makes the
+    # API reject the request with 400 "Tool reference 'X' not found in available
+    # tools".  Drop the missing references entirely rather than re-advertising a
+    # disabled tool: a stub definition would let the model call a non-functional
+    # tool again.  The cache is already invalidated by the tool-set change
+    # (`tools_changed`), so editing history here costs nothing extra.
+    _reserved_server_tool_names = {
+        "web_search",
+        "web_fetch",
+        "code_execution",
+        "bash",
+        "str_replace_based_edit_tool",
+        "str_replace_editor",
+        "computer",
+        "tool_search_tool_regex",
+        "tool_search_tool_bm25",
+        "advisor",
+    }
+    _present_tool_names = {
+        t.get("name")
+        for t in tools_list
+        if isinstance(t, dict) and t.get("name")
+    }
+    for _msg in processed_messages:
+        _content = _msg.get("content") if isinstance(_msg, dict) else None
+        if not isinstance(_content, list):
+            continue
+        for _block in _content:
+            if not isinstance(_block, dict) or _block.get("type") != "tool_search_tool_result":
+                continue
+            _inner = _block.get("content")
+            if not isinstance(_inner, dict):
+                continue
+            _refs = _inner.get("tool_references")
+            if not isinstance(_refs, list):
+                continue
+            _kept = [
+                _ref
+                for _ref in _refs
+                if isinstance(_ref, dict)
+                and (
+                    _ref.get("tool_name") in _present_tool_names
+                    or _ref.get("tool_name") in _reserved_server_tool_names
+                )
+            ]
+            if len(_kept) != len(_refs):
+                _dropped = [
+                    _ref.get("tool_name")
+                    for _ref in _refs
+                    if _ref not in _kept
+                ]
+                _inner["tool_references"] = _kept
+                logger.info(
+                    f"[TOOL-FILTER] Dropped stale tool_search references "
+                    f"(tool no longer enabled): {_dropped}"
+                )
+
     payload["tools"] = tools_list
 
     # Processing Messages and Caching
@@ -1341,6 +1409,18 @@ def _serialize_content_payload(content: Any) -> Any:
     return None
 
 
+def _extract_advisor_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        return "".join(_extract_advisor_text(part) for part in content)
+    text = getattr(content, "text", None)
+    if text is None and isinstance(content, dict):
+        text = content.get("text")
+    return (text or "").strip()
+
+
+
 async def handle_advisor_result_block_start(
     content_block: Any,
     *,
@@ -1375,11 +1455,10 @@ async def handle_advisor_result_block_start(
             "content is decrypted server-side on the next turn)_"
         )
     else:
-        advice_text = ""
-        if hasattr(content, "text"):
-            advice_text = getattr(content, "text", "") or ""
-        elif isinstance(content, dict):
-            advice_text = content.get("text", "") or ""
+        advice_text = _extract_advisor_text(content)
+        logger.info(
+            "advisor result: inner_type=%s text_len=%d", inner_type, len(advice_text)
+        )
         preview = advice_text.strip().splitlines()[0] if advice_text.strip() else ""
         status_desc = f"🧑‍⚖️ Advisor: {preview[:80]}" if preview else "🧑‍⚖️ Advisor consulted"
         display_body = advice_text.strip() if advice_text.strip() else "**🧑‍⚖️ Advisor consulted** _(empty response)_"
@@ -1960,9 +2039,9 @@ async def handle_server_tool_use_block_start(
         code_exec_current_lang = "bash" if active_server_tool_name == "bash_code_execution" else "python"
         code_exec_start_time = time.time()
 
-    elif active_server_tool_name in ("tool_search_tool_regex", "tool_search_tool_bm25"):
-        if emit_status:
-            await emit_status("🧰 Searching available tools...")
+    # elif active_server_tool_name in ("tool_search_tool_regex", "tool_search_tool_bm25"):
+    #     if emit_status:
+    #         await emit_status("🧰 Searching available tools...")
 
     elif active_server_tool_name == "advisor":
         if emit_status:
@@ -2416,11 +2495,18 @@ async def handle_text_block_stop(
     final_text: Callable[[], str],
     emit_delta: Callable[[str], Awaitable[None]],
 ) -> tuple[str, int, list[int]]:
+    had_citation = False
     if pending_citation_markers:
         chunk += "".join(f"[{n}]" for n in pending_citation_markers)
         pending_citation_markers = []
+        had_citation = True
     if chunk:
-        if not chunk.endswith("\n"):
+        # Web-search answers arrive as MULTIPLE text blocks split around their
+        # citation markers.  Forcing a trailing newline after every block put a
+        # line break right after each `[n]`, breaking cited prose onto separate
+        # lines.  Only add the separator newline for non-citation blocks (those
+        # precede tool/details blocks); cited segments must flow inline.
+        if not had_citation and not chunk.endswith("\n"):
             chunk += "\n"
         await emit_delta(chunk)
         chunk = ""
@@ -2577,6 +2663,9 @@ class StatusEmitter:
     async def activity(self, description: str) -> None:
         await self.emit(description, done=False)
 
+    async def resume_after_tool(self) -> None:
+        await self.emit("Responding...", done=False)
+
     async def complete(self, description: str) -> None:
         await self.emit(description, done=True, force=True)
 
@@ -2594,6 +2683,14 @@ class Pipe:
     # The API now provides: max_tokens, max_input_tokens, capabilities (thinking, effort, vision, etc.)
     # These overrides only contain flags that must be derived from model identity.
     MODEL_CAPABILITY_OVERRIDES = {
+         "claude-fable-5": {
+            "supports_dynamic_filtering": True,
+            "supports_compaction": True,
+        },
+         "claude-mythos-5": {
+            "supports_dynamic_filtering": True,
+            "supports_compaction": True,
+        },
         "claude-opus-4-8": {
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
@@ -6222,6 +6319,20 @@ class Pipe:
                     await request_ctx.emit_delta("\n\n⚠️ Maximum token limit reached.")
                 elif sdk_stop == "model_context_window_exceeded":
                     await request_ctx.emit_delta("\n\n⚠️ Context window exceeded.")
+                elif sdk_stop == "refusal":
+                    _stop_details = getattr(sdk_final_message, "stop_details", None)
+                    _category = getattr(_stop_details, "category", None) if _stop_details else None
+                    _explanation = getattr(_stop_details, "explanation", None) if _stop_details else None
+                    _REFUSAL_LABELS = {
+                        "cyber": "cybersecurity policy",
+                        "bio": "biological safety policy",
+                        "reasoning_extraction": "reasoning extraction policy",
+                    }
+                    _cat_label = _REFUSAL_LABELS.get(_category, "content policy") if _category else "content policy"
+                    _ref_msg = f"\u26a0\ufe0f Request declined by Claude ({_cat_label})."
+                    if _explanation:
+                        _ref_msg += f"\n\n_{_explanation}_"
+                    await request_ctx.emit_delta(_ref_msg)
         elif not sdk_content:
             logger.warning(
                 f"⚠️ Empty API response (no stop_reason, no content). "
@@ -6976,6 +7087,14 @@ class Pipe:
                                 if not content_block:
                                     continue
                                 await status.response_started_once()
+                                # Unify transient tool status lifecycle: a
+                                # *_tool_result block means the server tool that
+                                # emitted a "...ing..." status (web/code/advisor/
+                                # tool_search) has finished.  Reset to the neutral
+                                # "Responding..." so its status does not stay stuck
+                                # active while the executor keeps generating.
+                                if isinstance(content_type, str) and content_type.endswith("_tool_result"):
+                                    await status.resume_after_tool()
                                 if content_type == "text":
                                     chunk = handle_text_block_start(content_block, chunk)
                                 elif content_type == "thinking":
@@ -7537,7 +7656,23 @@ class Pipe:
                                     # tool_calls stays empty → PHASE 5 detects pause_turn
                                     await status.activity("⏳ Long-running turn paused, continuing...")
                                 elif stop_reason == "refusal":
-                                    chunk += "Claude has refused to answer based on its content policies."
+                                    # Extract stop_details from the live SDK snapshot.
+                                    # Available after the message_delta event updates it.
+                                    _snap = getattr(stream, "current_message_snapshot", None)
+                                    _stop_details = getattr(_snap, "stop_details", None) if _snap else None
+                                    _category = getattr(_stop_details, "category", None) if _stop_details else None
+                                    _explanation = getattr(_stop_details, "explanation", None) if _stop_details else None
+                                    _REFUSAL_LABELS = {
+                                        "cyber": "cybersecurity policy",
+                                        "bio": "biological safety policy",
+                                        "reasoning_extraction": "reasoning extraction policy",
+                                    }
+                                    _cat_label = _REFUSAL_LABELS.get(_category, "content policy") if _category else "content policy"
+                                    _ref_msg = f"\u26a0\ufe0f Request declined by Claude ({_cat_label})."
+                                    if _explanation:
+                                        _ref_msg += f"\n\n_{_explanation}_"
+                                    logger.info(f"\U0001f6ab Refusal: category={_category!r} explanation={(_explanation or '')[:120]!r}")
+                                    chunk += _ref_msg
                                     conversation_ended = True
                                 elif stop_reason == "stop_sequence":
                                     chunk += "Claude stopped generating based on stop sequence."
@@ -7957,6 +8092,36 @@ class Pipe:
                     if response_suffix:
                         return final_text() + response_suffix
                     return final_text()
+        except asyncio.CancelledError:
+            # OpenWebUI stop button cancels the pipe task (task.cancel() ->
+            # CancelledError raised inside `async for event in stream`).
+            # CancelledError is a BaseException, so the `except Exception` paths
+            # never finalize the UI.  Mark the status done and emit the completion
+            # event so the frontend stops showing the generating indicator and the
+            # status does not stay stuck active, then re-raise so OpenWebUI emits
+            # chat:tasks:cancel and tears the task down.  The cancellation has
+            # already been delivered, so awaiting the emits here is safe.
+            try:
+                await status.emit("⏹️ Request Cancelled", done=True, hidden=False, force=True)
+                consolidated = final_text()
+                if consolidated:
+                    await emit_event_local(
+                        {"type": "replace", "data": {"content": consolidated}}
+                    )
+                await emit_event_local(
+                    {
+                        "type": "chat:completion",
+                        "data": {
+                            "choices": [
+                                {"finish_reason": "stop", "delta": {"content": ""}}
+                            ],
+                            "done": True,
+                        },
+                    }
+                )
+            except Exception as _cancel_cleanup_err:
+                logger.debug(f"Cancel cleanup emit failed: {_cancel_cleanup_err}")
+            raise
         except Exception as e:
             await self.handle_errors(e, __event_emitter__)
             return final_text()
@@ -8122,7 +8287,6 @@ class Pipe:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to persist usage to chat_message: {e}")
-
 
         return final_text()
 
