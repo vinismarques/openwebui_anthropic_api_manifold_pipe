@@ -6,12 +6,11 @@
 
 ## 📌 Current status
 
-- **Current pipe version:** `0.9.10`
+- **Current pipe version:** `0.9.16`
 - **Recommended OpenWebUI:** `0.9.0+`
 - **Minimum practical OpenWebUI for good UX:** `0.8.11+`
 - **Model list and capabilities are fetched dynamically** from Anthropic's Models API (`max_input_tokens`, `max_tokens`, thinking/effort support, compaction support, etc.)
-- **Current Anthropic model docs focus on:** `Claude Opus 4.7`, `Claude Sonnet 4.6`, `Claude Haiku 4.5`
-- **Anthropic deprecation note:** `Claude Sonnet 4` and `Claude Opus 4` are deprecated and retire on **2026-06-15**
+- **Current Anthropic model docs focus on:** `Claude Fable 5`, `Claude Opus 4.8`, `Claude Sonnet 4.6`, `Claude Haiku 4.5`
 
 This pipe targets the **Anthropic Messages API** directly through the official **Anthropic Python SDK** and keeps the OpenWebUI experience close to Anthropic-native behavior while still playing nicely with OpenWebUI models, tools, filters, files, notes, channels, and task generation.
 
@@ -30,18 +29,6 @@ This pipe targets the **Anthropic Messages API** directly through the official *
 | **Skills** | Prebuilt and custom Agent Skills, skill validation, API-side skill support via Files API + code execution |
 | **Context efficiency** | Prompt caching, optional 1-hour cache TTL, token/cache stats, context editing, compaction, tool search, Advisor sub-inference |
 | **OpenWebUI integration** | Notes, channels, task generation, built-in tools, MCP tools, toggle filters, companion filter for native Anthropic buttons |
-
----
-
-## 🧠 Anthropic / Claude notes reflected in this pipe
-
-- The Anthropic docs now treat **Opus 4.7** as the flagship generally available model for the hardest agentic and coding workloads.
-- **Opus 4.7** and **Sonnet 4.6** expose a **1M token** context window; **Haiku 4.5** uses **200k**.
-- Modern Claude models expose capabilities through the **Models API**, which this pipe reads directly.
-- `thinking.display: "omitted"` suppresses streamed `thinking_delta` events; only the thinking block shell and signature are emitted.
-- Anthropic's **Files API** remains **beta** and is especially useful together with code execution and skills.
-- Anthropic's **Skills API** relies on **code execution + files + skills beta headers**; this pipe handles that plumbing for you.
-- Anthropic's **effort** parameter is now the recommended control for adaptive-thinking models; `xhigh` is **Opus 4.7 only**.
 
 ---
 
@@ -212,6 +199,28 @@ If you fork this pipe or copy code into your own plugin, note that OpenWebUI `0.
 ---
 
 ## 📝 Recent pipe changes
+### `v0.9.16`
+- Added Claude Fable and Mythos 5 alongside new stop_reasons and refusals
+
+### `v0.9.15`
+- Fixed Newline after Citations
+- Fixed Tool calling error when tools payload changes while old tool results are still present in previous answers
+- Fixed Stop Handling
+- Fixed Status Emitting for Tool Search and Advisor
+
+### `v0.9.14`
+- Added Claude Opus 4.8
+- Promt caching bugfixes when using native PDF Upload and Images
+
+### `v0.9.13`
+- Token counting is now Claude-Code-style: `total_tokens` only counts NEW tokens (uncached input + cache_creation + output) instead of all tokens
+- Added `ENABLE_CACHE_DIAGNOSTICS` valve for debug purposes
+
+### `v0.9.12`
+- Refactored the pipe into modular source files under `src/anthropic_pipe/`.
+- Extracted request payload creation into `request_payload.py` for cache/debug work.
+- Split streaming content-block handling into per-content modules and added a build step that compiles/minifies the OpenWebUI single-file artifact before deploy.
+- Fixed Anthropic API Skills container payload shape and added clearer Files API / code execution guidance.
 
 ### `v0.9.11`
 - Added async handling for Open Terminal `run_command` ↔ Anthropic `bash` tool bridging
