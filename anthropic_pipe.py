@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.16
+version: 0.9.19
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.103.0
 environment_variables:
@@ -37,6 +37,26 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.19
+- Removed static ANTHROPIC_BUILTIN_TOOL_NAMES in favor of default TOOL_SEARCH_EXCLUDE_TOOLS including all openwebui internal tools
+- Fixed open-terminal tool calls and read_file bugs, experimental bash and text_editor tool support seems to work now, needs further testing
+- Fixed token explosion on requests containing images and binary files from older read_file tool calls from open-terminal
+
+v0.9.18
+- Client tool results containing base64 image data now correctly get's converted in Anthropic image blocks instead of raw base64 TEXT
+- Use of native open-webui image compression user settings in image blocks
+- Added Claude Sonnet 5 (claude-sonnet-5): 1M context, 128k output, adaptive thinking on by default
+- Removed Fast Mode for Opus 4.6
+- Experimental Claude on AWS Support: use ANTHROPIC_WORKSPACE_ID Valve to try it out
+- Added ENABLED_MODELS valve + date-suffix normalization + static model fallback for endpoints without /v1/models (Azure/proxies)
+- Added ANTHROPIC_API_KEY Enviromental Variable readout for easier configuration
+- Increased the max-output-token fallback, 4096 is indeed to low :)
+- Fixed File Downloading from code_execution container using Anthropic Files API
+
+v0.9.17
+- Added Fable and Mythos as advisor models
+- Advisor Models is now dynamically adjusted to the next best model if not compatible
+
 v0.9.16
 - Added Claude Fable and Mythos 5 alongside new stop_reasons and refusals
 
@@ -617,6 +637,13 @@ PATTERN_COMPACTION_DETAILS = re.compile(
     flags=re.DOTALL,
 )
 
+# Pattern to detect base64 image data URIs embedded in a client tool's raw
+# result string (e.g. a file-reading tool returning a PNG/JPEG). Used to
+# convert them into real Anthropic image blocks instead of raw base64 TEXT.
+PATTERN_TOOL_RESULT_DATA_IMAGE = re.compile(
+    r"data:image/(?P<mime>jpeg|png|gif|webp);base64,(?P<data>[A-Za-z0-9+/]+=*)"
+)
+
 # Note: Some patterns are compiled dynamically at runtime because they depend
 # on user-provided data (filenames). See:
 #   - _remove_specific_sources_from_rag_message() - dynamic filename pattern
@@ -674,6 +701,16 @@ try:
 except ImportError:
     Chats = None
     CHATS_AVAILABLE = False
+
+# Import Pillow for downscaling images embedded in client tool results.
+# Optional: degrade gracefully (send original image / skip resize) if absent.
+try:
+    from PIL import Image as PILImage
+
+    PIL_AVAILABLE = True
+except Exception:
+    PILImage = None
+    PIL_AVAILABLE = False
 
 @dataclass
 class PipeRenderStrategy:
@@ -1037,13 +1074,22 @@ async def create_request_payload(
         t.get("name") == "code_execution" for t in tools_list
     )
 
+    # Open Terminal bridge is mutually exclusive with the code_execution sandbox:
+    # when Claude's native bash / text_editor tools are wired to the real
+    # terminal session, don't also hand it Anthropic's ephemeral server sandbox
+    # for the same operations. No terminal → these tools are absent and
+    # code_execution is injected as usual.
+    has_native_terminal_tools = any(
+        t.get("name") in ("bash", "str_replace_based_edit_tool") for t in tools_list
+    )
+
     # Determine which code_execution version to add
     use_programmatic_code_exec = (
         pipe.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING
         and model_info.get("supports_programmatic_calling", False)
     )
 
-    if activate_code_execution and not has_code_execution:
+    if activate_code_execution and not has_code_execution and not has_native_terminal_tools:
         if use_programmatic_code_exec:
             # Always add code_execution_20260120 for programmatic calling,
             # even alongside dynamic filtering tools (it supersedes the auto-injected one)
@@ -1265,6 +1311,25 @@ async def create_request_payload(
             f"[CACHE-DIAG] previous_message_id={previous_message_id} chat_id={chat_id_for_diag}"
         )
 
+    # A compaction block replayed from history requires the compaction beta even
+    # when API-side compaction isn't enabled for this turn — otherwise Anthropic
+    # 400s with "Input tag 'compaction' does not match any of the expected tags".
+    # This keeps previously-compacted chats replayable regardless of valve state.
+    def _messages_have_compaction_block(msgs) -> bool:
+        for _m in msgs or []:
+            _content = _m.get("content") if isinstance(_m, dict) else None
+            if isinstance(_content, list):
+                for _block in _content:
+                    if isinstance(_block, dict) and _block.get("type") == "compaction":
+                        return True
+        return False
+
+    if _messages_have_compaction_block(processed_messages):
+        if "context-management-2025-06-27" not in beta_headers:
+            beta_headers.append("context-management-2025-06-27")
+        if "compact-2026-01-12" not in beta_headers:
+            beta_headers.append("compact-2026-01-12")
+
     if beta_headers and len(beta_headers) > 0:
         headers["anthropic-beta"] = ",".join(beta_headers)
         # Add betas list to payload for beta.messages.stream
@@ -1369,6 +1434,26 @@ async def create_request_payload(
                 )
 
     payload["tools"] = tools_list
+
+    # Tool search nudge: deferred tools are stripped from the prompt prefix, so the
+    # model can't see them and tends to claim it lacks the capability. Tell it to
+    # search first. Static text → does not churn the cache across turns.
+    if any(isinstance(_t, dict) and _t.get("defer_loading") for _t in tools_list):
+        _tool_search_nudge = {
+            "type": "text",
+            "text": (
+                "Some available tools are not listed directly in this request; they are "
+                "loaded on demand via the tool search tool (tool_search_tool_*). Before "
+                "telling the user you cannot do something or that you lack access to a tool, "
+                "call the tool search tool to find a relevant tool, then use whatever it returns."
+            ),
+        }
+        if isinstance(system_messages, list):
+            system_messages = system_messages + [_tool_search_nudge]
+        elif system_messages:
+            system_messages = [{"type": "text", "text": str(system_messages)}, _tool_search_nudge]
+        else:
+            system_messages = [_tool_search_nudge]
 
     # Processing Messages and Caching
     if system_messages and len(system_messages) > 0:
@@ -2356,6 +2441,7 @@ async def handle_tool_use_block_stop(
     api_tool_names: list[str],
     running_tool_tasks: list[Any],
     emit_delta: Callable[[str], Awaitable[None]],
+    emit_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[str, bool]:
     if not tools_buffer:
         return tools_buffer, False
@@ -2391,7 +2477,8 @@ async def handle_tool_use_block_stop(
             task = asyncio.create_task(
                 pipe._await_tool_task_result(
                     tool_call_data,
-                    pipe._dispatch_bash_tool(args, tools),
+                    pipe._dispatch_bash_tool(args, tools, emit_event),
+                    timeout_s=pipe.valves.BASH_TOOL_TIMEOUT + 15,
                 )
             )
             running_tool_tasks.append(task)
@@ -2407,7 +2494,8 @@ async def handle_tool_use_block_stop(
             task = asyncio.create_task(
                 pipe._await_tool_task_result(
                     tool_call_data,
-                    pipe._dispatch_text_editor_tool(args, tools),
+                    pipe._dispatch_text_editor_tool(args, tools, emit_event),
+                    timeout_s=pipe.valves.BASH_TOOL_TIMEOUT + 15,
                 )
             )
             running_tool_tasks.append(task)
@@ -2682,12 +2770,30 @@ class Pipe:
     # Capability overrides for fields NOT available from the /v1/models API.
     # The API now provides: max_tokens, max_input_tokens, capabilities (thinking, effort, vision, etc.)
     # These overrides only contain flags that must be derived from model identity.
+    # Static max-output-token fallbacks, used ONLY when the /v1/models API does not
+    # report max_tokens (custom/Azure endpoints, ENABLED_MODELS manual ids). The
+    # live API value always wins for direct Anthropic. Keyed by base (suffix-stripped) id.
+    MODEL_MAX_TOKENS_FALLBACK = {
+        "claude-opus-4-8": 64000,
+        "claude-opus-4-7": 64000,
+        "claude-opus-4-6": 64000,
+        "claude-sonnet-5": 128000,
+        "claude-sonnet-4-6": 64000,
+        "claude-fable-5": 128000,
+        "claude-mythos-5": 128000,
+        "claude-haiku-4-5": 64000,
+    }
+
     MODEL_CAPABILITY_OVERRIDES = {
          "claude-fable-5": {
             "supports_dynamic_filtering": True,
             "supports_compaction": True,
         },
          "claude-mythos-5": {
+            "supports_dynamic_filtering": True,
+            "supports_compaction": True,
+        },
+        "claude-sonnet-5": {
             "supports_dynamic_filtering": True,
             "supports_compaction": True,
         },
@@ -2703,7 +2809,8 @@ class Pipe:
         },
         "claude-opus-4-6": {
             "supports_dynamic_filtering": True,
-            "supports_fast_mode": True,
+            # Fast mode removed for Opus 4.6 (2026-06-29): speed:"fast" is now a
+            # silent no-op billed at standard rate. Don't send it. Use Opus 4.8.
             "supports_compaction": True,
         },
         "claude-sonnet-4-6": {
@@ -2730,10 +2837,25 @@ class Pipe:
 
 
     class Valves(BaseModel):
-        ANTHROPIC_API_KEY: str = "Your API Key Here"
+        ANTHROPIC_API_KEY: str = Field(
+            default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", "Your API Key Here"),
+            description="Anthropic API key. Defaults to the ANTHROPIC_API_KEY environment variable when set.",
+        )
         ANTHROPIC_BASE_URL: str = Field(
             default="https://api.anthropic.com",
-            description="Custom base URL for the Anthropic API",
+            description="Custom base URL for the Anthropic API (e.g. a proxy, Azure, or an "
+            "aws-external-anthropic 'Claude on AWS' endpoint).",
+        )
+        ENABLED_MODELS: str = Field(
+            default="",
+            description="Comma-separated model ids to expose (e.g. 'claude-opus-4-8,claude-sonnet-5'). "
+            "Bypasses /v1/models auto-discovery — required for endpoints without it (Azure, some proxies). "
+            "Empty = auto-discover from the API.",
+        )
+        ANTHROPIC_WORKSPACE_ID: str = Field(
+            default="",
+            description="AWS 'Claude on AWS' workspace id. When set, sent as the 'anthropic-workspace-id' "
+            "header on every request. Required when ANTHROPIC_BASE_URL points at an aws-external-anthropic endpoint.",
         )
         ENABLE_FAST_MODE: bool = Field(
             default=False,
@@ -2915,15 +3037,50 @@ class Pipe:
             description="Tools with longer JSON definitions characters will be deferred.",
         )
         TOOL_SEARCH_EXCLUDE_TOOLS: List[str] = Field(
-            default=[],
-            description="Excluded Tools are always loaded. Anthropic Tools are excluded by default.",
+            default=["""
+            web_search,web_fetch,code_execution,
+            bash_code_execution,
+            text_editor_code_execution,
+            tool_search_tool_regex,
+            tool_search_tool_bm25,
+
+            advisor,
+            mcp_toolset,
+
+            memory,
+            bash,
+            str_replace_based_edit_tool,
+            computer,
+             add_memory, calculate_timestamp, create_automation,
+            create_calendar_event, create_tasks, delete_automation,
+            delete_calendar_event, delete_memory, edit_image,
+            execute_code, fetch_url, generate_image,
+            get_current_timestamp, grep_knowledge_files, list_automations,
+            list_knowledge, list_knowledge_bases, list_memories,
+            list_memory_paths, query_knowledge_bases, query_knowledge_files,
+            read_memory_path, replace_memory_content, replace_note_content,
+            search_calendar_events, search_channel_messages, search_channels,
+            search_chats, search_knowledge_bases, search_knowledge_files,
+            search_memories, search_notes, search_web, toggle_automation,
+            update_automation, update_calendar_event, update_memory,
+            update_task, view_channel_message, view_channel_thread,
+            view_chat, view_file, view_knowledge_file, view_note,
+            view_skill, write_note,
+
+            kb_exec,
+
+            display_file, get_process_status, glob_search, grep_search,
+            kill_process, list_files, list_processes, read_file,
+            replace_file_content, run_command, send_process_input,
+            write_file"""],
+            description="Excluded Tools are always loaded. Anthropic tools and OpenWebUI-native tools (builtin + Open Terminal) are excluded by default.",
         )
         # Advisor tool (advisor-tool-2026-03-01) — per-user
         ENABLE_ADVISOR_TOOL: bool = Field(
             default=False,
             description="Enable the Advisor tool. A faster executor model consults a stronger advisor model mid-generation for strategic guidance.",
         )
-        ADVISOR_MODEL: Literal["claude-opus-4-8"] = Field(
+        ADVISOR_MODEL: Literal["claude-opus-4-7", "claude-opus-4-8", "claude-fable-5", "claude-mythos-5"] = Field(
             default="claude-opus-4-8",
             description="Advisor model ID.",
         )
@@ -2993,6 +3150,13 @@ class Pipe:
         CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT: bool = Field(
             default=False,
             description="Also clear tool input parameters when clearing tool results.",
+        )
+        TOOL_RESULT_MAX_TOKENS: int = Field(
+            default=50000,
+            ge=0,
+            description="Backstop against runaway non-image client tool results: text tool output "
+            "estimated over this many tokens (len//4) is truncated with a note. 0 disables the guard. "
+            "Image blocks (converted from data:image;base64 tool output) are exempt.",
         )
 
     def __init__(self):
@@ -3980,9 +4144,19 @@ class Pipe:
         has_run_command = bool(__tools__ and "run_command" in __tools__ and __tools__["run_command"].get("callable"))
         has_write_file = bool(__tools__ and "write_file" in __tools__ and __tools__["write_file"].get("callable"))
         has_replace_file = bool(__tools__ and "replace_file_content" in __tools__ and __tools__["replace_file_content"].get("callable"))
-        bash_active = self.valves.ENABLE_BASH_TOOL and has_run_command
+        # Only bridge when Open Terminal is actually active for this request.
+        # `terminal_id` is OpenWebUI's canonical signal (set from the request
+        # body when a terminal session is attached); the callables can linger
+        # in __tools__ without an active terminal, so gating on presence alone
+        # is unreliable. No terminal_id → native tools are not injected and the
+        # request falls back to code_execution (see request_payload.py).
+        terminal_active = bool(__metadata__ and __metadata__.get("terminal_id"))
+        bash_active = self.valves.ENABLE_BASH_TOOL and has_run_command and terminal_active
         text_editor_active = (
-            self.valves.ENABLE_TEXT_EDITOR_TOOL and has_write_file and has_replace_file
+            self.valves.ENABLE_TEXT_EDITOR_TOOL
+            and has_write_file
+            and has_replace_file
+            and terminal_active
         )
         terminal_hidden_names: set[str] = set()
         if bash_active:
@@ -4130,13 +4304,39 @@ class Pipe:
             logger.debug(f"Added web_fetch tool: {web_fetch_type}")
 
         # Add advisor tool if enabled (beta). Executor↔advisor pair validation
-        # is enforced server-side — invalid pairs return 400 invalid_request_error.
-        # The advisor sub-inference is billed at the advisor model's rates.
+        # The advisor must be at least as capable as the executor.
+        # If the pair is invalid, downgrade the advisor to the next compatible model.
         if __user__["valves"].ENABLE_ADVISOR_TOOL:
+            executor_model = actual_model_name
+            advisor_model = __user__["valves"].ADVISOR_MODEL
+
+            # Valid advisor models per executor (advisor must be ≥ executor in capability),
+            # strongest first so allowed[0] is the best fallback. These lists already only
+            # contain API-supported advisors, so a single membership check covers both
+            # "unsupported" and "incompatible" cases.
+            valid_advisors = {
+                "claude-haiku-4-5": ["claude-opus-4-8", "claude-opus-4-7"],
+                "claude-sonnet-4-6": ["claude-opus-4-8", "claude-opus-4-7"],
+                "claude-opus-4-6": ["claude-opus-4-8", "claude-opus-4-7"],
+                "claude-opus-4-7": ["claude-opus-4-8", "claude-opus-4-7"],
+                "claude-opus-4-8": ["claude-opus-4-8"],
+                "claude-fable-5": ["claude-fable-5"],
+                "claude-mythos-5": ["claude-mythos-5"],
+            }
+            allowed_advisors = valid_advisors.get(executor_model, ["claude-opus-4-8"])
+
+            adjusted_advisor_model = advisor_model
+            if advisor_model not in allowed_advisors:
+                adjusted_advisor_model = allowed_advisors[0]
+                logger.warning(
+                    f"Advisor '{advisor_model}' invalid for executor '{executor_model}'. "
+                    f"Downgrading to '{adjusted_advisor_model}'"
+                )
+            
             advisor_tool: dict = {
                 "type": "advisor_20260301",
                 "name": "advisor",
-                "model": __user__["valves"].ADVISOR_MODEL,
+                "model": adjusted_advisor_model,
             }
             if __user__["valves"].ADVISOR_MAX_USES > 0:
                 advisor_tool["max_uses"] = __user__["valves"].ADVISOR_MAX_USES
@@ -4148,7 +4348,7 @@ class Pipe:
             claude_tools.append(advisor_tool)
             tool_names_seen.add("advisor")
             logger.debug(
-                f"Added advisor tool: model={__user__['valves'].ADVISOR_MODEL} "
+                f"Added advisor tool: model={adjusted_advisor_model} "
                 f"max_uses={__user__['valves'].ADVISOR_MAX_USES or 'unlimited'} "
                 f"caching={__user__['valves'].ADVISOR_CACHING}"
             )
@@ -4232,44 +4432,18 @@ class Pipe:
             model_info_ptc = self.get_model_info(actual_model_name)
             is_programmatic_active = model_info_ptc.get("supports_programmatic_calling", False)
 
-        # Anthropic-managed tools (server-side or special client tools wired by
-        # this pipe) MUST NEVER be deferred via tool_search — their names are
-        # not exposed in the regular tool registry the search picks from, and
-        # several have version-specific shapes the search can't reproduce.
-        # Hard-coded in addition to the user-configurable exclude list.
-        # Type identifiers used in tool definitions (advisor_20260301,
-        # web_search_20260209, …) are kept here for documentation; the actual
-        # exclusion key is the tool ``name`` field.
-        ANTHROPIC_BUILTIN_TOOL_NAMES = frozenset({
-            # Server tools — GA
-            "web_search",            # web_search_20260209 / web_search_20250305
-            "web_fetch",             # web_fetch_20260209  / web_fetch_20250910
-            "code_execution",        # code_execution_20260120 / code_execution_20250825
-            "bash_code_execution",
-            "text_editor_code_execution",
-            "tool_search_tool_regex",  # tool_search_tool_regex_20251119
-            "tool_search_tool_bm25",   # tool_search_tool_bm25_20251119
-            # Server tools — Beta
-            "advisor",               # advisor_20260301 (advisor-tool-2026-03-01)
-            "mcp_toolset",           # mcp-client-2025-11-20
-            # Client tools — bridged by this pipe
-            "memory",                # memory_20250818
-            "bash",                  # bash_20250124
-            "str_replace_based_edit_tool",  # text_editor_20250728 / 20250124
-            "computer",              # computer_20251124 / 20250124
-        })
+        _defer_active = __user__["valves"].ENABLE_TOOL_SEARCH and not is_programmatic_active
 
         for claude_tool in claude_tools:
             # Check if tool should be deferred for tool search
-            # IMPORTANT: Skip deferring when programmatic tool calling is active
-            if __user__["valves"].ENABLE_TOOL_SEARCH and not is_programmatic_active:
+            # IMPORTANT: Skip deferring when programmatic tool calling is active.
+            if _defer_active:
                 # Skip deferring if tool is in exclusion list
                 name = claude_tool["name"]
                 user_excludes = __user__["valves"].TOOL_SEARCH_EXCLUDE_TOOLS
                 if (
                     name != forced_tool_name
                     and name not in user_excludes
-                    and name not in ANTHROPIC_BUILTIN_TOOL_NAMES
                 ):
                     # Calculate tool definition size (JSON representation)
                     tool_json = json.dumps(claude_tool)
@@ -4404,7 +4578,15 @@ class Pipe:
                     "input": tc_input,
                 })
                 if tc_done:
-                    result_content = tc_result_raw if tc_result_raw else "(no result)"
+                    # Route through the same converter as live tool results:
+                    # embedded data:image URIs become real image blocks instead
+                    # of raw base64 text (~1.5k vs ~170k tokens per image), and
+                    # the TOOL_RESULT_MAX_TOKENS backstop applies on replay too.
+                    result_content = (
+                        self._convert_tool_result_content(tc_result_raw)
+                        if tc_result_raw
+                        else "(no result)"
+                    )
                     result_block: dict = {
                         "type": "tool_result",
                         "tool_use_id": tc_id,
@@ -4701,9 +4883,156 @@ class Pipe:
                         claude_tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": str(result_item["result"]),
+                            "content": self._convert_tool_result_content(str(result_item["result"])),
                         })
         return claude_tool_results
+
+    def _convert_tool_result_content(self, result_str, user=None):
+        """
+        Convert a raw client-tool result string into Anthropic tool_result content.
+
+        Detects `data:image/<fmt>;base64,...` data URIs (as produced by e.g. a
+        file-reading tool returning a PNG/JPEG) and converts them into real
+        Anthropic image blocks instead of sending the raw base64 as TEXT - the
+        same image costs ~1.5k tokens as an image block vs. ~170k tokens as
+        text, and Claude can actually see it. Mixed text+image output is split
+        into ordered text/image blocks; non-image output is returned unchanged
+        (as a plain string) except for a token-count backstop
+        (UserValves.TOOL_RESULT_MAX_TOKENS) that truncates runaway tool text.
+
+        Returns either a plain string (old behavior: no image, no truncation)
+        or a list of Anthropic content blocks (text/image).
+        """
+        if not isinstance(result_str, str) or not result_str:
+            return result_str
+
+        matches = list(PATTERN_TOOL_RESULT_DATA_IMAGE.finditer(result_str))
+        if not matches:
+            return self._truncate_tool_result_text(result_str, user)
+
+        blocks = []
+        last_end = 0
+        for match in matches:
+            prefix = result_str[last_end:match.start()]
+            if prefix.strip():
+                blocks.append({"type": "text", "text": self._truncate_tool_result_text(prefix, user)})
+            blocks.append(
+                self._build_tool_result_image_block(match.group("mime"), match.group("data"), user)
+            )
+            last_end = match.end()
+
+        suffix = result_str[last_end:]
+        if suffix.strip():
+            blocks.append({"type": "text", "text": self._truncate_tool_result_text(suffix, user)})
+
+        return blocks if blocks else result_str
+
+    def _truncate_tool_result_text(self, text: str, user=None) -> str:
+        """
+        Backstop against a runaway non-image tool result blowing the context
+        window. Truncates to UserValves.TOOL_RESULT_MAX_TOKENS (estimated as
+        len//4 chars). 0 disables the guard. Image blocks are exempt - they
+        are already cheap after conversion.
+        """
+        if not text:
+            return text
+        max_tokens = 50000
+        try:
+            user_valves = user.get("valves") if isinstance(user, dict) else None
+            if user_valves is not None:
+                max_tokens = getattr(user_valves, "TOOL_RESULT_MAX_TOKENS", 50000)
+        except Exception:
+            pass
+        if not max_tokens or max_tokens <= 0:
+            return text
+        max_chars = max_tokens * 4
+        if len(text) <= max_chars:
+            return text
+        logger.debug(f" Tool result text truncated: {len(text)}c > {max_chars}c limit")
+        return text[:max_chars] + "\n[tool result truncated: exceeded TOOL_RESULT_MAX_TOKENS]"
+
+    def _get_tool_result_image_max_dims(self, user=None) -> tuple[int, int]:
+        """
+        Read the user's OpenWebUI image-compression max dimensions from
+        __user__["settings"]["ui"] (keys "imageCompression" bool and
+        "imageCompressionSize" {"width":.., "height":..}). Falls back to a
+        1568px long-edge cap (Anthropic's own recommended max before it
+        downscales anyway) when compression is off or dims aren't set.
+        """
+        default_dim = 1568
+        try:
+            ui_settings = (user or {}).get("settings", {}).get("ui", {}) or {}
+            if ui_settings.get("imageCompression"):
+                size = ui_settings.get("imageCompressionSize") or {}
+                width = size.get("width")
+                height = size.get("height")
+                width = int(width) if width not in (None, "") else None
+                height = int(height) if height not in (None, "") else None
+                if width and height:
+                    return width, height
+        except Exception as e:
+            logger.debug(f" Failed to read imageCompressionSize, using default: {e}")
+        return default_dim, default_dim
+
+    def _build_tool_result_image_block(self, mime_type: str, encoded: str, user=None) -> dict:
+        """
+        Decode a base64 image payload extracted from a tool result into an
+        Anthropic image content block, downscaling it per
+        _get_tool_result_image_max_dims() to keep token cost low. Falls back
+        to the original image (if under the 25MB cap) or a text placeholder
+        on any decode/resize failure - mirrors the size-cap approach used for
+        image_url content blocks above.
+        """
+        media_type = f"image/{mime_type}"
+        MAX_IMAGE_SIZE = 25 * 1024 * 1024  # 25 MB (conservative, matches the image_url path)
+
+        try:
+            decoded_bytes = base64.b64decode(encoded)
+        except Exception as decode_ex:
+            logger.debug(f" Tool result image base64 decode failed: {decode_ex}")
+            return {"type": "text", "text": "[Image data could not be decoded - invalid base64 format]"}
+
+        final_bytes = decoded_bytes
+        final_media_type = media_type
+
+        if PIL_AVAILABLE:
+            try:
+                import io
+
+                max_w, max_h = self._get_tool_result_image_max_dims(user)
+                with PILImage.open(io.BytesIO(decoded_bytes)) as img:
+                    img.load()
+                    width, height = img.size
+                    if width > max_w or height > max_h:
+                        scale = min(max_w / width, max_h / height)
+                        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                        if img.mode == "P":
+                            img = img.convert("RGBA")
+                        resized = img.resize(new_size, PILImage.LANCZOS)
+                        buf = io.BytesIO()
+                        resized.save(buf, format="PNG")
+                        final_bytes = buf.getvalue()
+                        final_media_type = "image/png"
+            except Exception as resize_ex:
+                logger.debug(f" Tool result image resize failed, sending original: {resize_ex}")
+                final_bytes = decoded_bytes
+                final_media_type = media_type
+
+        if len(final_bytes) > MAX_IMAGE_SIZE:
+            logger.debug(f" Tool result image too large: {len(final_bytes)} bytes")
+            return {
+                "type": "text",
+                "text": f"[Image too large for Anthropic API. Max size: 25MB, received: {len(final_bytes)//1024//1024}MB]",
+            }
+
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": final_media_type,
+                "data": base64.b64encode(final_bytes).decode("ascii"),
+            },
+        }
 
     def _extract_and_remove_memories(self, text: str) -> tuple[str, Optional[str]]:
         """
@@ -4775,23 +5104,24 @@ class Pipe:
         try:
             from anthropic import AsyncAnthropic
             import hashlib
+            import io
             import uuid
 
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+            client = self._build_anthropic_client(api_key)
 
             # Get file metadata first
             file_meta = await client.beta.files.retrieve_metadata(file_id=file_id)
             filename = getattr(file_meta, "filename", file_id) or file_id
 
-            # Download file content
+            # Download file content (async binary response — .read() is a coroutine)
             response = await client.beta.files.download(file_id=file_id)
-            content = response.read()
+            content = await response.read()
 
-            # Save to OpenWebUI storage
+            # Save to OpenWebUI storage. upload_file(file: BinaryIO, filename, tags)
+            # returns a (contents, file_path) tuple; tags is required.
             owui_file_id = str(uuid.uuid4())
             storage_filename = f"code_exec_{owui_file_id}_{filename}"
-            file_path = Storage.upload_file(content, storage_filename)
+            _, file_path = Storage.upload_file(io.BytesIO(content), storage_filename, {})
 
             # Create OpenWebUI file record
             file_hash = hashlib.sha256(content).hexdigest()
@@ -4885,8 +5215,7 @@ class Pipe:
         client = None
         try:
             from anthropic import AsyncAnthropic
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY, **({"base_url": base_url} if base_url else {}))
+            client = self._build_anthropic_client(self.valves.ANTHROPIC_API_KEY)
         except ImportError:
             logger.warning("Anthropic SDK not available for file upload")
             return blocks_by_user_msg, processed_filenames
@@ -5049,8 +5378,7 @@ class Pipe:
             try:
                 from anthropic import AsyncAnthropic
 
-                base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-                client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+                client = self._build_anthropic_client(api_key)
 
                 # Fetch all available skills
                 available_skills = {}
@@ -5205,10 +5533,31 @@ class Pipe:
         except (TypeError, ValueError):
             return str(result)
 
+    async def _emit_terminal_event(
+        self,
+        emitter: Optional[Callable],
+        event_type: str,
+        path: str = "",
+    ) -> None:
+        """Emit a ``terminal:*`` UI event so Open Terminal refreshes the panel.
+
+        Mirrors OpenWebUI's ``terminal_event_handler``: run_command → empty
+        data, file ops → ``{"path": ...}``. Best-effort — event emission must
+        never break tool execution, so failures are swallowed.
+        """
+        if not emitter:
+            return
+        data = {"path": path} if path else {}
+        try:
+            await emitter({"type": f"terminal:{event_type}", "data": data})
+        except Exception:
+            logger.debug("terminal:%s event emit failed", event_type, exc_info=True)
+
     async def _dispatch_bash_tool(
         self,
         tool_input: dict,
         __tools__: dict,
+        emitter: Optional[Callable] = None,
     ) -> str:
         """Bridge native bash tool calls to Open Terminal's run_command callable.
 
@@ -5229,70 +5578,113 @@ class Pipe:
                 return "Error: run_command callable is not available."
             if tool_input.get("restart"):
                 await run_cmd(command="cd ~")
+                await self._emit_terminal_event(emitter, "run_command")
                 return "Bash session reset (working dir → $HOME)."
             command = tool_input.get("command", "")
             if not command:
                 return "Error: missing required parameter `command`."
 
-            raw = await run_cmd(command=command)
-            data = self._parse_terminal_payload(raw)
-
-            # Synchronous path: server returned a final status (no id, or already done).
-            if not isinstance(data, dict) or "id" not in data:
-                return self._stringify_terminal_result(raw)
-            status = data.get("status")
-            if status and status != "running":
-                return self._format_bash_process_result(data)
-
-            process_id = data["id"]
-            poll_cb = __tools__.get("get_process_status", {}).get("callable")
-            if not poll_cb:
-                # No polling tool available — surface the async descriptor as-is.
-                return self._stringify_terminal_result(raw)
-
-            timeout_s = max(5, int(self.valves.BASH_TOOL_TIMEOUT))
-            deadline = time.monotonic() + timeout_s
-            delay = 0.25  # exponential backoff: 0.25 → 0.5 → 1 → 2 (cap)
-            offset = 0
-            collected: list = list(data.get("output") or [])
-            last_status: dict = data
-            while True:
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 2.0)
-                try:
-                    poll_raw = await poll_cb(id=process_id, offset=offset)
-                except TypeError:
-                    # Older terminal builds may not accept `offset`
-                    poll_raw = await poll_cb(id=process_id)
-                poll_data = self._parse_terminal_payload(poll_raw)
-                if not isinstance(poll_data, dict):
-                    last_status = {"id": process_id, "status": "unknown"}
-                    break
-                last_status = poll_data
-                new_chunk = poll_data.get("output") or []
-                if isinstance(new_chunk, list):
-                    collected.extend(new_chunk)
-                    offset = poll_data.get("next_offset", offset + len(new_chunk))
-                if poll_data.get("status") and poll_data["status"] != "running":
-                    break
-                if time.monotonic() >= deadline:
-                    last_status["status"] = last_status.get("status") or "timeout"
-                    last_status["timed_out_after_s"] = timeout_s
-                    break
-
-            last_status["output"] = collected
-            return self._format_bash_process_result(last_status)
+            result = await self._run_terminal_command(__tools__, command)
+            await self._emit_terminal_event(emitter, "run_command")
+            return result
         except Exception as e:
             logger.exception("bash dispatch failed")
             return f"Error executing bash command: {e}"
+
+    async def _run_terminal_command(self, __tools__: dict, command: str) -> str:
+        """Run a shell command via Open Terminal and wait for its result.
+
+        Open Terminal's ``run_command`` is asynchronous by default, but both
+        ``run_command`` and ``get_process_status`` accept a server-side
+        long-poll ``wait`` (≤300s) that returns early when the process exits.
+        Prefer that; fall back to sleep-polling for older terminal builds.
+        Path/query parameter names must match the OpenAPI spec exactly
+        (``process_id``, not ``id``) — OpenWebUI's tool wrapper silently drops
+        unknown parameters, which turns into 404 "Process not found"."""
+        run_cmd = __tools__.get("run_command", {}).get("callable")
+        if not run_cmd:
+            return "Error: run_command callable is not available."
+        timeout_s = max(5, int(self.valves.BASH_TOOL_TIMEOUT))
+        deadline = time.monotonic() + timeout_s
+        try:
+            raw = await run_cmd(command=command, wait=min(timeout_s, 300))
+        except TypeError:
+            raw = await run_cmd(command=command)
+        data = self._parse_terminal_payload(raw)
+
+        # Synchronous path: server returned a final status (no id, or already done).
+        if not isinstance(data, dict) or "id" not in data:
+            return self._stringify_terminal_result(raw)
+        status = data.get("status")
+        if status and status != "running":
+            return self._format_bash_process_result(data)
+
+        process_id = data["id"]
+        poll_cb = __tools__.get("get_process_status", {}).get("callable")
+        if not poll_cb:
+            # No polling tool available — surface the async descriptor as-is.
+            return self._stringify_terminal_result(raw)
+
+        delay = 0.25  # exponential backoff: 0.25 → 0.5 → 1 → 2 (cap)
+        offset = 0
+        collected: list = list(data.get("output") or [])
+        last_status: dict = data
+        use_wait = True
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_status["status"] = last_status.get("status") or "timeout"
+                last_status["timed_out_after_s"] = timeout_s
+                break
+            try:
+                if use_wait:
+                    poll_raw = await poll_cb(
+                        process_id=process_id, offset=offset, wait=min(remaining, 25)
+                    )
+                else:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 2.0)
+                    poll_raw = await poll_cb(process_id=process_id, offset=offset)
+            except TypeError:
+                # Older terminal builds may not accept `wait` / `offset`
+                if use_wait:
+                    use_wait = False
+                    continue
+                poll_raw = await poll_cb(process_id=process_id)
+            poll_data = self._parse_terminal_payload(poll_raw)
+            if not isinstance(poll_data, dict):
+                last_status = {"id": process_id, "status": "unknown"}
+                break
+            if "status" not in poll_data and "output" not in poll_data:
+                # Error payload (e.g. {"detail": "Process not found"}) — stop
+                # instead of hammering the endpoint until the deadline.
+                collected.append(json.dumps(poll_data))
+                last_status = {"id": process_id, "status": "error"}
+                break
+            last_status = poll_data
+            new_chunk = poll_data.get("output") or []
+            if isinstance(new_chunk, list):
+                collected.extend(new_chunk)
+                offset = poll_data.get("next_offset", offset + len(new_chunk))
+            if poll_data.get("status") and poll_data["status"] != "running":
+                break
+
+        last_status["output"] = collected
+        return self._format_bash_process_result(last_status)
 
     async def _await_tool_task_result(
         self,
         tool_call_data: dict,
         awaitable: Awaitable[Any],
+        timeout_s: Optional[float] = None,
     ) -> tuple[dict, Any, Optional[Exception]]:
-        """Await a tool coroutine and keep its tool_use metadata attached."""
-        timeout_s = getattr(self.valves, "TOOL_CALL_TIMEOUT", self.TOOL_CALL_TIMEOUT)
+        """Await a tool coroutine and keep its tool_use metadata attached.
+
+        ``timeout_s`` overrides the generic TOOL_CALL_TIMEOUT valve — the Open
+        Terminal bash/text_editor bridges poll internally up to
+        BASH_TOOL_TIMEOUT and must not be killed early by the generic limit."""
+        if timeout_s is None:
+            timeout_s = getattr(self.valves, "TOOL_CALL_TIMEOUT", self.TOOL_CALL_TIMEOUT)
         try:
             result = await asyncio.wait_for(awaitable, timeout=max(1, float(timeout_s)))
             return tool_call_data, result, None
@@ -5344,7 +5736,8 @@ class Pipe:
 
         meta_bits: list[str] = []
         status = data.get("status")
-        if status and status != "completed":
+        # Open Terminal reports success as "done"; older builds may use "completed".
+        if status and status not in ("done", "completed"):
             meta_bits.append(f"status={status}")
         exit_code = data.get("exit_code")
         if exit_code not in (None, 0):
@@ -5364,6 +5757,7 @@ class Pipe:
         self,
         tool_input: dict,
         __tools__: dict,
+        emitter: Optional[Callable] = None,
     ) -> str:
         """Bridge native text_editor (str_replace_based_edit_tool) calls to
         Open Terminal's write_file / replace_file_content + run_command fallback
@@ -5393,8 +5787,9 @@ class Pipe:
                         f"if [ -d '{safe_path}' ]; then ls -la '{safe_path}'; "
                         f"else cat -n '{safe_path}'; fi"
                     )
-                result = await run_cmd(command=shell)
-                text = self._stringify_terminal_result(result)
+                text = await self._run_terminal_command(__tools__, shell)
+                # view is read-only → open the file preview in the panel.
+                await self._emit_terminal_event(emitter, "display_file", path)
                 max_chars = self.valves.TEXT_EDITOR_MAX_CHARACTERS
                 if len(text) > max_chars:
                     text = text[:max_chars] + f"\n…[truncated to {max_chars} chars]"
@@ -5407,6 +5802,7 @@ class Pipe:
                 old_str = tool_input.get("old_str", "")
                 new_str = tool_input.get("new_str", "")
                 result = await replace_cb(path=path, old_str=old_str, new_str=new_str)
+                await self._emit_terminal_event(emitter, "replace_file_content", path)
                 return self._stringify_terminal_result(result)
 
             elif command == "create":
@@ -5415,6 +5811,7 @@ class Pipe:
                     return "Error: write_file callable is not available."
                 file_text = tool_input.get("file_text", "")
                 result = await write_cb(path=path, content=file_text)
+                await self._emit_terminal_event(emitter, "write_file", path)
                 return self._stringify_terminal_result(result)
 
             elif command == "insert":
@@ -5442,8 +5839,10 @@ class Pipe:
                     "print(f'Inserted {len(ins.splitlines())} line(s) at position {ln} in {p}')\n"
                     "PYEOF"
                 )
-                result = await run_cmd(command=shell)
-                return self._stringify_terminal_result(result)
+                result_text = await self._run_terminal_command(__tools__, shell)
+                # insert mutates the file → treat as a content replacement refresh.
+                await self._emit_terminal_event(emitter, "replace_file_content", path)
+                return result_text
 
             else:
                 return f"Error: unsupported text_editor command '{command}'."
@@ -5960,10 +6359,18 @@ class Pipe:
         if model_name in cls._api_capabilities_cache:
             return cls._api_capabilities_cache[model_name]
 
+        # Endpoints that don't serve dated aliases (Azure/custom proxies) may hand
+        # us a dated id like "claude-opus-4-6-20251022". Strip the -YYYYMMDD suffix
+        # and retry both the API cache and the capability overrides with the base id.
+        normalized = re.sub(r"-\d{8}$", "", model_name)
+        if normalized != model_name and normalized in cls._api_capabilities_cache:
+            return cls._api_capabilities_cache[normalized]
+
         # Return conservative defaults for unknown models, then apply identity
         # overrides for beta features whose API capability metadata can lag.
         info = {
-            "max_tokens": 4096,
+            "max_tokens": cls.MODEL_MAX_TOKENS_FALLBACK.get(model_name)
+            or cls.MODEL_MAX_TOKENS_FALLBACK.get(normalized, 4096),
             "context_length": 200000,
             "supports_thinking": True,
             "supports_memory": False,
@@ -5977,7 +6384,10 @@ class Pipe:
             "supports_effort_xhigh": False,
             "supports_fast_mode": False,
         }
-        info.update(cls.MODEL_CAPABILITY_OVERRIDES.get(model_name, {}))
+        overrides = cls.MODEL_CAPABILITY_OVERRIDES.get(model_name)
+        if overrides is None:
+            overrides = cls.MODEL_CAPABILITY_OVERRIDES.get(normalized, {})
+        info.update(overrides)
         return info
 
     async def get_anthropic_models(self) -> List[dict]:
@@ -5986,6 +6396,17 @@ class Pipe:
         Parses capabilities from the API response and caches them.
         Returns OpenWebUI model dicts.
         """
+        # Explicit allow-list bypass: endpoints without a /v1/models route (Azure,
+        # some proxies) can't be auto-discovered. When ENABLED_MODELS is set, build
+        # entries directly from the listed ids plus their capability overrides.
+        enabled_raw = getattr(self.valves, "ENABLED_MODELS", "") or ""
+        if enabled_raw.strip():
+            enabled_list = [m.strip() for m in enabled_raw.split(",") if m.strip()]
+            return [
+                self._build_openwebui_model_entry(name, self.get_model_info(name))
+                for name in enabled_list
+            ]
+
         # Return cached result if still fresh
         if (
             self._api_capabilities_cache
@@ -6002,8 +6423,7 @@ class Pipe:
         new_cache: Dict[str, dict] = {}
         try:
             api_key = self.valves.ANTHROPIC_API_KEY
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+            client = self._build_anthropic_client(api_key)
             async for m in client.models.list():
                 name = m.id
                 display_name = getattr(m, "display_name", name)
@@ -6015,6 +6435,12 @@ class Pipe:
 
                 entry = self._build_openwebui_model_entry(name, info, display_name)
                 models.append(entry)
+
+            # Endpoint served no models (some proxies answer 200 with an empty
+            # list) — fall back to the static override-derived list.
+            if not models:
+                logger.warning("Model listing returned no models; using static fallback")
+                return self._static_fallback_models()
 
             # Update class-level cache
             Pipe._api_capabilities_cache = new_cache
@@ -6055,6 +6481,47 @@ class Pipe:
             },
         }
 
+    def _build_anthropic_client(
+        self,
+        api_key: str,
+        default_headers: Optional[dict] = None,
+        timeout: Optional[float] = None,
+    ):
+        """Central Anthropic async client factory.
+
+        All client creation routes through here so ANTHROPIC_BASE_URL and the
+        ANTHROPIC_WORKSPACE_ID header (required by the AWS 'Claude on AWS'
+        aws-external-anthropic endpoints) stay consistent across every request
+        path (model listing, tasks, file downloads, main pipe loop).
+        """
+        from anthropic import AsyncAnthropic
+
+        base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
+        headers = dict(default_headers or {})
+        ws_id = (getattr(self.valves, "ANTHROPIC_WORKSPACE_ID", "") or "").strip()
+        if ws_id:
+            headers.setdefault("anthropic-workspace-id", ws_id)
+
+        kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        if headers:
+            kwargs["default_headers"] = headers
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return AsyncAnthropic(**kwargs)
+
+    def _static_fallback_models(self) -> List[dict]:
+        """Model list used when live discovery fails or returns nothing.
+
+        Derives entries from MODEL_CAPABILITY_OVERRIDES so custom/proxy endpoints
+        without a /v1/models route still surface the known Claude models.
+        """
+        return [
+            self._build_openwebui_model_entry(name, self.get_model_info(name))
+            for name in self.MODEL_CAPABILITY_OVERRIDES
+        ]
+
     async def pipes(self) -> List[dict]:
         return await self.get_anthropic_models()
 
@@ -6077,7 +6544,10 @@ class Pipe:
             # Build simple payload for task request (non-streaming)
             task_payload = {
                 "model": actual_model_name,
-                "max_tokens": body.get("max_tokens", 4096),
+                # Resolve the model's real max output instead of a hard 4096 cap,
+                # which truncated task-model (title/tag/follow-up) responses.
+                "max_tokens": body.get("max_tokens")
+                or self.get_model_info(actual_model_name).get("max_tokens", 4096),
                 "messages": self._process_messages_for_task(messages),
                 "stream": False,
             }
@@ -6099,8 +6569,7 @@ class Pipe:
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
             api_key = self.valves.ANTHROPIC_API_KEY
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+            client = self._build_anthropic_client(api_key)
 
             response = await client.messages.create(**task_payload)
 
@@ -6914,8 +7383,7 @@ class Pipe:
                 api_key = user_api_key.strip()
                 logger.debug("Using user-provided API key from UserValves")
             request_timeout = self.valves.REQUEST_TIMEOUT
-            base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers, timeout=request_timeout, **({"base_url": base_url} if base_url else {}))
+            client = self._build_anthropic_client(api_key, default_headers=headers, timeout=request_timeout)
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
             include_usage = (
                 __user__["valves"].SHOW_TOKEN_COUNT != "Off"
@@ -7419,6 +7887,7 @@ class Pipe:
                                         api_tool_names=api_tool_names,
                                         running_tool_tasks=running_tool_tasks,
                                         emit_delta=emit_message_delta,
+                                        emit_event=__event_emitter__,
                                     )
                                     api_tool_passthrough = api_tool_passthrough or started_api_tool_passthrough
                                 elif is_model_thinking and content_type in ("thinking", "redacted_thinking"):
@@ -7588,10 +8057,14 @@ class Pipe:
                                                         result_str = json.dumps(tool_result, ensure_ascii=False)
                                                     except (TypeError, ValueError):
                                                         result_str = str(tool_result)
+                                                # Convert any embedded data:image;base64 URI (e.g. a
+                                                # read_file tool returning a PNG) into a real Anthropic
+                                                # image block instead of raw base64 TEXT, and apply the
+                                                # TOOL_RESULT_MAX_TOKENS backstop to non-image output.
                                                 result_block = {
                                                     "type": "tool_result",
                                                     "tool_use_id": tool_use_id,
-                                                    "content": result_str,
+                                                    "content": self._convert_tool_result_content(result_str, __user__),
                                                 }
                                                 if is_error:
                                                     result_block["is_error"] = True
