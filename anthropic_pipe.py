@@ -6498,6 +6498,11 @@ class Pipe:
 
         base_url = self.valves.ANTHROPIC_BASE_URL.strip() or None
         headers = dict(default_headers or {})
+        # The SDK derives the x-api-key header from api_key. A duplicate x-api-key in
+        # default_headers collides at the httpx layer (behavior varies by header casing)
+        # and corrupts the value → Anthropic 401 "API key is invalid". Strip any case
+        # variant so the SDK's own auth header is the only one sent.
+        headers = {k: v for k, v in headers.items() if k.lower() != "x-api-key"}
         ws_id = (getattr(self.valves, "ANTHROPIC_WORKSPACE_ID", "") or "").strip()
         if ws_id:
             headers.setdefault("anthropic-workspace-id", ws_id)
